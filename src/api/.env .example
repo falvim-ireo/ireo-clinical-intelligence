@@ -1,0 +1,5 @@
+CLINICORP_SUBSCRIBER_ID=seu_subscriber_id
+CLINICORP_BUSINESS_ID=seu_business_id
+CLINICORP_API_USER=seu_usuario_api
+CLINICORP_TOKEN=seu_token_api
+CLINICORP_BASE_URL=https://api.clinicorp.com/rest/v1
