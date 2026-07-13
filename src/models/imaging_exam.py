@@ -103,7 +103,7 @@ class ImagingExam:
         """Marca o exame como importado."""
 
         self.imported = True
-        self.imported_at = datetime.now()git add src/radiology
+        self.imported_at = datetime.now()
 
     def __str__(self):
 

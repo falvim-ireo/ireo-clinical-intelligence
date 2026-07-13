@@ -11,8 +11,30 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
+
+
+class _TransferNowHTMLParser(HTMLParser):
+    """Coleta texto visível e links sem descartar atributos href."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.partes: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        for nome, valor in attrs:
+            if nome.lower() == "href" and valor:
+                self.partes.append(valor)
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.partes.append(data)
 
 
 @dataclass(frozen=True)
@@ -30,7 +52,7 @@ class TransferNowConnector:
     """Interpreta mensagens recebidas por meio do TransferNow."""
 
     _URL_PATTERN = re.compile(
-        r"https?://[^\s<>'\"]*transfernow\.net/dl/[^\s<>'\"]+",
+        r"https://[^\s<>'\"]+",
         flags=re.IGNORECASE,
     )
 
@@ -103,12 +125,11 @@ class TransferNowConnector:
     ) -> bool:
         """Verifica se o conteúdo contém indícios de TransferNow."""
 
-        texto = f"{assunto} {conteudo}".lower()
-
-        return (
-            "transfernow" in texto
-            and bool(cls._URL_PATTERN.search(texto))
+        texto = cls._normalizar_conteudo(
+            f"{assunto} {conteudo}"
         )
+
+        return cls._extrair_url(texto) is not None
 
     @staticmethod
     def _normalizar_conteudo(conteudo: str) -> str:
@@ -117,35 +138,17 @@ class TransferNowConnector:
         if not conteudo:
             return ""
 
-        texto = html.unescape(conteudo)
-
-        texto = re.sub(
-            r"<br\s*/?>",
-            "\n",
-            texto,
-            flags=re.IGNORECASE,
-        )
-
-        texto = re.sub(
-            r"</p\s*>",
-            "\n",
-            texto,
-            flags=re.IGNORECASE,
-        )
-
-        texto = re.sub(
-            r"<[^>]+>",
-            " ",
-            texto,
-        )
+        parser = _TransferNowHTMLParser()
+        parser.feed(conteudo)
+        parser.close()
 
         texto = re.sub(
             r"\s+",
             " ",
-            texto,
+            " ".join(parser.partes),
         )
 
-        return texto.strip()
+        return html.unescape(texto).strip()
 
     @classmethod
     def _extrair_url(
@@ -154,32 +157,36 @@ class TransferNowConnector:
     ) -> Optional[str]:
         """Extrai e higieniza a primeira URL válida do TransferNow."""
 
-        correspondencia = cls._URL_PATTERN.search(texto)
-
-        if not correspondencia:
-            return None
-
-        url = correspondencia.group(0).rstrip(
-            ".,);]}>"
-        )
-
-        partes = urlsplit(url)
-
-        if not partes.scheme or not partes.netloc:
-            return None
-
-        if "transfernow.net" not in partes.netloc.lower():
-            return None
-
-        return urlunsplit(
-            (
-                partes.scheme,
-                partes.netloc,
-                partes.path,
-                partes.query,
-                "",
+        for correspondencia in cls._URL_PATTERN.finditer(texto):
+            url = correspondencia.group(0).rstrip(
+                ".,);]}>"
             )
-        )
+
+            try:
+                partes = urlsplit(url)
+                hostname = (partes.hostname or "").lower().rstrip(".")
+            except ValueError:
+                continue
+
+            dominio_valido = (
+                hostname == "transfernow.net"
+                or hostname.endswith(".transfernow.net")
+            )
+
+            if partes.scheme.lower() != "https" or not dominio_valido:
+                continue
+
+            return urlunsplit(
+                (
+                    partes.scheme,
+                    partes.netloc,
+                    partes.path,
+                    partes.query,
+                    "",
+                )
+            )
+
+        return None
 
     @classmethod
     def _extrair_nome_arquivo(

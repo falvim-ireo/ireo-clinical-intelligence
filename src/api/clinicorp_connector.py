@@ -5,24 +5,22 @@ Clinicorp API Connector
 Responsável pela comunicação com a API da Clinicorp.
 """
 
-import os
 from typing import Any
 import requests
-from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
+
+from core.config import Config
 
 
 class ClinicorpAPI:
     """Cliente para consultas somente leitura na API da Clinicorp."""
 
     def __init__(self) -> None:
-        load_dotenv()
-
-        self.subscriber_id = os.getenv("CLINICORP_SUBSCRIBER_ID")
-        self.business_id = os.getenv("CLINICORP_BUSINESS_ID")
-        self.api_user = os.getenv("CLINICORP_API_USER")
-        self.token = os.getenv("CLINICORP_TOKEN")
-        self.base_url = os.getenv("CLINICORP_BASE_URL")
+        self.subscriber_id = Config.CLINICORP_SUBSCRIBER_ID
+        self.business_id = Config.CLINICORP_BUSINESS_ID
+        self.api_user = Config.CLINICORP_API_USER
+        self.token = Config.CLINICORP_TOKEN
+        self.base_url = Config.CLINICORP_BASE_URL
 
         self._validar_configuracao()
 
