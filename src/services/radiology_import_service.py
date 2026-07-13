@@ -9,14 +9,20 @@ from models.email_message import EmailMessage
 from models.imaging_exam import ImagingExam
 from models.radiology_intake_plan import RadiologyIntakePlan
 from models.resolved_patient import ResolvedPatient, ResolutionReason
+from observability.audit_logger import (
+    AuditEventType,
+    AuditLogger,
+    emit_safely,
+)
 from services.patient_resolver import PatientResolver
 
 
 class RadiologyImportService:
     """Interpreta mensagens e produz planos idempotentes somente em memória."""
 
-    def __init__(self) -> None:
+    def __init__(self, audit_logger: AuditLogger | None = None) -> None:
         self._plans_by_message_id: dict[str, RadiologyIntakePlan] = {}
+        self.audit_logger = audit_logger or AuditLogger()
 
     @property
     def planned_message_count(self) -> int:
@@ -55,6 +61,14 @@ class RadiologyImportService:
         transfer_message = TransferNowConnector.interpretar(
             content,
             message.subject,
+        )
+        emit_safely(
+            self.audit_logger,
+            AuditEventType.TRANSFERNOW_MESSAGE_PARSED,
+            status="PARSED",
+            message_id=message_id,
+            archive_name=transfer_message.filename,
+            download_url=transfer_message.download_url,
         )
         sender_email = (
             transfer_message.sender_email

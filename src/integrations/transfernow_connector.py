@@ -69,6 +69,15 @@ class TransferNowConnector:
     _SUPPORTED_EXTENSIONS = (".rar", ".zip", ".7z")
 
     @classmethod
+    def extrair_nome_paciente_do_arquivo(
+        cls,
+        filename: Optional[str],
+    ) -> Optional[str]:
+        """Expõe a identificação provável usada pelo fluxo supervisionado."""
+
+        return cls._extrair_nome_paciente(filename)
+
+    @classmethod
     def interpretar(
         cls,
         conteudo: str,

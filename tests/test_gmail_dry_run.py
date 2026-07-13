@@ -236,6 +236,29 @@ def test_connector_uses_only_read_operations_and_safe_pilot_limit() -> None:
     )
 
 
+def test_connector_reads_one_selected_message_without_listing_or_mutation() -> None:
+    raw = gmail_message(
+        message_id="selected-message-id",
+        html_body='<a href="https://transfernow.net/dl/test">Baixar</a>',
+    )
+    service = ReadOnlyFakeGmailService([raw])
+    connector = GmailConnector(service=service)
+
+    message = connector.get_message("selected-message-id")
+
+    assert message.message_id == "selected-message-id"
+    assert service.messages_api.operations == [
+        (
+            "get",
+            {
+                "userId": "me",
+                "id": "selected-message-id",
+                "format": "full",
+            },
+        )
+    ]
+
+
 def test_gmail_message_id_preserves_workflow_idempotency() -> None:
     raw = gmail_message(
         text_body="Contato: atendimento@sorrimagem.example",

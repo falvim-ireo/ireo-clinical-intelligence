@@ -79,29 +79,28 @@ class ClinicorpAPI:
 
             response.raise_for_status()
 
-        except requests.exceptions.Timeout as exc:
+        except requests.exceptions.Timeout:
             raise RuntimeError(
                 "A Clinicorp demorou mais de 30 segundos para responder."
-            ) from exc
+            ) from None
 
-        except requests.exceptions.HTTPError as exc:
+        except requests.exceptions.HTTPError:
             raise RuntimeError(
-                f"Erro HTTP da Clinicorp: "
-                f"{response.status_code} - {response.text}"
-            ) from exc
+                "A Clinicorp retornou um erro HTTP."
+            ) from None
 
-        except requests.exceptions.RequestException as exc:
+        except requests.exceptions.RequestException:
             raise RuntimeError(
-                f"Não foi possível conectar à Clinicorp: {exc}"
-            ) from exc
+                "Não foi possível conectar à Clinicorp."
+            ) from None
 
         try:
             return response.json()
 
-        except ValueError as exc:
+        except ValueError:
             raise RuntimeError(
                 "A Clinicorp retornou uma resposta que não é JSON."
-            ) from exc
+            ) from None
 
     def buscar_paciente(
         self,

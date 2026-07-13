@@ -6,6 +6,11 @@ from difflib import SequenceMatcher
 from models.imaging_exam import ImagingExam
 from models.patient import Patient
 from models.resolved_patient import ResolvedPatient, ResolutionReason
+from observability.audit_logger import (
+    AuditEventType,
+    AuditLogger,
+    emit_safely,
+)
 from repositories.patient_repository import (
     PatientRepository,
     PatientRepositoryUnavailableError,
@@ -25,8 +30,17 @@ class PatientResolver:
 
     MINIMUM_MATCH_SCORE = 0.90
 
-    def __init__(self, repository: PatientRepository) -> None:
+    def __init__(
+        self,
+        repository: PatientRepository,
+        audit_logger: AuditLogger | None = None,
+    ) -> None:
         self.repository = repository
+        self.audit_logger = (
+            audit_logger
+            or getattr(repository, "audit_logger", None)
+            or AuditLogger()
+        )
 
     @classmethod
     def similarity_score(cls, first_name: str, second_name: str) -> float:
@@ -41,22 +55,38 @@ class PatientResolver:
     def resolve(self, exam: ImagingExam) -> ResolvedPatient:
         """Consulta candidatos e retorna uma decisão explicável."""
 
+        emit_safely(
+            self.audit_logger,
+            AuditEventType.PATIENT_RESOLUTION_STARTED,
+            status="STARTED",
+        )
+
         try:
             candidates = tuple(
                 self.repository.find_candidates(exam.patient_name)
             )
         except PatientRepositoryUnavailableError:
-            return self._unmatched(
+            if getattr(self.repository, "audit_logger", None) is not (
+                self.audit_logger
+            ):
+                emit_safely(
+                    self.audit_logger,
+                    AuditEventType.PATIENT_SOURCE_UNAVAILABLE,
+                    status="UNAVAILABLE",
+                    requires_manual_review=True,
+                    reason_code="PATIENT_SOURCE_UNAVAILABLE",
+                )
+            return self._record_result(self._unmatched(
                 reason=ResolutionReason.PATIENT_SOURCE_UNAVAILABLE,
                 confidence_score=0.0,
                 candidates=(),
-            )
+            ))
         if not candidates:
-            return self._unmatched(
+            return self._record_result(self._unmatched(
                 reason=ResolutionReason.PATIENT_NOT_FOUND,
                 confidence_score=0.0,
                 candidates=(),
-            )
+            ))
 
         normalized_exam_name = PatientNormalizer.compare_ready(
             exam.patient_name
@@ -85,11 +115,11 @@ class PatientResolver:
         )
 
         if not normalized_exam_name:
-            return self._unmatched(
+            return self._record_result(self._unmatched(
                 reason=ResolutionReason.MANUAL_REVIEW_REQUIRED,
                 confidence_score=0.0,
                 candidates=scored_candidates,
-            )
+            ))
 
         eligible = tuple(
             candidate
@@ -97,18 +127,18 @@ class PatientResolver:
             if candidate.score >= self.MINIMUM_MATCH_SCORE
         )
         if len(eligible) > 1:
-            return self._unmatched(
+            return self._record_result(self._unmatched(
                 reason=ResolutionReason.MULTIPLE_HIGH_SCORE,
                 confidence_score=eligible[0].score,
                 candidates=scored_candidates,
-            )
+            ))
 
         if not eligible:
-            return self._unmatched(
+            return self._record_result(self._unmatched(
                 reason=ResolutionReason.LOW_SCORE,
                 confidence_score=scored_candidates[0].score,
                 candidates=scored_candidates,
-            )
+            ))
 
         selected = eligible[0]
         if exam.patient_name == selected.patient.nome:
@@ -121,7 +151,7 @@ class PatientResolver:
             reason = ResolutionReason.SINGLE_HIGH_SCORE
             matched_by = "similarity_score"
 
-        return ResolvedPatient(
+        return self._record_result(ResolvedPatient(
             patient_id=selected.patient.id,
             patient_name=selected.patient.nome,
             matched=True,
@@ -131,7 +161,27 @@ class PatientResolver:
             candidate_count=len(scored_candidates),
             candidate_names=self._candidate_names(scored_candidates),
             matched_by=matched_by,
+        ))
+
+    def _record_result(self, result: ResolvedPatient) -> ResolvedPatient:
+        event_type = (
+            AuditEventType.PATIENT_RESOLUTION_MATCHED
+            if result.matched
+            else AuditEventType.PATIENT_RESOLUTION_REVIEW_REQUIRED
         )
+        emit_safely(
+            self.audit_logger,
+            event_type,
+            status="MATCHED" if result.matched else "REVIEW_REQUIRED",
+            patient_id=result.patient_id,
+            requires_manual_review=result.requires_manual_review,
+            reason_code=result.resolution_reason,
+            metadata={
+                "candidate_count": result.candidate_count,
+                "matched_by": result.matched_by,
+            },
+        )
+        return result
 
     @classmethod
     def _unmatched(

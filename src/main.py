@@ -1,4 +1,5 @@
 import sys
+import argparse
 from typing import Optional, Sequence
 
 from api.clinicorp_connector import ClinicorpAPI
@@ -153,13 +154,17 @@ def clinicorp_main() -> None:
         print(f"Detalhes: {erro}")
 
 
-def build_radiology_workflow(patient_source: str):
+def build_radiology_workflow(patient_source: str, audit_logger=None):
     """Compõe a fonte de pacientes sem ativar Clinicorp implicitamente."""
 
+    from core.config import Config
+    from observability.audit_logger import AuditLogger
     from workflows.imaging_workflow import ImagingWorkflow
 
+    audit = audit_logger or AuditLogger(level=Config.AUDIT_LOG_LEVEL)
+
     if patient_source == "offline":
-        return ImagingWorkflow()
+        return ImagingWorkflow(audit_logger=audit)
 
     if patient_source == "clinicorp":
         from repositories.clinicorp_patient_repository import (
@@ -167,9 +172,16 @@ def build_radiology_workflow(patient_source: str):
         )
         from services.patient_resolver import PatientResolver
 
-        repository = ClinicorpPatientRepository(api=ClinicorpAPI())
+        repository = ClinicorpPatientRepository(
+            api=ClinicorpAPI(),
+            audit_logger=audit,
+        )
         return ImagingWorkflow(
-            patient_resolver=PatientResolver(repository)
+            patient_resolver=PatientResolver(
+                repository,
+                audit_logger=audit,
+            ),
+            audit_logger=audit,
         )
 
     raise ValueError("Fonte de pacientes inválida.")
@@ -207,9 +219,84 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             print("Não foi possível concluir o dry-run com segurança.")
             return 1
 
+    if arguments and arguments[0] == "radiology-import-supervised":
+        from core.config import Config
+        from integrations.gmail_connector import (
+            GmailConnector,
+            GmailConnectorError,
+        )
+        from observability.audit_logger import AuditLogger
+        from radiology.archive_extractor import ArchiveExtractionError
+        from radiology.supervised_import import (
+            SupervisedImportCancelled,
+            SupervisedImportError,
+            SupervisedRadiologyImporter,
+        )
+        from repositories.patient_repository import EmptyPatientRepository
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence radiology-import-supervised"
+        )
+        entry = parser.add_mutually_exclusive_group(required=True)
+        entry.add_argument("--email-message-id")
+        entry.add_argument("--archive-path")
+        parser.add_argument(
+            "--patient-source",
+            choices=("clinicorp", "offline"),
+            default="offline",
+        )
+        try:
+            options = parser.parse_args(arguments[1:])
+        except SystemExit:
+            return 2
+
+        try:
+            audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
+            if options.patient_source == "clinicorp":
+                from repositories.clinicorp_patient_repository import (
+                    ClinicorpPatientRepository,
+                )
+
+                repository = ClinicorpPatientRepository(
+                    ClinicorpAPI(),
+                    audit_logger=audit,
+                )
+            else:
+                repository = EmptyPatientRepository()
+
+            importer = SupervisedRadiologyImporter(
+                patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
+                quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+                archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                patient_repository=repository,
+                gmail_connector=(
+                    GmailConnector() if options.email_message_id else None
+                ),
+                audit_logger=audit,
+            )
+            result = importer.run(
+                archive_path=options.archive_path,
+                email_message_id=options.email_message_id,
+            )
+        except SupervisedImportCancelled as exc:
+            print(str(exc))
+            return 1
+        except (
+            ArchiveExtractionError,
+            GmailConnectorError,
+            SupervisedImportError,
+            ValueError,
+        ) as exc:
+            print(f"Importação não concluída: {exc}")
+            return 1
+
+        print(f"Importação concluída: {result.destination}")
+        print(f"Manifesto: {result.manifest_path}")
+        return 0
+
     print(
         "Uso: ireo-clinical-intelligence "
-        "[radiology-gmail-dry-run]"
+        "[radiology-gmail-dry-run | radiology-import-supervised]"
     )
     return 2
 

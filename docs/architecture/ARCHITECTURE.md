@@ -182,3 +182,75 @@ Application composition remains safe by default. `radiology-gmail-dry-run`
 uses `EmptyPatientRepository`; the Clinicorp adapter is instantiated only for
 `radiology-gmail-dry-run --patient-source clinicorp`. Automated tests inject
 fakes and never construct the real HTTP path.
+
+## Sanitized Observability (Issue #34)
+
+The Gmail dry-run, `RadiologyImportService`, `PatientResolver`,
+`ClinicorpPatientRepository`, and `ImagingWorkflow` share one injected
+`AuditLogger` per composed execution:
+
+```text
+Gmail dry-run
+    -> masked operational AuditEvent
+    -> RadiologyImportService
+    -> PatientResolver / ClinicorpPatientRepository
+    -> ImagingWorkflow result
+    -> masked operational AuditEvent
+```
+
+The logger uses a strict field allowlist. Raw e-mail bodies, full TransferNow
+URLs, tokens, credentials, patient contacts, complete patient names, external
+response bodies, and raw identifiers never enter the event model. Message and
+patient IDs are represented by deterministic SHA-256 fingerprints, archive
+names by a fingerprint plus safe extension, and URLs by hostname only. A
+random `correlation_id` links the events from one execution without becoming a
+clinical identifier.
+
+Audit calls are failure-isolated and cannot alter clinical matching, manual
+review, or dry-run results. `WARNING` is the default level, `INFO` enables the
+pilot event sequence, and `DEBUG` remains equally sanitized. The detailed
+event catalog, LGPD constraints, and pending retention decisions are documented
+in [`OBSERVABILITY.md`](OBSERVABILITY.md).
+
+Contract fixtures under `tests/fixtures/clinicorp/` are explicitly synthetic.
+They exercise active/deleted records, ambiguity, duplicate IDs, empty and
+invalid responses, missing fields, optional contact and birth-date fields, and
+mixed case with accents. Tests override the Clinicorp transport and block
+socket and HTTP entry points, so contract validation cannot reach real
+services.
+
+## Supervised Radiology Import MVP (Issue #35)
+
+The supervised command is an explicit foreground workflow and does not replace
+the safe dry-run:
+
+```text
+Gmail message ID (readonly) OR local .zip/.rar
+    -> quarantine download/extraction
+    -> Clinicorp candidates or offline manual name confirmation
+    -> human patient selection
+    -> normalized local patient-folder search
+    -> human folder selection
+    -> complete copy preview
+    -> exact CONFIRMAR input
+    -> copy-only destination + manifest.json
+```
+
+ZIP extraction validates every member before writing and rejects absolute
+paths, parent traversal, Windows drive paths, alternate streams, and symbolic
+links. RAR extraction invokes the configured WinRAR executable with a list of
+separate arguments, `shell=False`, exit-code validation, and timeout. Both
+formats extract only below the configured quarantine. Archives and extracted
+folders are retained.
+
+Patient folders are searched as immediate child directories of the configured
+local OneDrive root. `PatientNormalizer` is used only to compare folder names;
+the operator must select a result even when there is only one. The workflow
+does not use Microsoft Graph and never creates a patient folder.
+
+The dated destination is created only after the exact confirmation text. A
+pre-existing destination receives an incremental suffix. Files are opened in
+exclusive-create mode, are copied rather than moved, and are never overwritten
+or deleted. The manifest records the execution correlation ID, UTC timestamp,
+original archive name, masked PatientId, counts, total size, SHA-256 checksums,
+source mode, destination, and completion status.

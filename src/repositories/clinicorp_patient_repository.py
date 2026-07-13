@@ -4,6 +4,11 @@ from typing import Any
 
 from api.clinicorp_connector import ClinicorpAPI
 from models.patient import Patient
+from observability.audit_logger import (
+    AuditEventType,
+    AuditLogger,
+    emit_safely,
+)
 from repositories.patient_repository import PatientRepositoryUnavailableError
 from services.patient_normalizer import PatientNormalizer
 
@@ -11,8 +16,13 @@ from services.patient_normalizer import PatientNormalizer
 class ClinicorpPatientRepository:
     """Converte respostas Clinicorp válidas sem executar matching."""
 
-    def __init__(self, api: ClinicorpAPI) -> None:
+    def __init__(
+        self,
+        api: ClinicorpAPI,
+        audit_logger: AuditLogger | None = None,
+    ) -> None:
         self.api = api
+        self.audit_logger = audit_logger or AuditLogger()
 
     def find_candidates(self, name: str) -> list[Patient]:
         """Consulta uma vez pelo nome original e retorna pacientes ativos."""
@@ -27,6 +37,7 @@ class ClinicorpPatientRepository:
                 somente_ativos=True,
             )
         except Exception:
+            self._record_unavailable()
             raise PatientRepositoryUnavailableError(
                 "A fonte de pacientes está temporariamente indisponível."
             ) from None
@@ -34,6 +45,7 @@ class ClinicorpPatientRepository:
         if raw_candidates == {}:
             return []
         if not isinstance(raw_candidates, list):
+            self._record_unavailable()
             raise PatientRepositoryUnavailableError(
                 "A fonte de pacientes retornou uma resposta inválida."
             )
@@ -48,6 +60,16 @@ class ClinicorpPatientRepository:
             patients.append(patient)
 
         return patients
+
+    def _record_unavailable(self) -> None:
+        emit_safely(
+            self.audit_logger,
+            AuditEventType.PATIENT_SOURCE_UNAVAILABLE,
+            status="UNAVAILABLE",
+            requires_manual_review=True,
+            reason_code="PATIENT_SOURCE_UNAVAILABLE",
+            metadata={"patient_source": "clinicorp"},
+        )
 
     @staticmethod
     def _to_active_patient(item: Any) -> Patient | None:

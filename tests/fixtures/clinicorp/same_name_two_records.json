@@ -1,0 +1,12 @@
+[
+  {
+    "PatientId": 990000003,
+    "Name": "PACIENTE FICTÍCIO GÊMEO",
+    "Status": "ACTIVE"
+  },
+  {
+    "PatientId": 990000004,
+    "Name": "PACIENTE FICTÍCIO GÊMEO",
+    "Status": "ACTIVE"
+  }
+]

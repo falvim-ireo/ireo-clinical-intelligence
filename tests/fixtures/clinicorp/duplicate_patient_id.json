@@ -1,0 +1,17 @@
+[
+  {
+    "PatientId": 990000005,
+    "Name": "PACIENTE FICTÍCIO PRIMEIRO",
+    "Status": "ACTIVE"
+  },
+  {
+    "PatientId": 990000005,
+    "Name": "PACIENTE FICTÍCIO DUPLICADO",
+    "Status": "ACTIVE"
+  },
+  {
+    "PatientId": 990000006,
+    "Name": "PACIENTE FICTÍCIO ÚLTIMO",
+    "Status": "ACTIVE"
+  }
+]

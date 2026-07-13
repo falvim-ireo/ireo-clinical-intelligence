@@ -21,10 +21,11 @@ ireo-clinical-intelligence radiology-gmail-dry-run --patient-source clinicorp
 ```
 
 This option uses the existing `Config` values and Basic Auth implementation. It
-performs one active-patient query using the normalized full name extracted from
-the intake. It does not generate name variants or search by CPF, phone, birth
-date, or aliases. Clinicorp currently works best when the complete name is
-available.
+performs one active-patient query using the original full name extracted from
+the intake, removing only external whitespace. Accents, letter case, internal
+whitespace, and word order are preserved. Normalization occurs only after
+candidate records return. The adapter does not generate name variants or search
+by CPF, phone, birth date, or aliases.
 
 If Clinicorp times out, returns an HTTP error, is unavailable, or returns an
 unusable structure, the output remains a manual-review plan. No patient can be
@@ -94,6 +95,28 @@ consent. Output is restricted to masked message ID, archive name, probable
 patient, matching status, review requirement, and proposed logical destination.
 The full body and TransferNow link are not printed.
 
+## Pilot Audit Log
+
+Sanitized structured logging defaults to `WARNING`. For a controlled pilot,
+enable the operational event sequence locally:
+
+```powershell
+$env:IREO_AUDIT_LOG_LEVEL = "INFO"
+ireo-clinical-intelligence radiology-gmail-dry-run
+```
+
+Use `DEBUG` only in development. It exposes no additional clinical or secret
+fields. Logs contain a UTC timestamp, a per-execution `correlation_id`, status,
+reason codes, manual-review state, deterministic masked identifiers, a masked
+archive reference, and at most the TransferNow hostname.
+
+Do not copy e-mail bodies, URLs, tokens, credentials, patient names, telephone
+numbers, e-mail addresses, or external response bodies into operational notes.
+Retention and deletion policy are not yet approved, so pilot logs must remain
+access-restricted and short-lived under the organization's interim security
+controls. Logs have no diagnostic purpose. See
+[`OBSERVABILITY.md`](OBSERVABILITY.md) for the event catalog and LGPD cautions.
+
 ## Revoke Access
 
 To revoke user authorization, open the Google Account security page, find the
@@ -108,3 +131,74 @@ Official references:
 
 - https://developers.google.com/workspace/gmail/api/quickstart/python
 - https://developers.google.com/identity/protocols/oauth2/resources/best-practices
+
+## Supervised Radiology Import
+
+The foreground-only MVP accepts exactly one input mode:
+
+```powershell
+ireo-clinical-intelligence radiology-import-supervised `
+  --archive-path "D:\IREO_Radiology_Quarantine\EXAME_FICTICIO.zip" `
+  --patient-source clinicorp
+```
+
+or a selected Gmail message through the existing readonly connector:
+
+```powershell
+ireo-clinical-intelligence radiology-import-supervised `
+  --email-message-id "GMAIL_MESSAGE_ID" `
+  --patient-source clinicorp
+```
+
+Use `--patient-source offline` when Clinicorp must not be queried. In that mode,
+the probable name from the archive still requires an explicit manual
+confirmation and no PatientId is recorded.
+
+The Gmail mode reads only the selected message and attempts to save the parsed
+TransferNow archive in quarantine. It never marks or modifies the message. A
+TransferNow link may be a landing page rather than a direct archive; if the
+download cannot be completed, download the `.zip` or `.rar` manually and use
+`--archive-path`.
+
+The configured local paths are:
+
+```text
+IREO_ONEDRIVE_PATIENTS_PATH=D:\OneDrive\Pasta pacientes 2026
+IREO_RADIOLOGY_QUARANTINE_PATH=D:\IREO_Radiology_Quarantine
+IREO_ARCHIVE_TOOL_PATH=C:\Program Files\WinRAR\WinRAR.exe
+```
+
+The command displays all Clinicorp candidates and compatible local patient
+folders. Selection is always manual. Before any destination is created, it
+shows the archive, extracted folder, confirmed patient and PatientId, selected
+patient folder, final destination, file count, total size, and possible
+duplicate count. Copying starts only when the operator types exactly:
+
+```text
+CONFIRMAR
+```
+
+The command copies without moving, deleting, or overwriting. It retains the
+archive and extraction folder in quarantine and creates `manifest.json` beside
+the copied files with SHA-256 checksums.
+
+### Checklist Before The First Real Pilot
+
+1. Confirm that the archive belongs to the intended Sorrimagem examination.
+2. Confirm free space and write access in quarantine and the patient root.
+3. Confirm the configured WinRAR path and use a ZIP fallback when appropriate.
+4. Confirm Gmail OAuth readonly scope if Gmail mode will be used.
+5. Confirm Clinicorp credentials without displaying or copying them to logs.
+6. Start with `--archive-path` so Gmail/TransferNow acquisition is separated
+   from the first supervised copy.
+7. Review every Clinicorp candidate and every matching patient folder.
+8. Verify the proposed destination, file count, total size, and duplicates.
+9. Type `CONFIRMAR` only after the complete preview is correct.
+10. Inspect `manifest.json` and compare the retained source archive after the
+    copy.
+
+The MVP does not inspect DICOM, create missing patient folders, resolve archive
+passwords, guarantee that a TransferNow landing URL is a direct download, or
+clean partial destinations after a local write failure. Any partial result must
+be reviewed manually because the application deliberately performs no
+automatic deletion.

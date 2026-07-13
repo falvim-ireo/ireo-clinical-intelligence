@@ -1,0 +1,8 @@
+[
+  {
+    "PatientId": 990000008,
+    "Name": "PACIENTE FICTÍCIO DATA",
+    "Status": "ACTIVE",
+    "BirthDate": "2099-12-31"
+  }
+]

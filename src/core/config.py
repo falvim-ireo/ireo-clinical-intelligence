@@ -13,6 +13,19 @@ def _bounded_int(value: str | None, default: int, maximum: int) -> int:
 
 
 class Config:
+    AUDIT_LOG_LEVEL = os.getenv("IREO_AUDIT_LOG_LEVEL", "WARNING").upper()
+    IREO_ONEDRIVE_PATIENTS_PATH = os.getenv(
+        "IREO_ONEDRIVE_PATIENTS_PATH",
+        r"D:\OneDrive\Pasta pacientes 2026",
+    )
+    IREO_RADIOLOGY_QUARANTINE_PATH = os.getenv(
+        "IREO_RADIOLOGY_QUARANTINE_PATH",
+        r"D:\IREO_Radiology_Quarantine",
+    )
+    IREO_ARCHIVE_TOOL_PATH = os.getenv(
+        "IREO_ARCHIVE_TOOL_PATH",
+        r"C:\Program Files\WinRAR\WinRAR.exe",
+    )
     CLINICORP_SUBSCRIBER_ID = os.getenv("CLINICORP_SUBSCRIBER_ID")
     CLINICORP_BUSINESS_ID = os.getenv("CLINICORP_BUSINESS_ID")
     CLINICORP_API_USER = os.getenv("CLINICORP_API_USER")

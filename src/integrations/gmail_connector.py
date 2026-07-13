@@ -89,6 +89,31 @@ class GmailConnector:
 
         return messages
 
+    def get_message(self, message_id: str) -> EmailMessage:
+        """Lê uma mensagem específica em formato completo, sem alterá-la."""
+
+        safe_message_id = str(message_id or "").strip()
+        if not safe_message_id:
+            raise GmailConnectorError("O identificador da mensagem é obrigatório.")
+
+        try:
+            raw_message = (
+                self._get_service()
+                .users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=safe_message_id,
+                    format="full",
+                )
+                .execute()
+            )
+        except Exception:
+            raise GmailConnectorError(
+                "A leitura da mensagem selecionada do Gmail falhou."
+            ) from None
+        return self.parse_message(raw_message)
+
     @classmethod
     def parse_message(cls, raw_message: dict[str, Any]) -> EmailMessage:
         """Converte a resposta MIME do Gmail em `EmailMessage`."""

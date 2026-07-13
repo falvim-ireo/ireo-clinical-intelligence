@@ -1,0 +1,9 @@
+[
+  {
+    "PatientId": 990000009,
+    "Name": "PACIENTE FICTÍCIO CONTATO",
+    "Status": "ACTIVE",
+    "Phone": "+00 00 00000-0000",
+    "Email": "paciente.ficticio@example.invalid"
+  }
+]

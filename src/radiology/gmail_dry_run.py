@@ -6,6 +6,11 @@ from typing import Optional
 from integrations.gmail_connector import GmailConnector
 from models.email_message import EmailMessage
 from models.radiology_intake_plan import RadiologyIntakePlan
+from observability.audit_logger import (
+    AuditEventType,
+    AuditLogger,
+    emit_safely,
+)
 from workflows.imaging_workflow import ImagingWorkflow
 
 
@@ -22,13 +27,25 @@ def run_gmail_dry_run(
     connector: Optional[GmailConnector] = None,
     workflow: Optional[ImagingWorkflow] = None,
     output: Callable[[str], None] = print,
+    audit_logger: Optional[AuditLogger] = None,
 ) -> int:
     """Lê mensagens e exibe somente os campos permitidos do plano."""
 
     gmail = connector or GmailConnector()
     imaging_workflow = workflow or ImagingWorkflow()
+    audit = (
+        audit_logger
+        or getattr(imaging_workflow, "audit_logger", None)
+        or AuditLogger()
+    )
 
     for message in gmail.list_messages():
+        emit_safely(
+            audit,
+            AuditEventType.RADIOLOGY_EMAIL_DETECTED,
+            status="DETECTED",
+            message_id=message.message_id,
+        )
         try:
             plan = imaging_workflow.run_dry_run(
                 message,
