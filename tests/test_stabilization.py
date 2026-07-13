@@ -107,6 +107,7 @@ def test_configuration_is_centralized_without_output(capsys) -> None:
         "services.patient_resolver",
         "services.radiology_import_service",
         "repositories.patient_repository",
+        "repositories.clinicorp_patient_repository",
         "utils.formatters",
         "utils.logger",
         "workflows.imaging_workflow",

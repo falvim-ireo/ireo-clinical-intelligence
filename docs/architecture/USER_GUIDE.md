@@ -10,8 +10,26 @@ ireo-clinical-intelligence radiology-gmail-dry-run
 ```
 
 It does not download TransferNow content, alter Gmail messages, create clinical
-folders, query Clinicorp, or access OneDrive. In Phase 3A the CLI does not load
-a patient directory, so patient association remains queued for manual review.
+folders, query Clinicorp, or access OneDrive. Without an explicit patient
+source, patient lookup remains offline and associations stay queued for manual
+review.
+
+To opt in to the existing Clinicorp read-only lookup, run:
+
+```powershell
+ireo-clinical-intelligence radiology-gmail-dry-run --patient-source clinicorp
+```
+
+This option uses the existing `Config` values and Basic Auth implementation. It
+performs one active-patient query using the normalized full name extracted from
+the intake. It does not generate name variants or search by CPF, phone, birth
+date, or aliases. Clinicorp currently works best when the complete name is
+available.
+
+If Clinicorp times out, returns an HTTP error, is unavailable, or returns an
+unusable structure, the output remains a manual-review plan. No patient can be
+associated automatically while the source is unavailable, and technical
+response details or credentials are not included in review reasons.
 
 ## Create OAuth Credentials
 

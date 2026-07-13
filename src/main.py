@@ -153,20 +153,58 @@ def clinicorp_main() -> None:
         print(f"Detalhes: {erro}")
 
 
+def build_radiology_workflow(patient_source: str):
+    """Compõe a fonte de pacientes sem ativar Clinicorp implicitamente."""
+
+    from workflows.imaging_workflow import ImagingWorkflow
+
+    if patient_source == "offline":
+        return ImagingWorkflow()
+
+    if patient_source == "clinicorp":
+        from repositories.clinicorp_patient_repository import (
+            ClinicorpPatientRepository,
+        )
+        from services.patient_resolver import PatientResolver
+
+        repository = ClinicorpPatientRepository(api=ClinicorpAPI())
+        return ImagingWorkflow(
+            patient_resolver=PatientResolver(repository)
+        )
+
+    raise ValueError("Fonte de pacientes inválida.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
         clinicorp_main()
         return None
 
-    if arguments == ["radiology-gmail-dry-run"]:
+    if arguments and arguments[0] == "radiology-gmail-dry-run":
         from integrations.gmail_connector import GmailConnectorError
         from radiology.gmail_dry_run import run_gmail_dry_run
 
+        if arguments == ["radiology-gmail-dry-run"]:
+            patient_source = "offline"
+        elif arguments == [
+            "radiology-gmail-dry-run",
+            "--patient-source",
+            "clinicorp",
+        ]:
+            patient_source = "clinicorp"
+        else:
+            print(
+                "Uso: ireo-clinical-intelligence radiology-gmail-dry-run "
+                "[--patient-source clinicorp]"
+            )
+            return 2
+
         try:
-            return run_gmail_dry_run()
-        except GmailConnectorError:
-            print("Não foi possível acessar o Gmail com segurança.")
+            workflow = build_radiology_workflow(patient_source)
+            return run_gmail_dry_run(workflow=workflow)
+        except (GmailConnectorError, ValueError):
+            print("Não foi possível concluir o dry-run com segurança.")
             return 1
 
     print(

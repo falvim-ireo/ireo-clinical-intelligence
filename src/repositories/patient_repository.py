@@ -5,6 +5,10 @@ from typing import Iterable, Protocol, Sequence
 from models.patient import Patient
 
 
+class PatientRepositoryUnavailableError(RuntimeError):
+    """Indica que uma fonte de pacientes não pôde responder com segurança."""
+
+
 class PatientRepository(Protocol):
     """Contrato mínimo para qualquer fonte de candidatos a paciente."""
 

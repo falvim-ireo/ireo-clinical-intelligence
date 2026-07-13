@@ -130,6 +130,9 @@ class RadiologyImportService:
             ResolutionReason.PATIENT_NOT_FOUND: (
                 "Nenhum paciente disponível para comparação."
             ),
+            ResolutionReason.PATIENT_SOURCE_UNAVAILABLE: (
+                "Fonte de pacientes indisponível; revisão manual obrigatória."
+            ),
             ResolutionReason.MANUAL_REVIEW_REQUIRED: (
                 "Nome do paciente não identificado."
             ),

@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+import re
+import unicodedata
 from typing import Optional, Sequence
-
-from services.patient_normalizer import PatientNormalizer
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,20 @@ class PatientMatcher:
     MINIMUM_AUTOMATIC_SCORE = 0.90
     AMBIGUITY_MARGIN = 0.10
 
+    @staticmethod
+    def normalize_name(name: str) -> str:
+        """Normaliza acentos, caixa, espaços, pontuação e separadores DICOM."""
+
+        decomposed = unicodedata.normalize("NFKD", str(name or ""))
+        without_accents = "".join(
+            character
+            for character in decomposed
+            if not unicodedata.combining(character)
+        )
+        with_spaces = without_accents.replace("^", " ")
+        alphanumeric = re.sub(r"[^A-Za-z0-9]+", " ", with_spaces)
+        return re.sub(r"\s+", " ", alphanumeric).strip().casefold()
+
     @classmethod
     def match(
         cls,
@@ -40,7 +54,7 @@ class PatientMatcher:
     ) -> PatientMatchResult:
         """Ordena candidatos e só seleciona uma correspondência forte e única."""
 
-        normalized_candidate = PatientNormalizer.compare_ready(
+        normalized_candidate = cls.normalize_name(
             patient_name_candidate or ""
         )
         if not normalized_candidate:
@@ -54,7 +68,7 @@ class PatientMatcher:
 
         scored_candidates = []
         for patient_name in available_patient_names:
-            normalized_patient = PatientNormalizer.compare_ready(patient_name)
+            normalized_patient = cls.normalize_name(patient_name)
             if not normalized_patient:
                 continue
 

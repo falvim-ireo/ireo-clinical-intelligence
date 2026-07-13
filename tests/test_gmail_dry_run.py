@@ -298,11 +298,11 @@ def test_cli_dispatches_gmail_dry_run_without_changing_default_flow(
     monkeypatch.setattr(
         gmail_dry_run,
         "run_gmail_dry_run",
-        lambda: calls.append("gmail") or 0,
+        lambda **kwargs: calls.append(kwargs["workflow"]) or 0,
     )
 
     assert main.main(["radiology-gmail-dry-run"]) == 0
-    assert calls == ["gmail"]
+    assert len(calls) == 1
 
 
 def test_gmail_config_uses_safe_defaults() -> None:

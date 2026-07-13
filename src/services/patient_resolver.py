@@ -6,7 +6,10 @@ from difflib import SequenceMatcher
 from models.imaging_exam import ImagingExam
 from models.patient import Patient
 from models.resolved_patient import ResolvedPatient, ResolutionReason
-from repositories.patient_repository import PatientRepository
+from repositories.patient_repository import (
+    PatientRepository,
+    PatientRepositoryUnavailableError,
+)
 from services.patient_normalizer import PatientNormalizer
 
 
@@ -38,9 +41,16 @@ class PatientResolver:
     def resolve(self, exam: ImagingExam) -> ResolvedPatient:
         """Consulta candidatos e retorna uma decisão explicável."""
 
-        candidates = tuple(
-            self.repository.find_candidates(exam.patient_name)
-        )
+        try:
+            candidates = tuple(
+                self.repository.find_candidates(exam.patient_name)
+            )
+        except PatientRepositoryUnavailableError:
+            return self._unmatched(
+                reason=ResolutionReason.PATIENT_SOURCE_UNAVAILABLE,
+                confidence_score=0.0,
+                candidates=(),
+            )
         if not candidates:
             return self._unmatched(
                 reason=ResolutionReason.PATIENT_NOT_FOUND,

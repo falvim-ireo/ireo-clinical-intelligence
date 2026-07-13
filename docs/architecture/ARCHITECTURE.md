@@ -91,9 +91,10 @@ token required for later Gmail sessions.
 After Gmail returns each full MIME message, all remaining processing is local.
 Message bodies and headers are not sent to AI models or AI services.
 The TransferNow connector only parses and validates text; it makes no HTTP
-request. The workflow does not access Clinicorp, OneDrive, archives, DICOM, or
-the filesystem. Ambiguous patient matching remains manual as defined in Phase
-2.
+request. The default workflow does not access Clinicorp, OneDrive, archives,
+DICOM, or the filesystem. Clinicorp is only composed when the operator uses
+`--patient-source clinicorp`. Ambiguous patient matching remains manual as
+defined in Phase 2.
 
 CLI output is restricted to the masked Gmail message ID, archive name, probable
 patient, matching status, manual-review flag, and logical destination. Message
@@ -142,3 +143,42 @@ The official workflow now creates `ImagingExam`, invokes `PatientResolver`, and
 uses `ResolvedPatient` to build the dry-run plan. The former `PatientMatcher`
 module remains temporarily available for backward compatibility but is no
 longer used by `RadiologyImportService` or `ImagingWorkflow`.
+
+## Clinicorp Patient Repository (Issue #33)
+
+The Clinicorp integration is an adapter behind the repository port:
+
+```text
+ImagingExam
+    -> PatientNormalizer
+    -> PatientResolver (matching and score)
+    -> PatientRepository (port)
+    -> ClinicorpPatientRepository (adapter)
+    -> ClinicorpAPI (Basic Auth HTTP client)
+```
+
+`ClinicorpPatientRepository` receives `ClinicorpAPI` through its constructor.
+It removes only external whitespace from the supplied name and performs
+exactly one active-patient query while preserving accents, letter case,
+internal whitespace, and word order. After Clinicorp returns candidates,
+`PatientNormalizer` supports their internal validation and comparison; it
+never rewrites the external query parameter at this stage. The adapter maps
+valid external records to domain `Patient` objects, removes duplicate
+`PatientId` values, and preserves response order. It does not score or select
+patients. `PatientResolver` depends only on the repository port and has no
+knowledge of Clinicorp or HTTP.
+
+The current Clinicorp endpoint works best with an exact full name. The adapter
+makes no automatic variations and does not search by CPF, phone, birth date, or
+aliases. Broader search strategies are intentionally deferred.
+
+Timeouts, HTTP errors, service unavailability, and unusable response structures
+become `PatientRepositoryUnavailableError` with a sanitized message. The
+resolver converts that condition to `PATIENT_SOURCE_UNAVAILABLE`, and the plan
+is always marked `DRY_RUN_REVIEW_REQUIRED`. Source failure can never produce an
+automatic patient association.
+
+Application composition remains safe by default. `radiology-gmail-dry-run`
+uses `EmptyPatientRepository`; the Clinicorp adapter is instantiated only for
+`radiology-gmail-dry-run --patient-source clinicorp`. Automated tests inject
+fakes and never construct the real HTTP path.
