@@ -68,6 +68,10 @@ def test_configuration_is_centralized_without_output(capsys) -> None:
         "CLINICORP_API_USER",
         "CLINICORP_TOKEN",
         "CLINICORP_BASE_URL",
+        "GMAIL_CREDENTIALS_FILE",
+        "GMAIL_TOKEN_FILE",
+        "GMAIL_QUERY",
+        "GMAIL_MAX_MESSAGES",
     }
 
     assert expected_settings.issubset(vars(Config))
@@ -92,12 +96,17 @@ def test_configuration_is_centralized_without_output(capsys) -> None:
         "models.imaging_exam",
         "models.patient",
         "models.radiology_intake_plan",
+        "models.resolved_patient",
         "radiology.archive_extractor",
         "radiology.dicom_reader",
+        "radiology.gmail_dry_run",
         "radiology.patient_matcher",
         "services.appointment_service",
         "services.patient_service",
+        "services.patient_normalizer",
+        "services.patient_resolver",
         "services.radiology_import_service",
+        "repositories.patient_repository",
         "utils.formatters",
         "utils.logger",
         "workflows.imaging_workflow",

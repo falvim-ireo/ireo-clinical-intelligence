@@ -1,3 +1,6 @@
+import sys
+from typing import Optional, Sequence
+
 from api.clinicorp_connector import ClinicorpAPI
 from intelligence.maintenance_engine import MaintenanceEngine
 from services.appointment_service import AppointmentService
@@ -92,7 +95,7 @@ def exibir_acompanhamento(agendamentos) -> None:
     )
 
 
-def main() -> None:
+def clinicorp_main() -> None:
     print("=" * 60)
     print("IREO Clinical Intelligence")
     print("=" * 60)
@@ -150,5 +153,28 @@ def main() -> None:
         print(f"Detalhes: {erro}")
 
 
+def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        clinicorp_main()
+        return None
+
+    if arguments == ["radiology-gmail-dry-run"]:
+        from integrations.gmail_connector import GmailConnectorError
+        from radiology.gmail_dry_run import run_gmail_dry_run
+
+        try:
+            return run_gmail_dry_run()
+        except GmailConnectorError:
+            print("Não foi possível acessar o Gmail com segurança.")
+            return 1
+
+    print(
+        "Uso: ireo-clinical-intelligence "
+        "[radiology-gmail-dry-run]"
+    )
+    return 2
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

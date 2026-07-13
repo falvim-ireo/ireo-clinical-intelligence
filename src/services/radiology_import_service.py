@@ -2,13 +2,14 @@
 
 from email.utils import parseaddr
 import re
-from typing import Optional, Sequence
+from typing import Optional
 
 from integrations.transfernow_connector import TransferNowConnector
 from models.email_message import EmailMessage
 from models.imaging_exam import ImagingExam
 from models.radiology_intake_plan import RadiologyIntakePlan
-from radiology.patient_matcher import PatientMatcher, PatientMatchResult
+from models.resolved_patient import ResolvedPatient, ResolutionReason
+from services.patient_resolver import PatientResolver
 
 
 class RadiologyImportService:
@@ -26,7 +27,7 @@ class RadiologyImportService:
     def create_plan(
         self,
         message: EmailMessage,
-        available_patient_names: Sequence[str],
+        patient_resolver: PatientResolver,
     ) -> RadiologyIntakePlan:
         """Cria um plano dry-run sem rede, download ou acesso a arquivos."""
 
@@ -55,38 +56,34 @@ class RadiologyImportService:
             content,
             message.subject,
         )
-        match_result = PatientMatcher.match(
-            transfer_message.patient_name_candidate,
-            available_patient_names,
-        )
         sender_email = (
             transfer_message.sender_email
             or self._extract_email(message.reply_to)
             or self._extract_email(message.sender)
         )
 
-        review_reasons = self._review_reasons(
-            match_result,
-            transfer_message.filename,
-            sender_email,
-        )
-        requires_manual_review = bool(review_reasons)
-
         exam = ImagingExam(
-            patient_name=(
-                match_result.selected_name
-                or transfer_message.patient_name_candidate
-                or "Não identificado"
-            ),
+            patient_name=transfer_message.patient_name_candidate or "",
             source="TransferNow",
             sender_name=parseaddr(message.reply_to or message.sender)[0] or None,
             sender_email=sender_email,
             archive_name=transfer_message.filename,
             received_at=message.received_at,
         )
+        resolved_patient = patient_resolver.resolve(exam)
+        if resolved_patient.matched:
+            exam.patient_id = resolved_patient.patient_id
+            exam.patient_name = resolved_patient.patient_name or exam.patient_name
+
+        review_reasons = self._review_reasons(
+            resolved_patient,
+            transfer_message.filename,
+            sender_email,
+        )
+        requires_manual_review = bool(review_reasons)
         proposed_destination = self._propose_destination(
             exam,
-            match_result.selected_name,
+            resolved_patient.patient_name,
             requires_manual_review,
         )
 
@@ -118,13 +115,30 @@ class RadiologyImportService:
 
     @staticmethod
     def _review_reasons(
-        match_result: PatientMatchResult,
+        resolved_patient: ResolvedPatient,
         archive_name: Optional[str],
         sender_email: Optional[str],
     ) -> list[str]:
         reasons = []
-        if match_result.review_reason:
-            reasons.append(match_result.review_reason)
+        resolution_messages = {
+            ResolutionReason.MULTIPLE_HIGH_SCORE: (
+                "Correspondência ambígua entre pacientes."
+            ),
+            ResolutionReason.LOW_SCORE: (
+                "Correspondência abaixo do limiar automático."
+            ),
+            ResolutionReason.PATIENT_NOT_FOUND: (
+                "Nenhum paciente disponível para comparação."
+            ),
+            ResolutionReason.MANUAL_REVIEW_REQUIRED: (
+                "Nome do paciente não identificado."
+            ),
+        }
+        resolution_message = resolution_messages.get(
+            resolved_patient.resolution_reason
+        )
+        if resolution_message:
+            reasons.append(resolution_message)
         if not archive_name:
             reasons.append("Nome do arquivo compactado não identificado.")
         if not sender_email:
