@@ -91,6 +91,7 @@ def test_configuration_is_centralized_without_output(capsys) -> None:
         "models.email_message",
         "models.imaging_exam",
         "models.patient",
+        "models.radiology_intake_plan",
         "radiology.archive_extractor",
         "radiology.dicom_reader",
         "radiology.patient_matcher",
