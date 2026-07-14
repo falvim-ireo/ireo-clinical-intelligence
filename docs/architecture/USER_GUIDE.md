@@ -165,7 +165,8 @@ The configured local paths are:
 ```text
 IREO_ONEDRIVE_PATIENTS_PATH=D:\OneDrive\Pasta pacientes 2026
 IREO_RADIOLOGY_QUARANTINE_PATH=D:\IREO_Radiology_Quarantine
-IREO_ARCHIVE_TOOL_PATH=C:\Program Files\WinRAR\WinRAR.exe
+IREO_ARCHIVE_TOOL_PATH=C:\Program Files\WinRAR\UnRAR.exe
+IREO_ARCHIVE_TIMEOUT_SECONDS=1800
 ```
 
 The command displays all Clinicorp candidates and compatible local patient
@@ -186,7 +187,7 @@ the copied files with SHA-256 checksums.
 
 1. Confirm that the archive belongs to the intended Sorrimagem examination.
 2. Confirm free space and write access in quarantine and the patient root.
-3. Confirm the configured WinRAR path and use a ZIP fallback when appropriate.
+3. Confirm the configured UnRAR console path and its 1800-second pilot timeout.
 4. Confirm Gmail OAuth readonly scope if Gmail mode will be used.
 5. Confirm Clinicorp credentials without displaying or copying them to logs.
 6. Start with `--archive-path` so Gmail/TransferNow acquisition is separated

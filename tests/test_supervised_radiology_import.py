@@ -73,7 +73,7 @@ def build_importer(
     for folder_name in patient_folders:
         (patients_root / folder_name).mkdir(exist_ok=True)
     quarantine = tmp_path / "quarantine"
-    tool = tmp_path / "WinRAR.exe"
+    tool = tmp_path / "UnRAR.exe"
     tool.write_bytes(b"ferramenta-ficticia")
     output: list[str] = []
     audit = AuditLogger(correlation_id="correlation-supervised-0001")
@@ -156,7 +156,7 @@ def test_checksums_match_every_copied_file(tmp_path: Path) -> None:
     assert manifest["checksums"] == {"nested/scan.bin": expected}
 
 
-def test_local_rar_uses_winrar_without_shell_and_keeps_inputs(
+def test_local_rar_uses_unrar_without_shell_and_keeps_inputs(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -168,7 +168,8 @@ def test_local_rar_uses_winrar_without_shell_and_keeps_inputs(
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
         if command[1] == "lb":
-            return subprocess.CompletedProcess(command, 0, "scan/image.dcm\n", "")
+            listing = "scan/image.dcm\n"
+            return subprocess.CompletedProcess(command, 0, listing, "")
         destination = Path(command[-1].rstrip("\\"))
         (destination / "scan").mkdir(parents=True, exist_ok=True)
         (destination / "scan" / "image.dcm").write_bytes(b"rar-extraido")
@@ -181,19 +182,29 @@ def test_local_rar_uses_winrar_without_shell_and_keeps_inputs(
     assert archive.exists()
     assert result.file_count == 1
     assert len(calls) == 2
-    assert calls[0][0][0].endswith("WinRAR.exe")
-    assert calls[0][0][1:] == ["lb", "-p-", str(archive.resolve())]
-    assert calls[1][0][1:4] == ["x", "-o-", "-p-"]
+    assert calls[0][0][0].endswith("UnRAR.exe")
+    assert calls[0][0][1:] == ["lb", str(archive.resolve())]
+    assert calls[1][0][0].endswith("UnRAR.exe")
+    assert calls[1][0][1:3] == ["x", "-o-"]
+    assert calls[1][0][-2] == str(archive.resolve())
+    assert calls[1][0][-1].endswith("\\")
+    assert all("WinRAR.exe" not in argument for call, _ in calls for argument in call)
     assert all(call_kwargs["shell"] is False for _, call_kwargs in calls)
-    assert all(call_kwargs["timeout"] == 120 for _, call_kwargs in calls)
+    assert all(call_kwargs["timeout"] == 1800 for _, call_kwargs in calls)
+    assert all(call_kwargs["capture_output"] is True for _, call_kwargs in calls)
+    assert all(
+        call_kwargs["creationflags"]
+        == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for _, call_kwargs in calls
+    )
 
 
-def test_winrar_not_found_is_safe(tmp_path: Path) -> None:
+def test_unrar_not_found_is_safe(tmp_path: Path) -> None:
     archive = tmp_path / "PACIENTE FICTICIO.rar"
     archive.write_bytes(b"rar")
     extractor = ArchiveExtractor(
         tmp_path / "quarantine",
-        tmp_path / "missing-winrar.exe",
+        tmp_path / "missing-unrar.exe",
     )
 
     with pytest.raises(ArchiveExtractionError, match="não foi encontrado"):
@@ -202,10 +213,10 @@ def test_winrar_not_found_is_safe(tmp_path: Path) -> None:
     assert archive.exists()
 
 
-def test_winrar_failure_is_checked(tmp_path: Path, monkeypatch) -> None:
+def test_unrar_failure_is_checked(tmp_path: Path, monkeypatch) -> None:
     archive = tmp_path / "PACIENTE FICTICIO.rar"
     archive.write_bytes(b"rar")
-    tool = tmp_path / "WinRAR.exe"
+    tool = tmp_path / "UnRAR.exe"
     tool.write_bytes(b"tool")
     extractor = ArchiveExtractor(tmp_path / "quarantine", tool)
     monkeypatch.setattr(
@@ -218,10 +229,10 @@ def test_winrar_failure_is_checked(tmp_path: Path, monkeypatch) -> None:
         extractor.extract(archive)
 
 
-def test_winrar_timeout_is_safe(tmp_path: Path, monkeypatch) -> None:
+def test_unrar_timeout_is_safe(tmp_path: Path, monkeypatch) -> None:
     archive = tmp_path / "PACIENTE FICTICIO.rar"
     archive.write_bytes(b"rar")
-    tool = tmp_path / "WinRAR.exe"
+    tool = tmp_path / "UnRAR.exe"
     tool.write_bytes(b"tool")
     extractor = ArchiveExtractor(tmp_path / "quarantine", tool, timeout_seconds=1)
 
@@ -232,6 +243,46 @@ def test_winrar_timeout_is_safe(tmp_path: Path, monkeypatch) -> None:
 
     with pytest.raises(ArchiveExtractionError, match="tempo limite"):
         extractor.extract(archive)
+
+
+def test_unrar_listing_blocks_traversal_before_extraction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    archive = tmp_path / "PACIENTE FICTICIO.rar"
+    archive.write_bytes(b"rar")
+    tool = tmp_path / "UnRAR.exe"
+    tool.write_bytes(b"tool")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        listing = "../../outside.txt\n"
+        return subprocess.CompletedProcess(command, 0, listing, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    extractor = ArchiveExtractor(tmp_path / "quarantine", tool)
+
+    with pytest.raises(ArchiveExtractionError, match="caminho inseguro"):
+        extractor.extract(archive)
+
+    assert len(calls) == 1
+    assert calls[0][1] == "lb"
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_unrar_lb_accepts_large_real_pilot_style_listing() -> None:
+    listing = "\n".join(
+        f"VERA LUCIA CRUZ/CT/SERIE_{index:04d}/IMAGEM_{index:04d}.dcm"
+        for index in range(1200)
+    )
+    listing = f"\n{listing}\n\n"
+
+    members = ArchiveExtractor._parse_unrar_listing(listing)
+
+    assert len(members) == 1200
+    assert members[0] == "VERA LUCIA CRUZ/CT/SERIE_0000/IMAGEM_0000.dcm"
+    assert members[-1] == "VERA LUCIA CRUZ/CT/SERIE_1199/IMAGEM_1199.dcm"
 
 
 def test_missing_local_archive_is_rejected(tmp_path: Path) -> None:
@@ -316,7 +367,7 @@ def test_zip_path_traversal_is_rejected_without_external_write(tmp_path: Path) -
     )
     extractor = ArchiveExtractor(
         tmp_path / "quarantine",
-        tmp_path / "WinRAR.exe",
+        tmp_path / "UnRAR.exe",
     )
 
     with pytest.raises(ArchiveExtractionError, match="caminho inseguro"):
@@ -400,12 +451,26 @@ def test_preview_reports_possible_duplicate_before_copy(tmp_path: Path) -> None:
     assert "Possíveis duplicados: 1" in output
 
 
-def test_user_without_exact_confirmation_causes_no_copy(tmp_path: Path) -> None:
+def test_copy_confirmation_is_case_insensitive_and_ignores_spaces(
+    tmp_path: Path,
+) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
-    importer, patients_root, quarantine, _ = build_importer(
+    importer, _, _, _ = build_importer(
         tmp_path,
-        answers=("1", "1", "confirmar"),
+        answers=("1", "1", "  confirmar  "),
     )
+
+    result = importer.run(archive_path=archive)
+
+    assert result.destination.is_dir()
+
+
+def test_enter_cancels_copy_with_friendly_prompt(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    prompts: list[str] = []
+    answers = iter(("1", "1", ""))
+    importer, patients_root, quarantine, _ = build_importer(tmp_path)
+    importer.input = lambda prompt: (prompts.append(prompt), next(answers))[1]
 
     with pytest.raises(SupervisedImportCancelled, match="confirmação explícita"):
         importer.run(archive_path=archive)
@@ -413,6 +478,9 @@ def test_user_without_exact_confirmation_causes_no_copy(tmp_path: Path) -> None:
     assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
     assert archive.exists()
     assert any(path.is_dir() for path in quarantine.iterdir())
+    assert "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)" in prompts[-1]
+    assert "[ENTER] = cancelar" in prompts[-1]
+    assert "CONFIRMAR = copiar" in prompts[-1]
 
 
 def test_copy_refuses_destination_created_after_preview(tmp_path: Path) -> None:

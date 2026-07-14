@@ -268,6 +268,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                 patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
                 quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
                 archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
                 patient_repository=repository,
                 gmail_connector=(
                     GmailConnector() if options.email_message_id else None

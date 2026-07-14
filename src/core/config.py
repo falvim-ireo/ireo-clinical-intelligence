@@ -24,7 +24,12 @@ class Config:
     )
     IREO_ARCHIVE_TOOL_PATH = os.getenv(
         "IREO_ARCHIVE_TOOL_PATH",
-        r"C:\Program Files\WinRAR\WinRAR.exe",
+        r"C:\Program Files\WinRAR\UnRAR.exe",
+    )
+    IREO_ARCHIVE_TIMEOUT_SECONDS = _bounded_int(
+        os.getenv("IREO_ARCHIVE_TIMEOUT_SECONDS"),
+        default=1800,
+        maximum=86400,
     )
     CLINICORP_SUBSCRIBER_ID = os.getenv("CLINICORP_SUBSCRIBER_ID")
     CLINICORP_BUSINESS_ID = os.getenv("CLINICORP_BUSINESS_ID")

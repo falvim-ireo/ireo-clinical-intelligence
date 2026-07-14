@@ -56,6 +56,7 @@ class SupervisedRadiologyImporter:
         patients_root: str | Path,
         quarantine_root: str | Path,
         archive_tool_path: str | Path,
+        archive_timeout_seconds: int = 1800,
         patient_repository: PatientRepository,
         gmail_connector: Optional[GmailConnector] = None,
         audit_logger: Optional[AuditLogger] = None,
@@ -78,6 +79,7 @@ class SupervisedRadiologyImporter:
         self.extractor = ArchiveExtractor(
             self.quarantine_root,
             archive_tool_path,
+            timeout_seconds=archive_timeout_seconds,
         )
         self.folder_locator = PatientFolderLocator(self.patients_root)
 
@@ -118,9 +120,13 @@ class SupervisedRadiologyImporter:
             duplicate_count=duplicate_count,
         )
         confirmation = self.input(
-            "Digite exatamente CONFIRMAR para copiar os arquivos: "
+            "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)\n"
+            "ou pressione ENTER para cancelar.\n"
+            "[ENTER] = cancelar\n"
+            "CONFIRMAR = copiar\n"
+            "> "
         )
-        if confirmation != "CONFIRMAR":
+        if confirmation.strip().casefold() != "confirmar":
             raise SupervisedImportCancelled(
                 "Importação cancelada: confirmação explícita não recebida."
             )

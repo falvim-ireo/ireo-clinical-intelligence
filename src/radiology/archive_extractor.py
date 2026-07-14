@@ -19,7 +19,7 @@ class ArchiveExtractor:
         self,
         quarantine_root: str | Path,
         archive_tool_path: str | Path,
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 1800,
     ) -> None:
         self.quarantine_root = Path(quarantine_root).expanduser().resolve()
         self.archive_tool_path = Path(archive_tool_path).expanduser()
@@ -74,26 +74,44 @@ class ArchiveExtractor:
 
     def _extract_rar(self, archive: Path, destination: Path) -> None:
         if not self.archive_tool_path.is_file():
-            raise ArchiveExtractionError("O executável do WinRAR não foi encontrado.")
+            raise ArchiveExtractionError("O executável do UnRAR não foi encontrado.")
 
-        listing = self._run_winrar(["lb", "-p-", str(archive)])
-        for member_name in listing.stdout.splitlines():
-            if member_name.strip():
-                self._validate_member(member_name.strip(), destination)
+        listing = self._run_tool(
+            self.archive_tool_path,
+            ["lb", str(archive)],
+        )
+        member_names = self._parse_unrar_listing(listing.stdout)
+        if not member_names:
+            raise ArchiveExtractionError(
+                "O UnRAR não retornou uma listagem válida do arquivo."
+            )
+        for member_name in member_names:
+            self._validate_member(member_name, destination)
 
-        target_argument = f"{destination}\\"
-        self._run_winrar(
+        target_argument = str(destination)
+        if not target_argument.endswith(("\\", "/")):
+            target_argument += "\\"
+        self._run_tool(
+            self.archive_tool_path,
             [
                 "x",
                 "-o-",
-                "-p-",
                 str(archive),
                 target_argument,
             ]
         )
 
-    def _run_winrar(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        command = [str(self.archive_tool_path), *arguments]
+    @staticmethod
+    def _parse_unrar_listing(output: str) -> list[str]:
+        """Extrai as linhas não vazias produzidas por ``unrar lb``."""
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    def _run_tool(
+        self,
+        executable: Path,
+        arguments: list[str],
+    ) -> subprocess.CompletedProcess[str]:
+        command = [str(executable), *arguments]
         try:
             completed = subprocess.run(
                 command,
@@ -102,19 +120,20 @@ class ArchiveExtractor:
                 text=True,
                 timeout=self.timeout_seconds,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except FileNotFoundError:
             raise ArchiveExtractionError(
-                "O executável do WinRAR não foi encontrado."
+                "O executável do UnRAR não foi encontrado."
             ) from None
         except subprocess.TimeoutExpired:
             raise ArchiveExtractionError(
-                "A extração pelo WinRAR excedeu o tempo limite."
+                "O processamento pelo UnRAR excedeu o tempo limite."
             ) from None
 
         if completed.returncode != 0:
             raise ArchiveExtractionError(
-                "O WinRAR não conseguiu processar o arquivo compactado."
+                "O UnRAR não conseguiu processar o arquivo compactado."
             )
         return completed
 

@@ -238,8 +238,9 @@ Gmail message ID (readonly) OR local .zip/.rar
 
 ZIP extraction validates every member before writing and rejects absolute
 paths, parent traversal, Windows drive paths, alternate streams, and symbolic
-links. RAR extraction invokes the configured WinRAR executable with a list of
-separate arguments, `shell=False`, exit-code validation, and timeout. Both
+links. RAR extraction invokes only the configured UnRAR console executable,
+first with `l` for path validation and then with `x -o-`, using separate
+arguments, `shell=False`, exit-code validation, and a configurable timeout. Both
 formats extract only below the configured quarantine. Archives and extracted
 folders are retained.
 
