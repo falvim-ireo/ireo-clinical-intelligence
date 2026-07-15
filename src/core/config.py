@@ -18,6 +18,16 @@ def _bounded_int(value: str | None, default: int, maximum: int) -> int:
     return min(max(parsed, 1), maximum)
 
 
+def _bounded_float(
+    value: str | None, default: float, minimum: float, maximum: float
+) -> float:
+    try:
+        parsed = float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
 class Config:
     AUDIT_LOG_LEVEL = os.getenv("IREO_AUDIT_LOG_LEVEL", "WARNING").upper()
     IREO_ONEDRIVE_PATIENTS_PATH = os.getenv(
@@ -50,6 +60,12 @@ class Config:
     IREO_BROWSER_DEBUG = _bool(os.getenv("IREO_BROWSER_DEBUG"))
     IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS = _bounded_int(
         os.getenv("IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS"), 3600, 86400
+    )
+    IREO_AUTO_SELECT_UNAMBIGUOUS = _bool(
+        os.getenv("IREO_AUTO_SELECT_UNAMBIGUOUS"), False
+    )
+    IREO_AUTO_SELECT_MIN_SCORE = _bounded_float(
+        os.getenv("IREO_AUTO_SELECT_MIN_SCORE"), 0.95, 0.0, 1.0
     )
     CLINICORP_SUBSCRIBER_ID = os.getenv("CLINICORP_SUBSCRIBER_ID")
     CLINICORP_BUSINESS_ID = os.getenv("CLINICORP_BUSINESS_ID")

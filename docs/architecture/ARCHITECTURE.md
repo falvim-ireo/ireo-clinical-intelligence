@@ -23,6 +23,14 @@ Todo arquivo baixado e extraído passa pela quarentena. ZIP e RAR têm caminhos 
 
 A pasta do paciente e a cópia final também exigem confirmação. A aplicação copia sem mover ou apagar a origem, usa criação exclusiva e não sobrescreve arquivos automaticamente. O OneDrive v1.0.0 é integrado por uma pasta sincronizada localmente; upload direto via Microsoft Graph é uma evolução futura.
 
+### Auto-seleção supervisionada
+
+A feature flag `IREO_AUTO_SELECT_UNAMBIGUOUS`, falsa por padrão, controla somente as seleções intermediárias. A decisão do paciente reutiliza o resultado estruturado do `PatientResolver`, mas aplica o limiar independente `IREO_AUTO_SELECT_MIN_SCORE` (padrão `0.95`) e uma allowlist fechada de motivos. Valores futuros desconhecidos falham para seleção manual.
+
+A pasta só acompanha uma auto-seleção segura do paciente quando há exatamente um diretório compatível, resolvido dentro da raiz, coerente após normalização e diferente de `REVIEW_REQUIRED`. Symlinks e junctions que resolvem fora da raiz são descartados. A aplicação nunca cria pastas de pacientes.
+
+As decisões emitem eventos sanitizados de auto-seleção ou revisão manual. O manifesto registra os modos e motivos. Nenhuma dessas decisões ignora a prévia completa ou a confirmação final `CONFIRMAR`.
+
 ## Radiology Intake Phase 2
 
 Phase 2 implements a dry-run planning flow. It receives data already loaded in

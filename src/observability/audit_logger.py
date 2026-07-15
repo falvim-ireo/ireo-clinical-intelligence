@@ -26,6 +26,10 @@ class AuditEventType(str, Enum):
     PATIENT_SOURCE_UNAVAILABLE = "PATIENT_SOURCE_UNAVAILABLE"
     RADIOLOGY_DRY_RUN_COMPLETED = "RADIOLOGY_DRY_RUN_COMPLETED"
     RADIOLOGY_DRY_RUN_FAILED = "RADIOLOGY_DRY_RUN_FAILED"
+    PATIENT_AUTO_SELECTED = "PATIENT_AUTO_SELECTED"
+    PATIENT_MANUAL_SELECTION_REQUIRED = "PATIENT_MANUAL_SELECTION_REQUIRED"
+    ONEDRIVE_FOLDER_AUTO_SELECTED = "ONEDRIVE_FOLDER_AUTO_SELECTED"
+    ONEDRIVE_FOLDER_MANUAL_SELECTION_REQUIRED = "ONEDRIVE_FOLDER_MANUAL_SELECTION_REQUIRED"
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class AuditEvent:
     masked_patient_id: Optional[str] = None
     requires_manual_review: Optional[bool] = None
     reason_code: Optional[str] = None
-    metadata: dict[str, str | int | bool] = field(default_factory=dict)
+    metadata: dict[str, str | int | float | bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
@@ -116,13 +120,25 @@ _ALLOWED_PATIENT_SOURCES = {"clinicorp", "offline"}
 def _sanitize_metadata(
     metadata: Optional[Mapping[str, Any]],
     download_url: Any,
-) -> dict[str, str | int | bool]:
-    sanitized: dict[str, str | int | bool] = {}
+) -> dict[str, str | int | float | bool]:
+    sanitized: dict[str, str | int | float | bool] = {}
     supplied = metadata or {}
 
     candidate_count = supplied.get("candidate_count")
     if isinstance(candidate_count, int) and candidate_count >= 0:
         sanitized["candidate_count"] = candidate_count
+
+    folder_candidate_count = supplied.get("folder_candidate_count")
+    if isinstance(folder_candidate_count, int) and folder_candidate_count >= 0:
+        sanitized["folder_candidate_count"] = folder_candidate_count
+
+    confidence_score = supplied.get("confidence_score")
+    if isinstance(confidence_score, (int, float)) and 0 <= confidence_score <= 1:
+        sanitized["confidence_score"] = round(float(confidence_score), 4)
+
+    override_manual = supplied.get("override_manual")
+    if isinstance(override_manual, bool):
+        sanitized["override_manual"] = override_manual
 
     matched_by = supplied.get("matched_by")
     if matched_by in _ALLOWED_MATCH_METHODS:

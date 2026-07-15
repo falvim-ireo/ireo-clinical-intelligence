@@ -15,13 +15,17 @@ import requests
 from integrations.gmail_connector import GmailConnector
 from integrations.onedrive_connector import PatientFolderLocator
 from integrations.transfernow_connector import TransferNowConnector
+from models.imaging_exam import ImagingExam
 from models.patient import Patient
-from observability.audit_logger import AuditLogger, mask_patient_id
+from models.resolved_patient import ResolvedPatient, ResolutionReason
+from observability.audit_logger import AuditEventType, AuditLogger, emit_safely, mask_patient_id
 from radiology.archive_extractor import ArchiveExtractor
 from repositories.patient_repository import (
     PatientRepository,
     PatientRepositoryUnavailableError,
+    InMemoryPatientRepository,
 )
+from services.patient_resolver import PatientResolver
 
 
 class SupervisedImportError(RuntimeError):
@@ -36,6 +40,10 @@ class SupervisedImportCancelled(SupervisedImportError):
 class ConfirmedPatient:
     name: str
     patient_id: Optional[int]
+    selection_mode: str = "manual"
+    selection_reason: str = "MANUAL_SELECTION"
+    confidence_score: float = 0.0
+    candidate_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,10 @@ class SupervisedRadiologyImporter:
         downloader: Optional[Callable[[str, str, Path], Path]] = None,
         today_provider: Callable[[], date] = date.today,
         now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        auto_select_unambiguous: bool = False,
+        auto_select_min_score: float = 0.95,
+        force_manual_selection: bool = False,
+        patient_source_mode: str = "clinicorp",
     ) -> None:
         self.patients_root = Path(patients_root).expanduser().resolve()
         self.quarantine_root = Path(quarantine_root).expanduser().resolve()
@@ -76,6 +88,10 @@ class SupervisedRadiologyImporter:
         self.downloader = downloader or self._download_transfernow
         self.today_provider = today_provider
         self.now_provider = now_provider
+        self.auto_select_unambiguous = bool(auto_select_unambiguous)
+        self.auto_select_min_score = min(max(float(auto_select_min_score), 0.0), 1.0)
+        self.force_manual_selection = bool(force_manual_selection)
+        self.patient_source_mode = patient_source_mode
         self.extractor = ArchiveExtractor(
             self.quarantine_root,
             archive_tool_path,
@@ -100,7 +116,10 @@ class SupervisedRadiologyImporter:
         )
         extracted = self.extractor.extract(archive)
         confirmed_patient = self._confirm_patient(probable_name)
-        patient_folder = self._choose_patient_folder(confirmed_patient.name)
+        patient_folder, folder_mode, folder_reason = self._choose_patient_folder(
+            confirmed_patient.name,
+            allow_auto=confirmed_patient.selection_mode == "auto",
+        )
         files = self._source_files(extracted)
         total_size = sum(path.stat().st_size for path in files)
         duplicate_count = self._possible_duplicate_count(
@@ -118,6 +137,8 @@ class SupervisedRadiologyImporter:
             file_count=len(files),
             total_size=total_size,
             duplicate_count=duplicate_count,
+            folder_selection_mode=folder_mode,
+            folder_selection_reason=folder_reason,
         )
         confirmation = self.input(
             "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)\n"
@@ -139,6 +160,8 @@ class SupervisedRadiologyImporter:
             files=files,
             total_size=total_size,
             source=source,
+            folder_selection_mode=folder_mode,
+            folder_selection_reason=folder_reason,
         )
 
     def _acquire_archive(
@@ -187,9 +210,49 @@ class SupervisedRadiologyImporter:
                 self.patient_repository.find_candidates(probable_name)
             )
         except PatientRepositoryUnavailableError:
+            self._audit_selection(
+                AuditEventType.PATIENT_MANUAL_SELECTION_REQUIRED,
+                "MANUAL_REQUIRED",
+                ResolutionReason.PATIENT_SOURCE_UNAVAILABLE,
+                candidate_count=0,
+                confidence_score=0.0,
+            )
             raise SupervisedImportError(
                 "A fonte de pacientes está indisponível; importação interrompida."
             ) from None
+
+        resolved = PatientResolver(
+            InMemoryPatientRepository(candidates), self.audit_logger
+        ).resolve(ImagingExam(patient_name=probable_name))
+        if self._is_patient_auto_selectable(resolved):
+            selected = next(
+                candidate for candidate in candidates if candidate.id == resolved.patient_id
+            )
+            self.output(f"Paciente selecionado automaticamente: {selected.nome}")
+            self.output("Motivo: único candidato elegível; score acima do limiar.")
+            self._audit_selection(
+                AuditEventType.PATIENT_AUTO_SELECTED,
+                "AUTO_SELECTED",
+                resolved.resolution_reason,
+                candidate_count=resolved.candidate_count,
+                confidence_score=resolved.confidence_score,
+            )
+            return ConfirmedPatient(
+                selected.nome,
+                selected.id,
+                "auto",
+                resolved.resolution_reason.value,
+                resolved.confidence_score,
+                resolved.candidate_count,
+            )
+
+        self._audit_selection(
+            AuditEventType.PATIENT_MANUAL_SELECTION_REQUIRED,
+            "MANUAL_REQUIRED",
+            resolved.resolution_reason,
+            candidate_count=resolved.candidate_count,
+            confidence_score=resolved.confidence_score,
+        )
 
         if not candidates:
             self.output("Nenhum candidato retornado pela fonte de pacientes.")
@@ -201,7 +264,12 @@ class SupervisedRadiologyImporter:
                 raise SupervisedImportCancelled(
                     "Importação cancelada na confirmação do paciente."
                 )
-            return ConfirmedPatient(probable_name, None)
+            return ConfirmedPatient(
+                probable_name,
+                None,
+                selection_reason=resolved.resolution_reason.value,
+                candidate_count=resolved.candidate_count,
+            )
 
         self.output("Candidatos de paciente:")
         for index, candidate in enumerate(candidates, start=1):
@@ -210,15 +278,68 @@ class SupervisedRadiologyImporter:
             "Selecione o número do paciente confirmado: ",
             candidates,
         )
-        return ConfirmedPatient(selected.nome, selected.id)
+        return ConfirmedPatient(
+            selected.nome,
+            selected.id,
+            selection_reason=resolved.resolution_reason.value,
+            confidence_score=PatientResolver.similarity_score(probable_name, selected.nome),
+            candidate_count=resolved.candidate_count,
+        )
 
-    def _choose_patient_folder(self, patient_name: str) -> Path:
+    def _is_patient_auto_selectable(self, resolved: ResolvedPatient) -> bool:
+        safe_reasons = {
+            ResolutionReason.EXACT_NAME,
+            ResolutionReason.NORMALIZED_NAME,
+            ResolutionReason.SINGLE_HIGH_SCORE,
+        }
+        return bool(
+            self.auto_select_unambiguous
+            and not self.force_manual_selection
+            and self.patient_source_mode != "offline"
+            and resolved.matched
+            and not resolved.requires_manual_review
+            and resolved.patient_id is not None
+            and resolved.candidate_count == 1
+            and resolved.confidence_score >= self.auto_select_min_score
+            and resolved.resolution_reason in safe_reasons
+        )
+
+    def _choose_patient_folder(
+        self, patient_name: str, *, allow_auto: bool = False
+    ) -> tuple[Path, str, str]:
         matches = self.folder_locator.find_compatible(patient_name)
         if not matches:
             raise SupervisedImportError(
                 "Nenhuma pasta compatível de paciente foi encontrada."
             )
 
+        can_auto_select = bool(
+            self.auto_select_unambiguous
+            and allow_auto
+            and not self.force_manual_selection
+            and self.patient_source_mode != "offline"
+            and len(matches) == 1
+            and self._similar_folder_count(patient_name) == 1
+            and "REVIEW REQUIRED" not in matches[0].name.upper().replace("_", " ")
+        )
+        if can_auto_select:
+            selected = self.folder_locator.validate_selection(matches[0])
+            self.output(f"Pasta selecionada automaticamente: {selected}")
+            self.output("Motivo: única pasta compatível e coerente.")
+            self._audit_selection(
+                AuditEventType.ONEDRIVE_FOLDER_AUTO_SELECTED,
+                "AUTO_SELECTED",
+                "SINGLE_COMPATIBLE_FOLDER",
+                folder_candidate_count=1,
+            )
+            return selected, "auto", "SINGLE_COMPATIBLE_FOLDER"
+
+        self._audit_selection(
+            AuditEventType.ONEDRIVE_FOLDER_MANUAL_SELECTION_REQUIRED,
+            "MANUAL_REQUIRED",
+            "FOLDER_MANUAL_SELECTION",
+            folder_candidate_count=len(matches),
+        )
         self.output("Pastas compatíveis no OneDrive local:")
         for index, folder in enumerate(matches, start=1):
             self.output(f"{index}. {folder}")
@@ -226,7 +347,30 @@ class SupervisedRadiologyImporter:
             "Selecione o número da pasta confirmada: ",
             matches,
         )
-        return self.folder_locator.validate_selection(selected)
+        return self.folder_locator.validate_selection(selected), "manual", "FOLDER_MANUAL_SELECTION"
+
+    def _similar_folder_count(self, patient_name: str) -> int:
+        if not self.patients_root.is_dir():
+            return 0
+        return sum(
+            1
+            for folder in self.patients_root.iterdir()
+            if folder.is_dir()
+            and folder.resolve().is_relative_to(self.patients_root)
+            and PatientResolver.similarity_score(patient_name, folder.name)
+            >= PatientResolver.MINIMUM_MATCH_SCORE
+        )
+
+    def _audit_selection(
+        self, event_type: AuditEventType, status: str, reason: Any, **metadata: Any
+    ) -> None:
+        emit_safely(
+            self.audit_logger,
+            event_type,
+            status=status,
+            reason_code=reason,
+            metadata={**metadata, "override_manual": self.force_manual_selection},
+        )
 
     def _numbered_choice(self, prompt: str, options: Sequence[Any]) -> Any:
         value = self.input(prompt).strip()
@@ -297,19 +441,26 @@ class SupervisedRadiologyImporter:
         file_count: int,
         total_size: int,
         duplicate_count: int,
+        folder_selection_mode: str,
+        folder_selection_reason: str,
     ) -> None:
         self.output(f"Arquivo de origem: {archive}")
         self.output(f"Pasta extraída: {extracted}")
         self.output(f"Paciente confirmado: {patient.name}")
         self.output(
             "PatientId: "
-            f"{patient.patient_id if patient.patient_id is not None else 'não disponível'}"
+            f"{mask_patient_id(patient.patient_id) or 'não disponível'}"
         )
         self.output(f"Pasta do paciente: {patient_folder}")
         self.output(f"Destino final: {destination}")
         self.output(f"Quantidade de arquivos: {file_count}")
         self.output(f"Tamanho total: {total_size} bytes")
         self.output(f"Possíveis duplicados: {duplicate_count}")
+        self.output(f"Feature flag de auto-seleção ativa: {self.auto_select_unambiguous}")
+        self.output(
+            "Motivo da seleção: "
+            f"paciente={patient.selection_reason}; pasta={folder_selection_reason}"
+        )
 
     def _copy_and_manifest(
         self,
@@ -321,6 +472,8 @@ class SupervisedRadiologyImporter:
         files: list[Path],
         total_size: int,
         source: str,
+        folder_selection_mode: str = "manual",
+        folder_selection_reason: str = "FOLDER_MANUAL_SELECTION",
     ) -> SupervisedImportResult:
         if not destination.resolve().is_relative_to(self.patients_root):
             raise SupervisedImportError(
@@ -374,6 +527,14 @@ class SupervisedRadiologyImporter:
             "source": source,
             "destination": str(destination),
             "status": "COMPLETED",
+            "selection_mode": {
+                "patient": patient.selection_mode,
+                "folder": folder_selection_mode,
+            },
+            "auto_selection_reason": {
+                "patient": patient.selection_reason,
+                "folder": folder_selection_reason,
+            },
         }
         manifest_path = destination / "manifest.json"
         try:

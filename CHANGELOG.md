@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- auto-seleção opt-in de paciente e pasta quando a resolução é única e segura
+- override CLI `--force-manual-selection`
+- modos e motivos de seleção no `manifest.json`
+- eventos sanitizados de seleção automática e manual
+
+### Security
+
+- confirmação final `CONFIRMAR` permanece obrigatória
+- ambiguidades, modo offline e motivos desconhecidos falham para seleção manual
+
 ## [1.0.0] - 2026-07-15
 
 ### Added

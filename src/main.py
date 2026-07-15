@@ -266,6 +266,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             choices=("clinicorp", "offline"),
             default="offline",
         )
+        parser.add_argument("--force-manual-selection", action="store_true")
         try:
             options = parser.parse_args(arguments[1:])
         except SystemExit:
@@ -295,6 +296,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                     GmailConnector() if options.email_message_id else None
                 ),
                 audit_logger=audit,
+                auto_select_unambiguous=Config.IREO_AUTO_SELECT_UNAMBIGUOUS,
+                auto_select_min_score=Config.IREO_AUTO_SELECT_MIN_SCORE,
+                force_manual_selection=options.force_manual_selection,
+                patient_source_mode=options.patient_source,
             )
             result = importer.run(
                 archive_path=options.archive_path,
@@ -340,6 +345,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         parser.add_argument(
             "--patient-source", choices=("clinicorp", "offline"), default="offline"
         )
+        parser.add_argument("--force-manual-selection", action="store_true")
         try:
             options = parser.parse_args(arguments[1:])
         except SystemExit:
@@ -358,6 +364,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
             patient_repository=repository,
             audit_logger=audit,
+            auto_select_unambiguous=Config.IREO_AUTO_SELECT_UNAMBIGUOUS,
+            auto_select_min_score=Config.IREO_AUTO_SELECT_MIN_SCORE,
+            force_manual_selection=options.force_manual_selection,
+            patient_source_mode=options.patient_source,
         )
         downloader = TransferNowDownloader(
             connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,

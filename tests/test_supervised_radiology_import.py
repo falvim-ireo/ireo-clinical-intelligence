@@ -2,7 +2,9 @@
 
 from datetime import date, datetime, timezone
 import hashlib
+import io
 import json
+import logging
 from pathlib import Path
 import shutil
 import socket
@@ -19,6 +21,7 @@ from integrations.onedrive_connector import (
 )
 from models.email_message import EmailMessage
 from models.patient import Patient
+from models.resolved_patient import ResolvedPatient, ResolutionReason
 from observability.audit_logger import AuditLogger, mask_patient_id
 from radiology.archive_extractor import (
     ArchiveExtractionError,
@@ -32,6 +35,7 @@ from radiology.supervised_import import (
 )
 from repositories.patient_repository import InMemoryPatientRepository
 from repositories.patient_repository import EmptyPatientRepository
+from repositories.patient_repository import PatientRepositoryUnavailableError
 
 
 PATIENT_NAME = "CLÁUDIA EXEMPLO FICTÍCIA"
@@ -67,6 +71,11 @@ def build_importer(
     patient_folders: tuple[str, ...] = (PATIENT_NAME,),
     gmail_connector=None,
     downloader=None,
+    auto_select_unambiguous: bool = False,
+    auto_select_min_score: float = 0.95,
+    force_manual_selection: bool = False,
+    patient_source_mode: str = "clinicorp",
+    audit_logger=None,
 ) -> tuple[SupervisedRadiologyImporter, Path, Path, list[str]]:
     patients_root = tmp_path / "patients"
     patients_root.mkdir(exist_ok=True)
@@ -76,7 +85,7 @@ def build_importer(
     tool = tmp_path / "UnRAR.exe"
     tool.write_bytes(b"ferramenta-ficticia")
     output: list[str] = []
-    audit = AuditLogger(correlation_id="correlation-supervised-0001")
+    audit = audit_logger or AuditLogger(correlation_id="correlation-supervised-0001")
     importer = SupervisedRadiologyImporter(
         patients_root=patients_root,
         quarantine_root=quarantine,
@@ -100,6 +109,10 @@ def build_importer(
             59,
             tzinfo=timezone.utc,
         ),
+        auto_select_unambiguous=auto_select_unambiguous,
+        auto_select_min_score=auto_select_min_score,
+        force_manual_selection=force_manual_selection,
+        patient_source_mode=patient_source_mode,
     )
     return importer, patients_root, quarantine, output
 
@@ -705,3 +718,196 @@ def test_cli_requires_exactly_one_input_option() -> None:
             "fixture-message",
         ]
     ) == 2
+
+
+def resolved_fixture(
+    *, score: float = 1.0, reason=ResolutionReason.EXACT_NAME,
+    patient_id: int | None = 990000010, candidate_count: int = 1,
+    matched: bool = True, manual: bool = False,
+) -> ResolvedPatient:
+    return ResolvedPatient(
+        patient_id=patient_id,
+        patient_name=PATIENT_NAME if matched else None,
+        matched=matched,
+        requires_manual_review=manual,
+        confidence_score=score,
+        resolution_reason=reason,
+        candidate_count=candidate_count,
+        candidate_names=[PATIENT_NAME] * candidate_count,
+        matched_by="exact_name" if matched else None,
+    )
+
+
+def test_auto_selection_flag_false_preserves_manual_flow(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, output = build_importer(tmp_path)
+
+    manifest = json.loads(importer.run(archive_path=archive).manifest_path.read_text("utf-8"))
+
+    assert manifest["selection_mode"] == {"patient": "manual", "folder": "manual"}
+    assert any("Candidatos de paciente" in line for line in output)
+
+
+def test_exact_patient_and_single_folder_are_auto_selected(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, output = build_importer(
+        tmp_path, answers=("CONFIRMAR",), auto_select_unambiguous=True,
+    )
+
+    manifest = json.loads(importer.run(archive_path=archive).manifest_path.read_text("utf-8"))
+
+    assert manifest["selection_mode"] == {"patient": "auto", "folder": "auto"}
+    assert manifest["auto_selection_reason"] == {
+        "patient": "EXACT_NAME", "folder": "SINGLE_COMPATIBLE_FOLDER"
+    }
+    assert any("Paciente selecionado automaticamente" in line for line in output)
+    assert any("Pasta selecionada automaticamente" in line for line in output)
+
+
+@pytest.mark.parametrize("score, expected", [(0.94, False), (0.95, True)])
+def test_auto_selection_uses_independent_inclusive_threshold(
+    tmp_path: Path, score: float, expected: bool,
+) -> None:
+    importer, _, _, _ = build_importer(tmp_path, auto_select_unambiguous=True)
+    assert importer._is_patient_auto_selectable(resolved_fixture(score=score)) is expected
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        resolved_fixture(candidate_count=2, manual=True, matched=False,
+                         reason=ResolutionReason.MULTIPLE_HIGH_SCORE),
+        resolved_fixture(candidate_count=1, manual=True, matched=False,
+                         reason=ResolutionReason.MULTIPLE_HIGH_SCORE),
+        resolved_fixture(patient_id=None),
+        resolved_fixture(reason="FUTURE_UNKNOWN_REASON"),
+    ],
+)
+def test_unsafe_patient_resolution_never_auto_selects(
+    tmp_path: Path, resolved: ResolvedPatient,
+) -> None:
+    importer, _, _, _ = build_importer(tmp_path, auto_select_unambiguous=True)
+    assert importer._is_patient_auto_selectable(resolved) is False
+
+
+def test_patient_source_unavailable_stops_safely(tmp_path: Path) -> None:
+    class UnavailableRepository:
+        def find_candidates(self, name):
+            raise PatientRepositoryUnavailableError("sensitive")
+
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, patients_root, _, _ = build_importer(
+        tmp_path, auto_select_unambiguous=True,
+    )
+    importer.patient_repository = UnavailableRepository()
+
+    with pytest.raises(SupervisedImportError, match="indisponível"):
+        importer.run(archive_path=archive)
+    assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
+
+
+def test_auto_folder_outside_root_is_rejected(tmp_path: Path) -> None:
+    importer, _, _, _ = build_importer(tmp_path, auto_select_unambiguous=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    importer.folder_locator.find_compatible = lambda name: [outside]
+
+    with pytest.raises(PatientFolderError, match="fora da raiz"):
+        importer._choose_patient_folder(PATIENT_NAME, allow_auto=True)
+
+
+def test_two_folders_remain_manual_when_feature_is_active(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    folders = (f"001 - {PATIENT_NAME}", f"002 - {PATIENT_NAME}")
+    importer, patients_root, _, _ = build_importer(
+        tmp_path, answers=("2", "CONFIRMAR"), patient_folders=folders,
+        auto_select_unambiguous=True,
+    )
+
+    result = importer.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+    assert result.destination.is_relative_to(patients_root / folders[1])
+    assert manifest["selection_mode"] == {"patient": "auto", "folder": "manual"}
+
+
+def test_incoherent_folder_name_is_not_selected(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(
+        tmp_path, patient_folders=("OUTRO PACIENTE",), auto_select_unambiguous=True,
+    )
+    with pytest.raises(SupervisedImportError, match="Nenhuma pasta"):
+        importer.run(archive_path=archive)
+
+
+def test_force_manual_override_disables_both_auto_selections(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(
+        tmp_path, auto_select_unambiguous=True, force_manual_selection=True,
+    )
+    manifest = json.loads(importer.run(archive_path=archive).manifest_path.read_text("utf-8"))
+    assert manifest["selection_mode"] == {"patient": "manual", "folder": "manual"}
+
+
+def test_auto_selection_still_requires_final_confirmation(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, patients_root, _, _ = build_importer(
+        tmp_path, answers=("",), auto_select_unambiguous=True,
+    )
+    with pytest.raises(SupervisedImportCancelled, match="confirmação explícita"):
+        importer.run(archive_path=archive)
+    assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
+
+
+def test_selection_audit_is_sanitized(tmp_path: Path) -> None:
+    stream = io.StringIO()
+    logger = logging.Logger("selection-audit")
+    logger.addHandler(logging.StreamHandler(stream))
+    audit = AuditLogger(logger=logger, level="INFO", correlation_id="correlation-auto-0001")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(
+        tmp_path, answers=("CONFIRMAR",), auto_select_unambiguous=True,
+        audit_logger=audit,
+    )
+
+    importer.run(archive_path=archive)
+    payload = stream.getvalue()
+    assert "PATIENT_AUTO_SELECTED" in payload
+    assert "ONEDRIVE_FOLDER_AUTO_SELECTED" in payload
+    assert '"confidence_score":1.0' in payload
+    assert '"candidate_count":1' in payload
+    assert '"folder_candidate_count":1' in payload
+    assert '"override_manual":false' in payload
+    assert PATIENT_NAME not in payload
+    assert str(tmp_path) not in payload
+
+
+def test_offline_mode_never_auto_selects(tmp_path: Path) -> None:
+    importer, _, _, _ = build_importer(
+        tmp_path, auto_select_unambiguous=True, patient_source_mode="offline",
+    )
+    assert importer._is_patient_auto_selectable(resolved_fixture()) is False
+
+
+def test_cli_force_manual_option_reaches_importer(tmp_path: Path, monkeypatch) -> None:
+    import main
+    from radiology import supervised_import
+
+    calls = {}
+
+    class FakeImporter:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def run(self, **kwargs):
+            return SimpleNamespace(
+                destination=tmp_path / "destination",
+                manifest_path=tmp_path / "destination" / "manifest.json",
+            )
+
+    monkeypatch.setattr(supervised_import, "SupervisedRadiologyImporter", FakeImporter)
+    result = main.main([
+        "radiology-import-supervised", "--archive-path", "fixture.zip",
+        "--patient-source", "offline", "--force-manual-selection",
+    ])
+    assert result == 0
+    assert calls["force_manual_selection"] is True

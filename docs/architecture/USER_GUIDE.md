@@ -34,6 +34,19 @@ ireo-clinical-intelligence radiology-import-supervised `
 
 O fallback mantém as mesmas confirmações de paciente, pasta, prévia e cópia final. Não use arquivos fora do fluxo autorizado.
 
+### Redução opcional de confirmações
+
+Por padrão, paciente e pasta continuam manuais. Um administrador pode habilitar localmente:
+
+```env
+IREO_AUTO_SELECT_UNAMBIGUOUS=true
+IREO_AUTO_SELECT_MIN_SCORE=0.95
+```
+
+Com a flag ativa, o terminal informa o paciente e a pasta selecionados automaticamente e seus motivos. Isso só ocorre com um candidato Clinicorp elegível, PatientId presente, score suficiente, resolução não ambígua e uma única pasta coerente dentro da raiz. Modo offline, mais de um candidato ou pasta, score baixo, indisponibilidade, inconsistência ou motivo não reconhecido exigem seleção humana.
+
+Use `--force-manual-selection` em qualquer comando de importação para ignorar a automação naquela execução. Em caso de dúvida operacional, altere imediatamente `IREO_AUTO_SELECT_UNAMBIGUOUS=false` e reinicie o comando. Mesmo com auto-seleção, revise todos os dados da prévia e digite `CONFIRMAR`; sem essa confirmação nenhum arquivo é copiado.
+
 ## Gmail Radiology Dry-Run
 
 ## Purpose

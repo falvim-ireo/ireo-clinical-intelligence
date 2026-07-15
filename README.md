@@ -53,6 +53,19 @@ Gmail é readonly; URLs, credenciais e identificadores são sanitizados nos logs
 
 O MVP depende da pasta local do OneDrive, não roda continuamente em background, não interpreta metadados DICOM, não remove temporários automaticamente, não marca e-mails como processados e não possui dashboard. Não substitui validação clínica nem deve operar sem supervisão.
 
+### Auto-seleção segura (opt-in)
+
+A redução de confirmações intermediárias é desativada por padrão. Para habilitá-la explicitamente:
+
+```env
+IREO_AUTO_SELECT_UNAMBIGUOUS=true
+IREO_AUTO_SELECT_MIN_SCORE=0.95
+```
+
+O limiar é independente do `PatientResolver`. A auto-seleção exige exatamente um paciente elegível, sem revisão, com PatientId, score mínimo e motivo `EXACT_NAME`, `NORMALIZED_NAME` ou `SINGLE_HIGH_SCORE`, além de uma única pasta coerente e contida na raiz local. Ambiguidade, fonte indisponível, modo offline, pasta ausente/múltipla/incoerente ou motivo desconhecido mantêm a seleção manual.
+
+Para forçar o comportamento manual em uma execução, acrescente `--force-manual-selection` a `radiology-import-supervised` ou `radiology-import-from-gmail`. Para desativar rapidamente em todo o ambiente, defina `IREO_AUTO_SELECT_UNAMBIGUOUS=false`. A prévia e a confirmação final digitada `CONFIRMAR` permanecem obrigatórias em todos os casos.
+
 ## Solução de problemas
 
 - **OAuth Gmail:** confira os caminhos de credencial/token e o escopo readonly; revogue e refaça o consentimento se o token estiver inválido.
