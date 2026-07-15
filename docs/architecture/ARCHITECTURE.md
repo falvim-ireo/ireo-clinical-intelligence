@@ -1,5 +1,28 @@
 # IREO Clinical Intelligence Architecture
 
+## Fluxo oficial v1.0.0
+
+```text
+Gmail API (readonly)
+    -> seleção supervisionada da mensagem
+    -> parsing e priorização do link público TransferNow /dl/
+    -> download HTTPS ou Playwright em contexto temporário
+    -> checksum SHA-256 e quarentena
+    -> extração segura ZIP/RAR
+    -> Clinicorp (fonte mestre de identificação)
+    -> confirmação humana do paciente e da pasta
+    -> prévia de arquivos, tamanho e duplicidades
+    -> confirmação explícita CONFIRMAR
+    -> cópia exclusiva para pasta OneDrive local
+    -> manifest.json
+```
+
+O Gmail é acessado somente com o escopo `gmail.readonly` e nenhuma mensagem é modificada ou marcada como processada. O link público `/dl/` do TransferNow é priorizado; quando a página exige JavaScript, Playwright abre Chromium visível em contexto temporário, sem perfil persistente e sem contornar proteções externas.
+
+Todo arquivo baixado e extraído passa pela quarentena. ZIP e RAR têm caminhos validados contra traversal antes da extração. O Clinicorp é a fonte mestre para identificação; associação ausente ou ambígua nunca é resolvida automaticamente e exige revisão humana.
+
+A pasta do paciente e a cópia final também exigem confirmação. A aplicação copia sem mover ou apagar a origem, usa criação exclusiva e não sobrescreve arquivos automaticamente. O OneDrive v1.0.0 é integrado por uma pasta sincronizada localmente; upload direto via Microsoft Graph é uma evolução futura.
+
 ## Radiology Intake Phase 2
 
 Phase 2 implements a dry-run planning flow. It receives data already loaded in

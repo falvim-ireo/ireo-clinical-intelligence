@@ -1,2 +1,63 @@
-# ireo-clinical-intelligence
-AI-powered Clinical Intelligence Platform for Integrated Oral Healthcare, Facial &amp; Body Aesthetics, Clinical Research and Education
+# IREO Clinical Intelligence
+
+Plataforma operacional para ingestão segura e supervisionada de exames radiológicos no IREO. O MVP recebe notificações do TransferNow no Gmail, baixa e valida o arquivo, confirma a identidade no Clinicorp e copia o exame para a pasta local sincronizada pelo OneDrive.
+
+**Status:** MVP v1.0.0 validado em piloto real supervisionado. O sistema exige supervisão humana em todas as importações.
+
+## Fluxo
+
+```text
+Gmail readonly -> mensagem TransferNow -> link público /dl/
+-> download HTTP ou Chromium temporário -> SHA-256 -> quarentena
+-> extração segura -> Clinicorp -> confirmação do paciente
+-> seleção da pasta OneDrive local -> revisão humana -> cópia sem sobrescrita
+-> manifest.json
+```
+
+## Requisitos
+
+- Windows 11 e Python 3.11 ou superior;
+- UnRAR (console) para arquivos RAR;
+- Playwright Chromium para páginas que exigem JavaScript;
+- credencial OAuth Desktop do Gmail com escopo somente leitura;
+- acesso de leitura à API Clinicorp;
+- pasta de pacientes do OneDrive sincronizada localmente.
+
+## Instalação
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python -m playwright install chromium
+```
+
+Copie `.env.example` para `.env` e preencha somente no arquivo local. Configure as credenciais Clinicorp, os caminhos protegidos dos arquivos OAuth Gmail, a raiz local do OneDrive, a quarentena e o executável UnRAR. Não versione `.env`, tokens, credenciais ou caminhos com dados reais.
+
+## Comandos principais
+
+```powershell
+ireo-clinical-intelligence browser-self-test
+ireo-clinical-intelligence radiology-gmail-dry-run
+ireo-clinical-intelligence radiology-import-supervised --archive-path "C:\caminho\exame.rar" --patient-source clinicorp
+ireo-clinical-intelligence radiology-import-from-gmail --patient-source clinicorp
+```
+
+## Procedimento operacional
+
+Valide primeiro OAuth, navegador, UnRAR, espaço livre e acesso às pastas. Execute o fluxo do Gmail em primeiro plano, selecione a mensagem, autorize o download e revise checksum, paciente, pasta, quantidade, tamanho e duplicidades. A cópia final só ocorre após digitar exatamente `CONFIRMAR`. Ao concluir, confira os arquivos e `manifest.json` no destino. Consulte o [guia do operador](docs/architecture/USER_GUIDE.md).
+
+## Segurança e limitações
+
+Gmail é readonly; URLs, credenciais e identificadores são sanitizados nos logs; downloads e extrações permanecem em quarentena; caminhos de arquivo são validados; destinos existentes não são sobrescritos; associações ambíguas e a cópia final exigem decisão humana.
+
+O MVP depende da pasta local do OneDrive, não roda continuamente em background, não interpreta metadados DICOM, não remove temporários automaticamente, não marca e-mails como processados e não possui dashboard. Não substitui validação clínica nem deve operar sem supervisão.
+
+## Solução de problemas
+
+- **OAuth Gmail:** confira os caminhos de credencial/token e o escopo readonly; revogue e refaça o consentimento se o token estiver inválido.
+- **Chromium ausente:** execute `python -m playwright install chromium` e depois `browser-self-test`.
+- **RAR não extrai:** confirme `IREO_ARCHIVE_TOOL_PATH`, permissões e se o arquivo não exige senha.
+- **Link não baixa:** use o fallback manual `radiology-import-supervised --archive-path ...`.
+- **Paciente ou pasta ambíguos:** não prossiga até conferir manualmente a identidade e o destino.
+- **Destino ou cópia parcial:** preserve as evidências e revise manualmente; o sistema não apaga resultados automaticamente.

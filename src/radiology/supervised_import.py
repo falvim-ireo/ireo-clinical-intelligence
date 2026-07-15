@@ -168,13 +168,13 @@ class SupervisedRadiologyImporter:
             body for body in (message.text_body, message.html_body) if body
         )
         transfer = TransferNowConnector.interpretar(content, message.subject)
-        if not transfer.filename or not transfer.patient_name_candidate:
+        if not transfer.original_filename or not transfer.patient_name_candidate:
             raise SupervisedImportError(
                 "A mensagem não informa um arquivo radiológico válido."
             )
         archive = self.downloader(
             transfer.download_url,
-            transfer.filename,
+            transfer.original_filename,
             self.quarantine_root,
         ).resolve()
         if not archive.is_file():

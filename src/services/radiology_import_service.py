@@ -67,7 +67,7 @@ class RadiologyImportService:
             AuditEventType.TRANSFERNOW_MESSAGE_PARSED,
             status="PARSED",
             message_id=message_id,
-            archive_name=transfer_message.filename,
+            archive_name=transfer_message.original_filename,
             download_url=transfer_message.download_url,
         )
         sender_email = (
@@ -81,7 +81,7 @@ class RadiologyImportService:
             source="TransferNow",
             sender_name=parseaddr(message.reply_to or message.sender)[0] or None,
             sender_email=sender_email,
-            archive_name=transfer_message.filename,
+            archive_name=transfer_message.original_filename,
             received_at=message.received_at,
         )
         resolved_patient = patient_resolver.resolve(exam)
@@ -91,7 +91,7 @@ class RadiologyImportService:
 
         review_reasons = self._review_reasons(
             resolved_patient,
-            transfer_message.filename,
+            transfer_message.original_filename,
             sender_email,
         )
         requires_manual_review = bool(review_reasons)
@@ -104,7 +104,7 @@ class RadiologyImportService:
         plan = RadiologyIntakePlan(
             message_id=message_id,
             transfer_url=transfer_message.download_url,
-            archive_name=transfer_message.filename,
+            archive_name=transfer_message.original_filename,
             patient_name_candidate=transfer_message.patient_name_candidate,
             sender_email=sender_email,
             proposed_destination=proposed_destination,

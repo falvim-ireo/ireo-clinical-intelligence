@@ -1,4 +1,40 @@
-# Gmail Radiology Dry-Run
+# Guia do Operador — Radiology Intake v1.0.0
+
+Este fluxo é exclusivamente supervisionado. Antes de começar, confirme que o exame, o ambiente e as autorizações pertencem ao atendimento correto.
+
+## Fluxo operacional aprovado
+
+1. Verifique se o OAuth Gmail está configurado com escopo readonly.
+2. Execute:
+
+   ```powershell
+   ireo-clinical-intelligence radiology-import-from-gmail --patient-source clinicorp
+   ```
+
+3. Selecione a mensagem TransferNow exibida pelo comando.
+4. Confirme o download.
+5. Quando solicitado, autorize a abertura do navegador. O Chromium usa um contexto temporário; não tente contornar CAPTCHA, senha ou proteções do site.
+6. Aguarde o término do download e o cálculo do checksum SHA-256.
+7. Confira o resultado e confirme a continuidade para a etapa de importação.
+8. Revise os candidatos do Clinicorp e confirme o paciente correto. Em caso de ambiguidade, interrompa até realizar a revisão humana.
+9. Revise e confirme a pasta correta do paciente no OneDrive local.
+10. Confira o arquivo de origem, destino, quantidade de arquivos, tamanho total e possíveis duplicidades.
+11. Somente quando toda a prévia estiver correta, digite exatamente `CONFIRMAR`.
+12. Confira a pasta final e o arquivo `manifest.json`. Preserve a quarentena para investigação quando houver falha ou resultado parcial.
+
+### Fallback por arquivo local
+
+Se a aquisição pelo Gmail/TransferNow não puder ser concluída, baixe o arquivo por um meio aprovado, coloque-o na quarentena e execute:
+
+```powershell
+ireo-clinical-intelligence radiology-import-supervised `
+  --archive-path "C:\caminho\controlado\exame.rar" `
+  --patient-source clinicorp
+```
+
+O fallback mantém as mesmas confirmações de paciente, pasta, prévia e cópia final. Não use arquivos fora do fluxo autorizado.
+
+## Gmail Radiology Dry-Run
 
 ## Purpose
 
@@ -160,13 +196,50 @@ TransferNow link may be a landing page rather than a direct archive; if the
 download cannot be completed, download the `.zip` or `.rar` manually and use
 `--archive-path`.
 
+For supervised selection and download from up to five recent readonly Gmail
+messages, run:
+
+```text
+ireo-clinical-intelligence radiology-import-from-gmail --patient-source clinicorp
+```
+
+Quando o link do TransferNow exigir JavaScript, o fluxo oferece abrir um Chromium
+visível e isolado. Confirme com `ABRIR NAVEGADOR`; se o controle não for localizado
+automaticamente, clique manualmente no botão de download. O próximo e único download
+será validado e salvo na quarentena antes de o navegador fechar.
+
+Configuração do piloto:
+
+```env
+IREO_BROWSER_HEADLESS=false
+IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS=3600
+```
+
+O piloto permanece visível (`headless=False`). Para executar o primeiro piloto real:
+
+```text
+ireo-clinical-intelligence radiology-import-from-gmail --patient-source clinicorp
+```
+
+The download uses HTTPS only, follows a limited number of validated
+TransferNow redirects, streams into a correlation-specific quarantine folder,
+keeps failed `.part` files, and atomically renames only complete `.rar` or
+`.zip` files. An HTML landing page is inspected only for an HTTPS TransferNow
+download link. If no reliable HTTP endpoint exists, the supervised Chromium
+fallback is offered. JavaScript supplied externally is not executed by the
+application, and CAPTCHA, passwords, and browser protections are not bypassed.
+Failures preserve the manual `radiology-import-supervised --archive-path` fallback.
+
 The configured local paths are:
 
 ```text
-IREO_ONEDRIVE_PATIENTS_PATH=D:\OneDrive\Pasta pacientes 2026
-IREO_RADIOLOGY_QUARANTINE_PATH=D:\IREO_Radiology_Quarantine
+IREO_ONEDRIVE_PATIENTS_PATH=C:\IREO\OneDrive\Pacientes
+IREO_RADIOLOGY_QUARANTINE_PATH=C:\IREO\QuarentenaRadiologia
 IREO_ARCHIVE_TOOL_PATH=C:\Program Files\WinRAR\UnRAR.exe
 IREO_ARCHIVE_TIMEOUT_SECONDS=1800
+IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS=30
+IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS=1800
+IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES=10737418240
 ```
 
 The command displays all Clinicorp candidates and compatible local patient

@@ -4,6 +4,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "sim"}
+
+
 def _bounded_int(value: str | None, default: int, maximum: int) -> int:
     try:
         parsed = int(value or default)
@@ -30,6 +36,20 @@ class Config:
         os.getenv("IREO_ARCHIVE_TIMEOUT_SECONDS"),
         default=1800,
         maximum=86400,
+    )
+    IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS = _bounded_int(
+        os.getenv("IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS"), 30, 300
+    )
+    IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS = _bounded_int(
+        os.getenv("IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS"), 1800, 86400
+    )
+    IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES = _bounded_int(
+        os.getenv("IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES"), 10737418240, 1099511627776
+    )
+    IREO_BROWSER_HEADLESS = False  # Piloto supervisionado: sempre visível.
+    IREO_BROWSER_DEBUG = _bool(os.getenv("IREO_BROWSER_DEBUG"))
+    IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS = _bounded_int(
+        os.getenv("IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS"), 3600, 86400
     )
     CLINICORP_SUBSCRIBER_ID = os.getenv("CLINICORP_SUBSCRIBER_ID")
     CLINICORP_BUSINESS_ID = os.getenv("CLINICORP_BUSINESS_ID")

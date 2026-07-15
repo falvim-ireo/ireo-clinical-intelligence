@@ -13,7 +13,27 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+
+
+@dataclass(frozen=True)
+class TransferNowLinkDiagnosis:
+    total_links: int
+    transfernow_links: int
+    public_candidates: int
+    dl_candidates: int = 0
+    candidate_type: Optional[str] = None
+    candidate_text: Optional[str] = None
+    hostname: Optional[str] = None
+    has_path: bool = False
+    has_query: bool = False
+
+
+@dataclass(frozen=True)
+class _EmailLink:
+    url: str
+    text: str = ""
+    source: str = "href"
 
 
 class _TransferNowHTMLParser(HTMLParser):
@@ -22,19 +42,39 @@ class _TransferNowHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.partes: list[str] = []
+        self.links: list[_EmailLink] = []
+        self._active_href: Optional[str] = None
+        self._active_text: list[str] = []
 
     def handle_starttag(
         self,
         tag: str,
         attrs: list[tuple[str, Optional[str]]],
     ) -> None:
+        href = None
         for nome, valor in attrs:
             if nome.lower() == "href" and valor:
                 self.partes.append(valor)
+                href = html.unescape(valor).strip()
+        if href:
+            if tag.casefold() == "a":
+                self._active_href = href
+                self._active_text = []
+            else:
+                self.links.append(_EmailLink(href, source=f"href:{tag.casefold()}"))
 
     def handle_data(self, data: str) -> None:
         if data:
             self.partes.append(data)
+            if self._active_href is not None:
+                self._active_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "a" and self._active_href is not None:
+            text = re.sub(r"\s+", " ", " ".join(self._active_text)).strip()
+            self.links.append(_EmailLink(self._active_href, text, "href:a"))
+            self._active_href = None
+            self._active_text = []
 
 
 @dataclass(frozen=True)
@@ -42,10 +82,18 @@ class TransferNowMessage:
     """Representa os dados extraídos de um e-mail do TransferNow."""
 
     download_url: str
-    filename: Optional[str]
+    original_filename: Optional[str]
+    display_filename: Optional[str]
     patient_name_candidate: Optional[str]
     sender_email: Optional[str]
     sender_name: Optional[str] = None
+    link_diagnosis: Optional[TransferNowLinkDiagnosis] = None
+
+    @property
+    def filename(self) -> Optional[str]:
+        """Compatibilidade: o nome de arquivo sempre significa o valor original."""
+
+        return self.original_filename
 
 
 class TransferNowConnector:
@@ -99,20 +147,22 @@ class TransferNowConnector:
 
         texto_normalizado = cls._normalizar_conteudo(conteudo)
 
-        download_url = cls._extrair_url(texto_normalizado)
+        download_url, link_diagnosis = cls._selecionar_url_publica(conteudo)
 
         if not download_url:
-            raise ValueError(
-                "Nenhum link válido do TransferNow foi encontrado."
-            )
+            if link_diagnosis.transfernow_links:
+                raise ValueError(
+                    "O e-mail não forneceu um link público de transferência válido."
+                )
+            raise ValueError("Nenhum link válido do TransferNow foi encontrado.")
 
-        filename = (
+        original_filename = (
             cls._extrair_nome_arquivo(assunto)
             or cls._extrair_nome_arquivo(texto_normalizado)
         )
 
         patient_name_candidate = cls._extrair_nome_paciente(
-            filename
+            original_filename
         )
 
         sender_email = cls._extrair_email_remetente(
@@ -121,10 +171,26 @@ class TransferNowConnector:
 
         return TransferNowMessage(
             download_url=download_url,
-            filename=filename,
+            original_filename=original_filename,
+            display_filename=cls._nome_arquivo_para_exibicao(original_filename),
             patient_name_candidate=patient_name_candidate,
             sender_email=sender_email,
+            link_diagnosis=link_diagnosis,
         )
+
+    @staticmethod
+    def _nome_arquivo_para_exibicao(filename: Optional[str], limit: int = 36) -> Optional[str]:
+        """Mascara nomes longos; este valor existe exclusivamente para o terminal."""
+
+        if not filename or len(filename) <= limit:
+            return filename
+        suffix = next(
+            (extension for extension in (".rar", ".zip", ".7z") if filename.casefold().endswith(extension)),
+            "",
+        )
+        stem = filename[:-len(suffix)] if suffix else filename
+        visible = max(1, limit - len(suffix) - len("... "))
+        return f"{stem[:visible]}... {suffix}"
 
     @classmethod
     def eh_mensagem_transfernow(
@@ -134,11 +200,13 @@ class TransferNowConnector:
     ) -> bool:
         """Verifica se o conteúdo contém indícios de TransferNow."""
 
-        texto = cls._normalizar_conteudo(
-            f"{assunto} {conteudo}"
-        )
+        diagnosis = cls.diagnosticar_links(f"{assunto} {conteudo}")
+        return diagnosis.transfernow_links > 0
 
-        return cls._extrair_url(texto) is not None
+    @classmethod
+    def diagnosticar_links(cls, conteudo: str) -> TransferNowLinkDiagnosis:
+        _, diagnosis = cls._selecionar_url_publica(conteudo)
+        return diagnosis
 
     @staticmethod
     def _normalizar_conteudo(conteudo: str) -> str:
@@ -166,36 +234,127 @@ class TransferNowConnector:
     ) -> Optional[str]:
         """Extrai e higieniza a primeira URL válida do TransferNow."""
 
-        for correspondencia in cls._URL_PATTERN.finditer(texto):
-            url = correspondencia.group(0).rstrip(
-                ".,);]}>"
-            )
+        selected, _ = cls._selecionar_url_publica(texto)
+        return selected
 
-            try:
-                partes = urlsplit(url)
-                hostname = (partes.hostname or "").lower().rstrip(".")
-            except ValueError:
-                continue
-
-            dominio_valido = (
-                hostname == "transfernow.net"
-                or hostname.endswith(".transfernow.net")
-            )
-
-            if partes.scheme.lower() != "https" or not dominio_valido:
-                continue
-
-            return urlunsplit(
-                (
-                    partes.scheme,
-                    partes.netloc,
-                    partes.path,
-                    partes.query,
-                    "",
+    @classmethod
+    def _selecionar_url_publica(
+        cls, conteudo: str
+    ) -> tuple[Optional[str], TransferNowLinkDiagnosis]:
+        links = cls._coletar_links(conteudo)
+        candidates_by_url: dict[str, tuple[int, str, str, Optional[str]]] = {}
+        transfer_urls: set[str] = set()
+        for link in links:
+            for url, candidate_type in cls._urls_transfernow(link):
+                normalized = cls._normalizar_url(url)
+                if not normalized:
+                    continue
+                transfer_urls.add(normalized)
+                if not cls._eh_link_publico(normalized):
+                    continue
+                parsed = urlsplit(normalized)
+                semantic_text = cls._texto_semantico(link.text)
+                is_dl = parsed.path.casefold().startswith("/dl/")
+                if is_dl and semantic_text == "Acessar o download":
+                    score = 100
+                elif is_dl:
+                    score = 95
+                elif semantic_text and parsed.path not in {"", "/"}:
+                    score = 80
+                else:
+                    score = 50
+                kind = "link /dl/" if is_dl else (
+                    "botão semântico" if semantic_text else candidate_type
                 )
-            )
+                candidate = (score, normalized, kind, semantic_text)
+                previous = candidates_by_url.get(normalized)
+                if previous is None or candidate[0] > previous[0]:
+                    candidates_by_url[normalized] = candidate
+        candidates = sorted(
+            candidates_by_url.values(), key=lambda item: item[0], reverse=True
+        )
+        chosen = candidates[0] if candidates else None
+        parsed = urlsplit(chosen[1]) if chosen else None
+        diagnosis = TransferNowLinkDiagnosis(
+            total_links=len(links),
+            transfernow_links=len(transfer_urls),
+            public_candidates=len(candidates),
+            dl_candidates=sum(
+                urlsplit(candidate[1]).path.casefold().startswith("/dl/")
+                for candidate in candidates
+            ),
+            candidate_type=chosen[2] if chosen else None,
+            candidate_text=chosen[3] if chosen else None,
+            hostname=parsed.hostname if parsed else None,
+            has_path=bool(parsed and parsed.path not in {"", "/"}),
+            has_query=bool(parsed and parsed.query),
+        )
+        return (chosen[1] if chosen else None), diagnosis
 
+    @staticmethod
+    def _texto_semantico(value: str) -> Optional[str]:
+        normalized = re.sub(r"\s+", " ", value or "").strip().casefold()
+        labels = (
+            ("acessar o download", "Acessar o download"),
+            ("acessar arquivos", "Acessar arquivos"),
+            ("obter arquivos", "Obter arquivos"),
+            ("download", "Download"),
+            ("baixar", "Baixar"),
+            ("view transfer", "View transfer"),
+            ("get your files", "Get your files"),
+        )
+        for fragment, safe_label in labels:
+            if fragment in normalized:
+                return safe_label
         return None
+
+    @classmethod
+    def _coletar_links(cls, conteudo: str) -> list[_EmailLink]:
+        parser = _TransferNowHTMLParser()
+        parser.feed(conteudo or "")
+        parser.close()
+        links = list(parser.links)
+        href_urls = {link.url for link in links}
+        for match in cls._URL_PATTERN.finditer(html.unescape(conteudo or "")):
+            url = match.group(0).rstrip(".,);]}>")
+            if url not in href_urls:
+                links.append(_EmailLink(url, source="texto"))
+        return links
+
+    @classmethod
+    def _urls_transfernow(cls, link: _EmailLink):
+        if cls._normalizar_url(link.url):
+            yield link.url, "link TransferNow"
+        try:
+            query_values = parse_qsl(urlsplit(link.url).query, keep_blank_values=False)
+        except ValueError:
+            return
+        for _, value in query_values:
+            decoded = unquote(html.unescape(value))
+            if cls._normalizar_url(decoded):
+                yield decoded, "redirecionamento rastreado"
+
+    @staticmethod
+    def _normalizar_url(url: str) -> Optional[str]:
+        try:
+            parsed = urlsplit(html.unescape(url).strip())
+            hostname = (parsed.hostname or "").casefold().rstrip(".")
+        except ValueError:
+            return None
+        if parsed.scheme.casefold() != "https" or not (
+            hostname == "transfernow.net" or hostname.endswith(".transfernow.net")
+        ):
+            return None
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+    @staticmethod
+    def _eh_link_publico(url: str) -> bool:
+        parsed = urlsplit(url)
+        path = (parsed.path or "/").casefold().rstrip("/") or "/"
+        rejected = {"/login", "/signin", "/privacy", "/terms", "/support"}
+        if path == "/":
+            return bool(parsed.query)
+        return path not in rejected
 
     @classmethod
     def _extrair_nome_arquivo(

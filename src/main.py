@@ -193,6 +193,27 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         clinicorp_main()
         return None
 
+    if arguments == ["browser-self-test"]:
+        from radiology.transfernow_browser_download import run_browser_self_test
+
+        try:
+            run_browser_self_test()
+        except Exception as exc:
+            print(f"Browser self-test falhou: {type(exc).__name__}")
+            return 1
+        return 0
+
+    if arguments == ["transfernow-link-diagnosis"]:
+        from integrations.gmail_connector import GmailConnector, GmailConnectorError
+        from radiology.transfernow_link_diagnosis import run_transfernow_link_diagnosis
+
+        try:
+            run_transfernow_link_diagnosis(gmail=GmailConnector())
+        except (GmailConnectorError, ValueError) as exc:
+            print(f"Diagnóstico não concluído: {exc}")
+            return 1
+        return 0
+
     if arguments and arguments[0] == "radiology-gmail-dry-run":
         from integrations.gmail_connector import GmailConnectorError
         from radiology.gmail_dry_run import run_gmail_dry_run
@@ -295,9 +316,90 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         print(f"Manifesto: {result.manifest_path}")
         return 0
 
+    if arguments and arguments[0] == "radiology-import-from-gmail":
+        from core.config import Config
+        from integrations.gmail_connector import GmailConnector, GmailConnectorError
+        from observability.audit_logger import AuditLogger
+        from radiology.gmail_import import run_gmail_import
+        from radiology.archive_extractor import ArchiveExtractionError
+        from radiology.supervised_import import (
+            SupervisedImportCancelled,
+            SupervisedImportError,
+            SupervisedRadiologyImporter,
+        )
+        from radiology.transfernow_download import (
+            TransferNowDownloader,
+            TransferNowDownloadError,
+        )
+        from radiology.transfernow_browser_download import TransferNowBrowserDownloader
+        from repositories.patient_repository import EmptyPatientRepository
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence radiology-import-from-gmail"
+        )
+        parser.add_argument(
+            "--patient-source", choices=("clinicorp", "offline"), default="offline"
+        )
+        try:
+            options = parser.parse_args(arguments[1:])
+        except SystemExit:
+            return 2
+        audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
+        if options.patient_source == "clinicorp":
+            from repositories.clinicorp_patient_repository import ClinicorpPatientRepository
+
+            repository = ClinicorpPatientRepository(ClinicorpAPI(), audit_logger=audit)
+        else:
+            repository = EmptyPatientRepository()
+        importer = SupervisedRadiologyImporter(
+            patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
+            quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+            archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+            archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
+            patient_repository=repository,
+            audit_logger=audit,
+        )
+        downloader = TransferNowDownloader(
+            connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=Config.IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS,
+            max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES,
+        )
+        browser_downloader = TransferNowBrowserDownloader(
+            timeout_seconds=Config.IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS,
+            max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES,
+            headless=False,
+            debug=Config.IREO_BROWSER_DEBUG,
+        )
+        try:
+            outcome = run_gmail_import(
+                gmail=GmailConnector(),
+                downloader=downloader,
+                browser_downloader=browser_downloader,
+                importer=importer,
+                quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+                correlation_id=audit.correlation_id,
+            )
+        except (
+            ArchiveExtractionError,
+            GmailConnectorError,
+            SupervisedImportCancelled,
+            SupervisedImportError,
+            TransferNowDownloadError,
+            ValueError,
+        ) as exc:
+            print(f"Importação não concluída: {exc}")
+            return 1
+        if outcome.import_result is None:
+            print("Download preservado; fluxo supervisionado não iniciado.")
+        else:
+            print(f"Importação concluída: {outcome.import_result.destination}")
+        return 0
+
     print(
         "Uso: ireo-clinical-intelligence "
-        "[radiology-gmail-dry-run | radiology-import-supervised]"
+        "[radiology-gmail-dry-run | radiology-import-supervised | "
+        "radiology-import-from-gmail | browser-self-test | "
+        "transfernow-link-diagnosis]"
     )
     return 2
 

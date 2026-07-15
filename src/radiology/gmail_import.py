@@ -1,0 +1,134 @@
+"""Orquestra seleção readonly e download supervisionado do TransferNow."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+from typing import Callable
+from urllib.parse import urlsplit
+
+from integrations.gmail_connector import GmailConnector
+from integrations.transfernow_connector import TransferNowConnector, TransferNowMessage
+from observability.audit_logger import mask_message_id
+from radiology.transfernow_download import DownloadResult, TransferNowDownloader
+from radiology.transfernow_download import BrowserInteractionRequired
+
+
+@dataclass(frozen=True)
+class GmailImportOutcome:
+    download: DownloadResult
+    import_result: object | None
+
+
+def run_gmail_import(
+    *,
+    gmail: GmailConnector,
+    downloader: TransferNowDownloader,
+    importer,
+    quarantine_root,
+    correlation_id: str,
+    browser_downloader=None,
+    input_func: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+) -> GmailImportOutcome:
+    messages = gmail.list_messages(
+        query="from:noreply@transfernow.net subject:TransferNow",
+        max_results=5,
+    )
+    parsed: list[tuple[object, TransferNowMessage, str | None, str | None]] = []
+    public_link_missing = False
+    for message in messages:
+        body = "\n".join(value for value in (message.text_body, message.html_body) if value)
+        try:
+            transfer = TransferNowConnector.interpretar(body, message.subject)
+        except ValueError as exc:
+            if "link público de transferência válido" in str(exc):
+                public_link_missing = True
+            continue
+        size = _first_match(body, r"(?:tamanho|size)\s*:?\s*([0-9.,]+\s*(?:KB|MB|GB|TB))")
+        validity = _first_match(body, r"(?:v[aá]lid[oa]|expires?)\s*:?\s*([^\n<]{1,60})")
+        if validity:
+            validity = re.split(r"https?://", validity, maxsplit=1)[0].strip(" .")
+        parsed.append((message, transfer, size, validity))
+
+    if not parsed:
+        if public_link_missing:
+            raise ValueError(
+                "O e-mail não forneceu um link público de transferência válido."
+            )
+        raise ValueError("Nenhuma mensagem TransferNow utilizável foi encontrada.")
+    output("Mensagens TransferNow recentes:")
+    for index, (message, transfer, size, _) in enumerate(parsed, 1):
+        output(
+            f"{index}. Data: {message.received_at:%Y-%m-%d %H:%M}; "
+            f"Remetente: {transfer.sender_email or 'não informado'}; "
+            f"Arquivo: {transfer.display_filename or 'não informado'}; "
+            f"Tamanho: {size or 'não informado'}; "
+            f"Message ID: {mask_message_id(message.message_id)}"
+        )
+    selected = _choice(input_func("Selecione o número da mensagem: "), len(parsed))
+    message, transfer, _, validity = parsed[selected - 1]
+    if not transfer.original_filename:
+        raise ValueError("A mensagem selecionada não informa o arquivo esperado.")
+    output(f"Arquivo esperado: {transfer.display_filename}")
+    output(f"Domínio: {urlsplit(transfer.download_url).hostname}")
+    output(f"Validade: {validity or 'não informada'}")
+    if input_func(
+        "Digite CONFIRMAR para iniciar o download ou ENTER para cancelar: "
+    ).strip().casefold() != "confirmar":
+        raise ValueError("Download cancelado pelo operador.")
+
+    try:
+        downloaded = downloader.download(
+            transfer.download_url,
+            transfer.original_filename,
+            quarantine_root,
+            correlation_id,
+            message.message_id,
+        )
+    except BrowserInteractionRequired:
+        if browser_downloader is None:
+            raise
+        output(f"Domínio: {urlsplit(transfer.download_url).hostname}")
+        output(f"Arquivo esperado: {transfer.display_filename}")
+        output("O navegador visível será aberto com um perfil temporário.")
+        output("Nenhuma alteração será feita no Gmail.")
+        if input_func(
+            "Digite ABRIR NAVEGADOR ou ENTER para cancelar: "
+        ).strip().casefold() != "abrir navegador":
+            raise ValueError("Abertura do navegador cancelada pelo operador.")
+        downloaded = browser_downloader.download(
+            transfer.download_url,
+            transfer.original_filename,
+            quarantine_root,
+            correlation_id,
+            message.message_id,
+        )
+    display_downloaded = TransferNowConnector._nome_arquivo_para_exibicao(downloaded.path.name)
+    output(f"Nome: {display_downloaded}")
+    output(f"Tamanho: {downloaded.size_bytes} bytes")
+    output(f"SHA-256: {downloaded.sha256}")
+    output(f"Caminho na quarentena: {downloaded.path}")
+    if input_func(
+        "Digite CONFIRMAR para continuar ao fluxo supervisionado ou ENTER para encerrar: "
+    ).strip().casefold() != "confirmar":
+        return GmailImportOutcome(downloaded, None)
+    return GmailImportOutcome(
+        downloaded,
+        importer.run(archive_path=downloaded.path),
+    )
+
+
+def _choice(value: str, maximum: int) -> int:
+    try:
+        selected = int(value.strip())
+    except ValueError:
+        raise ValueError("Seleção inválida.") from None
+    if not 1 <= selected <= maximum:
+        raise ValueError("Seleção inválida.")
+    return selected
+
+
+def _first_match(text: str, pattern: str) -> str | None:
+    match = re.search(pattern, text, re.IGNORECASE)
+    return match.group(1).strip() if match else None
