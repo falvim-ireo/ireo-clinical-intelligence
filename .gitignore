@@ -29,3 +29,16 @@ quarantine/
 quarentena/
 **/quarantine/
 **/quarentena/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite
+data/*.sqlite3
+data/last_auto_run_summary.json
+data/radiology_review_required.txt
+data/radiology_auto_run.lock
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3

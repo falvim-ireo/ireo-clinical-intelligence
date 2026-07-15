@@ -30,6 +30,7 @@ class TransferNowBrowserDownloader:
         playwright_factory=None,
         output: Callable[[str], None] = print,
         debug: bool = False,
+        allow_manual_interaction: bool = True,
     ) -> None:
         self.timeout_ms = timeout_seconds * 1000
         self.max_download_bytes = max_download_bytes
@@ -37,6 +38,7 @@ class TransferNowBrowserDownloader:
         self.playwright_factory = playwright_factory
         self.output = output
         self.debug = debug
+        self.allow_manual_interaction = allow_manual_interaction
 
     def download(
         self,
@@ -65,7 +67,7 @@ class TransferNowBrowserDownloader:
                 executable_path = Path(playwright.chromium.executable_path)
                 if not executable_path.is_file():
                     raise FileNotFoundError("Chromium executable not found")
-                browser = playwright.chromium.launch(headless=False)
+                browser = playwright.chromium.launch(headless=self.headless)
                 self._require_sync_object(
                     browser, "browser", "new_context",
                     expected_types[0] if expected_types else None,
@@ -94,6 +96,11 @@ class TransferNowBrowserDownloader:
                     page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                     stage = "DOMAIN_VALIDATION"
                     TransferNowDownloader._validate_url(page.url)
+                    stage = "PROTECTION_CHECK"
+                    if self._has_access_protection(page):
+                        raise TransferNowDownloadError(
+                            "A página exige autenticação ou verificação humana."
+                        )
                     stage = "DOWNLOAD_CONTROL_SEARCH"
                     control = self._download_control(page)
                     stage = "DOWNLOAD_WAIT"
@@ -126,8 +133,36 @@ class TransferNowBrowserDownloader:
             with page.expect_download(timeout=self.timeout_ms) as info:
                 control.click()
             return info.value
+        if not self.allow_manual_interaction:
+            raise TransferNowDownloadError(
+                "O controle de download não foi localizado automaticamente."
+            )
         self.output("Clique manualmente no botão de download da página.")
         return page.wait_for_event("download", timeout=self.timeout_ms)
+
+    def _has_access_protection(self, page) -> bool:
+        if re.search(r"/(?:login|signin|auth)(?:[/?#]|$)", page.url, re.IGNORECASE):
+            return True
+        protection_pattern = re.compile(
+            r"captcha|recaptcha|hcaptcha|faça login|iniciar sessão|"
+            r"digite (?:a )?senha|enter (?:the )?password",
+            re.IGNORECASE,
+        )
+        try:
+            locator = page.get_by_text(protection_pattern)
+            if self._first_usable(locator) is not None:
+                return True
+            selectors = (
+                'input[type="password"]',
+                'iframe[src*="captcha" i], iframe[title*="captcha" i], '
+                '[class*="captcha" i], [id*="captcha" i]',
+            )
+            return any(
+                self._first_usable(page.locator(selector)) is not None
+                for selector in selectors
+            )
+        except (AttributeError, TypeError):
+            return False
 
     def _download_control(self, page):
         label_pattern = re.compile(r"download|baixar", re.IGNORECASE)
@@ -253,6 +288,7 @@ class TransferNowBrowserDownloader:
             "PAGE_CREATE": "Não foi possível criar a página isolada.",
             "NAVIGATION": "Não foi possível carregar a página permitida.",
             "DOMAIN_VALIDATION": "O domínio final não pôde ser validado.",
+            "PROTECTION_CHECK": "A página exige autenticação ou verificação humana.",
             "DOWNLOAD_CONTROL_SEARCH": "Não foi possível examinar os controles de download.",
             "DOWNLOAD_WAIT": "Não foi possível capturar o download no tempo permitido.",
             "DOWNLOAD_SAVE": "Não foi possível salvar o download na quarentena.",

@@ -20,6 +20,12 @@ from models.patient import Patient
 from models.resolved_patient import ResolvedPatient, ResolutionReason
 from observability.audit_logger import AuditEventType, AuditLogger, emit_safely, mask_patient_id
 from radiology.archive_extractor import ArchiveExtractor
+from radiology.intake_history import (
+    DuplicateMatch,
+    IntakeHistoryError,
+    IntakeHistoryRepository,
+    fingerprint,
+)
 from repositories.patient_repository import (
     PatientRepository,
     PatientRepositoryUnavailableError,
@@ -77,6 +83,8 @@ class SupervisedRadiologyImporter:
         auto_select_min_score: float = 0.95,
         force_manual_selection: bool = False,
         patient_source_mode: str = "clinicorp",
+        intake_history: IntakeHistoryRepository | None = None,
+        allow_reimport: bool = False,
     ) -> None:
         self.patients_root = Path(patients_root).expanduser().resolve()
         self.quarantine_root = Path(quarantine_root).expanduser().resolve()
@@ -92,6 +100,9 @@ class SupervisedRadiologyImporter:
         self.auto_select_min_score = min(max(float(auto_select_min_score), 0.0), 1.0)
         self.force_manual_selection = bool(force_manual_selection)
         self.patient_source_mode = patient_source_mode
+        self.intake_history = intake_history
+        self.allow_reimport = bool(allow_reimport)
+        self._approved_duplicate_records: set[int] = set()
         self.extractor = ArchiveExtractor(
             self.quarantine_root,
             archive_tool_path,
@@ -104,64 +115,260 @@ class SupervisedRadiologyImporter:
         *,
         archive_path: str | Path | None = None,
         email_message_id: str | None = None,
+        gmail_message_id: str | None = None,
+        transfer_url: str | None = None,
+        archive_sha256: str | None = None,
+        intake_record_id: int | None = None,
     ) -> SupervisedImportResult:
         if bool(archive_path) == bool(email_message_id):
             raise SupervisedImportError(
                 "Informe exatamente uma entrada: e-mail ou arquivo local."
             )
 
-        archive, probable_name, source = self._acquire_archive(
-            archive_path,
-            email_message_id,
-        )
-        extracted = self.extractor.extract(archive)
-        confirmed_patient = self._confirm_patient(probable_name)
-        patient_folder, folder_mode, folder_reason = self._choose_patient_folder(
-            confirmed_patient.name,
-            allow_auto=confirmed_patient.selection_mode == "auto",
-        )
-        files = self._source_files(extracted)
-        total_size = sum(path.stat().st_size for path in files)
-        duplicate_count = self._possible_duplicate_count(
-            files,
-            patient_folder,
-        )
-        destination = self._next_destination(patient_folder)
-
-        self._show_preview(
-            archive=archive,
-            extracted=extracted,
-            patient=confirmed_patient,
-            patient_folder=patient_folder,
-            destination=destination,
-            file_count=len(files),
-            total_size=total_size,
-            duplicate_count=duplicate_count,
-            folder_selection_mode=folder_mode,
-            folder_selection_reason=folder_reason,
-        )
-        confirmation = self.input(
-            "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)\n"
-            "ou pressione ENTER para cancelar.\n"
-            "[ENTER] = cancelar\n"
-            "CONFIRMAR = copiar\n"
-            "> "
-        )
-        if confirmation.strip().casefold() != "confirmar":
-            raise SupervisedImportCancelled(
-                "Importação cancelada: confirmação explícita não recebida."
+        record_id: int | None = intake_record_id
+        duplicate_state = "clear"
+        previous_reference: str | None = None
+        reimport = False
+        try:
+            archive, probable_name, source = self._acquire_archive(
+                archive_path, email_message_id,
             )
+            archive_sha256 = archive_sha256 or self._file_sha256(archive)
+            if self.intake_history and record_id is None:
+                record = self.intake_history.create_downloaded(
+                    correlation_id=self.audit_logger.correlation_id,
+                    archive_filename=archive.name,
+                    archive_size=archive.stat().st_size,
+                    archive_sha256=archive_sha256,
+                    gmail_message_id=gmail_message_id or email_message_id,
+                    transfer_url=transfer_url,
+                )
+                record_id = record.id
+                self._emit_history(AuditEventType.INTAKE_RECORD_CREATED, "DOWNLOADED")
+                match = self._check_duplicate(
+                    archive_sha256=archive_sha256,
+                    gmail_message_id=gmail_message_id or email_message_id,
+                )
+                if match and match.record.id != record_id:
+                    duplicate_state, previous_reference, reimport = self._handle_duplicate(
+                        match, record_id
+                    )
+            elif self.intake_history and record_id is not None:
+                existing = self.intake_history.get(record_id)
+                if existing.status == "REIMPORT_CONFIRMED":
+                    reimport = True
+                    duplicate_state = "confirmed"
+                    if self._approved_duplicate_records:
+                        previous = self.intake_history.get(
+                            next(iter(self._approved_duplicate_records))
+                        )
+                        previous_reference = previous.safe_reference
 
-        return self._copy_and_manifest(
-            archive=archive,
-            extracted=extracted,
-            destination=destination,
-            patient=confirmed_patient,
-            files=files,
-            total_size=total_size,
-            source=source,
-            folder_selection_mode=folder_mode,
-            folder_selection_reason=folder_reason,
+            extracted = self.extractor.extract(archive)
+            self._history_update(record_id, "EXTRACTED")
+            confirmed_patient = self._confirm_patient(probable_name)
+            patient_folder, folder_mode, folder_reason = self._choose_patient_folder(
+                confirmed_patient.name,
+                allow_auto=confirmed_patient.selection_mode == "auto",
+            )
+            files = self._source_files(extracted)
+            total_size = sum(path.stat().st_size for path in files)
+            duplicate_count = self._possible_duplicate_count(files, patient_folder)
+            destination = self._next_destination(patient_folder)
+            if self.intake_history:
+                match = self._check_duplicate(
+                    archive_filename=archive.name,
+                    archive_size=archive.stat().st_size,
+                    patient_id=confirmed_patient.patient_id,
+                    destination=destination,
+                )
+                if match and match.record.id != record_id:
+                    state, reference, approved = self._handle_duplicate(match, record_id)
+                    if duplicate_state != "confirmed":
+                        duplicate_state = (
+                            "confirmed" if state == "confirmed" else "possible"
+                        )
+                    previous_reference = reference
+                    reimport = reimport or approved
+                self._history_update(
+                    record_id, "READY_FOR_CONFIRMATION",
+                    patient_id_hash=fingerprint(confirmed_patient.patient_id),
+                    destination_fingerprint=fingerprint(destination),
+                    file_count=len(files), total_size=total_size,
+                )
+
+            self._show_preview(
+                archive=archive, extracted=extracted, patient=confirmed_patient,
+                patient_folder=patient_folder, destination=destination,
+                file_count=len(files), total_size=total_size,
+                duplicate_count=duplicate_count,
+                folder_selection_mode=folder_mode,
+                folder_selection_reason=folder_reason,
+            )
+            confirmation = self.input(
+                "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)\n"
+                "ou pressione ENTER para cancelar.\n"
+                "[ENTER] = cancelar\nCONFIRMAR = copiar\n> "
+            )
+            if confirmation.strip().casefold() != "confirmar":
+                raise SupervisedImportCancelled(
+                    "Importação cancelada: confirmação explícita não recebida."
+                )
+            result = self._copy_and_manifest(
+                archive=archive, extracted=extracted, destination=destination,
+                patient=confirmed_patient, files=files, total_size=total_size,
+                source=source, folder_selection_mode=folder_mode,
+                folder_selection_reason=folder_reason,
+                intake_record={
+                    "correlation_id": self.audit_logger.correlation_id,
+                    "archive_sha256": archive_sha256,
+                    "duplicate_check": duplicate_state,
+                    "reimport": reimport,
+                    "previous_record_reference": previous_reference,
+                },
+            )
+            self._history_update(
+                record_id, "COMPLETED",
+                manifest_path_fingerprint=fingerprint(result.manifest_path),
+                file_checksums_fingerprint=fingerprint(
+                    json.dumps(result.checksums, sort_keys=True)
+                ),
+            )
+            return result
+        except SupervisedImportCancelled:
+            self._safe_terminal_status(record_id, "CANCELLED")
+            raise
+        except IntakeHistoryError as exc:
+            self._emit_history(AuditEventType.IMPORT_HISTORY_WRITE_FAILED, "FAILED")
+            raise SupervisedImportError(
+                "Falha no histórico local; nenhuma cópia deve prosseguir."
+            ) from exc
+        except Exception:
+            self._safe_terminal_status(record_id, "FAILED")
+            raise
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def check_message_duplicate(
+        self, gmail_message_id: str, transfer_url: str | None = None
+    ) -> None:
+        """Bloqueia mensagem concluída antes de qualquer novo download."""
+        if not self.intake_history:
+            return
+        match = self._check_duplicate(
+            gmail_message_id=gmail_message_id, transfer_url=transfer_url
+        )
+        if match:
+            self._handle_duplicate(match, None)
+
+    def register_download(
+        self, *, archive_path: str | Path, archive_sha256: str,
+        gmail_message_id: str, transfer_url: str,
+    ) -> int | None:
+        if not self.intake_history:
+            return None
+        archive = Path(archive_path).resolve()
+        record = self.intake_history.create_downloaded(
+            correlation_id=self.audit_logger.correlation_id,
+            archive_filename=archive.name,
+            archive_size=archive.stat().st_size,
+            archive_sha256=archive_sha256,
+            gmail_message_id=gmail_message_id,
+            transfer_url=transfer_url,
+        )
+        self._emit_history(AuditEventType.INTAKE_RECORD_CREATED, "DOWNLOADED")
+        match = self._check_duplicate(
+            archive_sha256=archive_sha256, gmail_message_id=gmail_message_id,
+        )
+        if match and match.record.id != record.id:
+            self._handle_duplicate(match, record.id)
+        return record.id
+
+    def cancel_registered_download(self, record_id: int | None) -> None:
+        self._history_update(record_id, "CANCELLED")
+
+    def _check_duplicate(self, **signals: Any) -> DuplicateMatch | None:
+        if not self.intake_history:
+            return None
+        self._emit_history(AuditEventType.DUPLICATE_CHECK_STARTED, "STARTED")
+        match = self.intake_history.find_duplicate(**signals)
+        if match is None:
+            self._emit_history(AuditEventType.DUPLICATE_NOT_FOUND, "CLEAR")
+        else:
+            event = (
+                AuditEventType.DUPLICATE_CONFIRMED
+                if match.level == "confirmed"
+                else AuditEventType.DUPLICATE_POSSIBLE
+            )
+            self._emit_history(event, "DETECTED", match.criterion)
+        return match
+
+    def _handle_duplicate(
+        self, match: DuplicateMatch, record_id: int | None
+    ) -> tuple[str, str, bool]:
+        reference = match.record.safe_reference
+        if match.record.id in self._approved_duplicate_records:
+            if record_id:
+                self._history_update(
+                    record_id, "REIMPORT_CONFIRMED", reimport_confirmed=1,
+                    previous_record_reference=reference,
+                )
+            return match.level, reference, True
+        if record_id:
+            self._history_update(record_id, "DUPLICATE_DETECTED")
+        self.output("Este exame já foi importado anteriormente.")
+        self.output(f"Data: {match.record.completed_at_utc or match.record.created_at_utc}")
+        self.output(f"Status: {match.record.status}")
+        self.output(f"Identificador: {reference}")
+        patient = match.record.patient_id_hash
+        self.output(f"Paciente: patient-{patient[:12]}" if patient else "Paciente: não disponível")
+        destination = match.record.destination_fingerprint
+        self.output(
+            f"Destino: destination-{destination[:12]}"
+            if destination else "Destino: não disponível"
+        )
+        self.output(f"Critério: {match.criterion}")
+        if not self.allow_reimport:
+            raise SupervisedImportError(
+                "Duplicidade detectada; reimportação bloqueada por padrão."
+            )
+        self._emit_history(AuditEventType.REIMPORT_REQUESTED, "REQUESTED", match.criterion)
+        if self.input("Digite REIMPORTAR para prosseguir ou ENTER para cancelar: ").strip() != "REIMPORTAR":
+            raise SupervisedImportCancelled("Reimportação cancelada pelo operador.")
+        self._approved_duplicate_records.add(match.record.id)
+        if record_id:
+            self._history_update(
+                record_id, "REIMPORT_CONFIRMED", reimport_confirmed=1,
+                previous_record_reference=reference,
+            )
+        self._emit_history(AuditEventType.REIMPORT_CONFIRMED, "CONFIRMED", match.criterion)
+        return match.level, reference, True
+
+    def _history_update(self, record_id: int | None, status: str, **fields: Any) -> None:
+        if self.intake_history and record_id is not None:
+            self.intake_history.update(record_id, status, **fields)
+
+    def _safe_terminal_status(self, record_id: int | None, status: str) -> None:
+        if not self.intake_history or record_id is None:
+            return
+        try:
+            current = self.intake_history.get(record_id)
+            if current.status != "DUPLICATE_DETECTED":
+                self.intake_history.update(record_id, status)
+        except IntakeHistoryError:
+            self._emit_history(AuditEventType.IMPORT_HISTORY_WRITE_FAILED, "FAILED")
+
+    def _emit_history(
+        self, event_type: AuditEventType, status: str, reason: str | None = None
+    ) -> None:
+        emit_safely(
+            self.audit_logger, event_type, status=status, reason_code=reason
         )
 
     def _acquire_archive(
@@ -474,6 +681,7 @@ class SupervisedRadiologyImporter:
         source: str,
         folder_selection_mode: str = "manual",
         folder_selection_reason: str = "FOLDER_MANUAL_SELECTION",
+        intake_record: dict[str, Any] | None = None,
     ) -> SupervisedImportResult:
         if not destination.resolve().is_relative_to(self.patients_root):
             raise SupervisedImportError(
@@ -534,6 +742,13 @@ class SupervisedRadiologyImporter:
             "auto_selection_reason": {
                 "patient": patient.selection_reason,
                 "folder": folder_selection_reason,
+            },
+            "intake_record": intake_record or {
+                "correlation_id": self.audit_logger.correlation_id,
+                "archive_sha256": self._file_sha256(archive),
+                "duplicate_check": "clear",
+                "reimport": False,
+                "previous_record_reference": None,
             },
         }
         manifest_path = destination / "manifest.json"

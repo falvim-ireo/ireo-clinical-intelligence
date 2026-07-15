@@ -33,6 +33,7 @@ from radiology.supervised_import import (
     SupervisedImportError,
     SupervisedRadiologyImporter,
 )
+from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
 from repositories.patient_repository import InMemoryPatientRepository
 from repositories.patient_repository import EmptyPatientRepository
 from repositories.patient_repository import PatientRepositoryUnavailableError
@@ -76,6 +77,8 @@ def build_importer(
     force_manual_selection: bool = False,
     patient_source_mode: str = "clinicorp",
     audit_logger=None,
+    intake_history=None,
+    allow_reimport: bool = False,
 ) -> tuple[SupervisedRadiologyImporter, Path, Path, list[str]]:
     patients_root = tmp_path / "patients"
     patients_root.mkdir(exist_ok=True)
@@ -113,6 +116,8 @@ def build_importer(
         auto_select_min_score=auto_select_min_score,
         force_manual_selection=force_manual_selection,
         patient_source_mode=patient_source_mode,
+        intake_history=intake_history,
+        allow_reimport=allow_reimport,
     )
     return importer, patients_root, quarantine, output
 
@@ -911,3 +916,97 @@ def test_cli_force_manual_option_reaches_importer(tmp_path: Path, monkeypatch) -
     ])
     assert result == 0
     assert calls["force_manual_selection"] is True
+
+
+def test_completed_archive_is_blocked_by_default(tmp_path: Path) -> None:
+    history = IntakeHistoryRepository(tmp_path / "intake.db")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    first, patients_root, _, _ = build_importer(tmp_path, intake_history=history)
+    first.run(archive_path=archive)
+    second, _, _, output = build_importer(tmp_path, intake_history=history)
+
+    with pytest.raises(SupervisedImportError, match="bloqueada por padrão"):
+        second.run(archive_path=archive)
+
+    assert any("já foi importado" in line for line in output)
+    assert len(list((patients_root / PATIENT_NAME / "Exames de imagem").iterdir())) == 1
+    assert history.list_records(limit=1)[0].status == "DUPLICATE_DETECTED"
+
+
+def test_allow_reimport_without_exact_word_does_not_copy(tmp_path: Path) -> None:
+    history = IntakeHistoryRepository(tmp_path / "intake.db")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    first, patients_root, _, _ = build_importer(tmp_path, intake_history=history)
+    first.run(archive_path=archive)
+    second, _, _, _ = build_importer(
+        tmp_path, answers=("",), intake_history=history, allow_reimport=True,
+    )
+
+    with pytest.raises(SupervisedImportCancelled, match="Reimportação cancelada"):
+        second.run(archive_path=archive)
+    assert len(list((patients_root / PATIENT_NAME / "Exames de imagem").iterdir())) == 1
+
+
+def test_allow_reimport_with_two_explicit_confirmations_copies(tmp_path: Path) -> None:
+    history = IntakeHistoryRepository(tmp_path / "intake.db")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    first, _, _, _ = build_importer(tmp_path, intake_history=history)
+    first.run(archive_path=archive)
+    second, _, _, _ = build_importer(
+        tmp_path, answers=("REIMPORTAR", "1", "1", "CONFIRMAR"),
+        intake_history=history, allow_reimport=True,
+    )
+
+    result = second.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+    assert manifest["intake_record"]["reimport"] is True
+    assert manifest["intake_record"]["duplicate_check"] == "confirmed"
+    assert manifest["intake_record"]["previous_record_reference"].startswith("intake-")
+    completed = history.list_records(status="COMPLETED")
+    assert len(completed) == 2
+    assert completed[0].reimport_confirmed == 1
+    assert completed[0].previous_record_reference.startswith("intake-")
+
+
+def test_history_failure_blocks_before_copy(tmp_path: Path) -> None:
+    class UnavailableHistory:
+        def create_downloaded(self, **kwargs):
+            raise IntakeHistoryError("sensitive database path")
+
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, patients_root, _, _ = build_importer(
+        tmp_path, intake_history=UnavailableHistory(),
+    )
+    with pytest.raises(SupervisedImportError, match="histórico local"):
+        importer.run(archive_path=archive)
+    assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
+
+
+def test_intake_manifest_preserves_file_checksums(tmp_path: Path) -> None:
+    history = IntakeHistoryRepository(tmp_path / "intake.db")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(tmp_path, intake_history=history)
+    result = importer.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+    assert manifest["checksums"] == result.checksums
+    assert manifest["intake_record"]["archive_sha256"] == importer._file_sha256(archive)
+    assert manifest["intake_record"]["duplicate_check"] == "clear"
+
+
+def test_duplicate_audit_contains_no_clinical_values(tmp_path: Path) -> None:
+    stream = io.StringIO()
+    logger = logging.Logger("duplicate-audit")
+    logger.addHandler(logging.StreamHandler(stream))
+    audit = AuditLogger(logger=logger, level="INFO", correlation_id="correlation-history-1")
+    history = IntakeHistoryRepository(tmp_path / "intake.db")
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    first, _, _, _ = build_importer(tmp_path, intake_history=history, audit_logger=audit)
+    first.run(archive_path=archive)
+    second, _, _, _ = build_importer(tmp_path, intake_history=history, audit_logger=audit)
+    with pytest.raises(SupervisedImportError):
+        second.run(archive_path=archive)
+    payload = stream.getvalue()
+    assert "INTAKE_RECORD_CREATED" in payload
+    assert "DUPLICATE_CONFIRMED" in payload
+    assert PATIENT_NAME not in payload
+    assert str(tmp_path) not in payload

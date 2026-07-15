@@ -21,6 +21,8 @@ O Gmail é acessado somente com o escopo `gmail.readonly` e nenhuma mensagem é 
 
 Todo arquivo baixado e extraído passa pela quarentena. ZIP e RAR têm caminhos validados contra traversal antes da extração. O Clinicorp é a fonte mestre para identificação; associação ausente ou ambígua nunca é resolvida automaticamente e exige revisão humana.
 
+O comando `radiology-auto-run` é um orquestrador local agendável e fail-closed. Ele usa Gmail readonly, a mesma quarentena, o mesmo SQLite e a mesma cópia/manifesto do fluxo supervisionado. Só copia com flags explícitas, candidato Clinicorp único com score mínimo 0,98 e motivo `EXACT_NAME`/`NORMALIZED_NAME`, uma pasta compatível dentro da raiz e nenhuma duplicidade. As demais situações persistem `REVIEW_REQUIRED` com código e estágio sanitizados.
+
 A pasta do paciente e a cópia final também exigem confirmação. A aplicação copia sem mover ou apagar a origem, usa criação exclusiva e não sobrescreve arquivos automaticamente. O OneDrive v1.0.0 é integrado por uma pasta sincronizada localmente; upload direto via Microsoft Graph é uma evolução futura.
 
 ### Auto-seleção supervisionada
@@ -30,6 +32,22 @@ A feature flag `IREO_AUTO_SELECT_UNAMBIGUOUS`, falsa por padrão, controla somen
 A pasta só acompanha uma auto-seleção segura do paciente quando há exatamente um diretório compatível, resolvido dentro da raiz, coerente após normalização e diferente de `REVIEW_REQUIRED`. Symlinks e junctions que resolvem fora da raiz são descartados. A aplicação nunca cria pastas de pacientes.
 
 As decisões emitem eventos sanitizados de auto-seleção ou revisão manual. O manifesto registra os modos e motivos. Nenhuma dessas decisões ignora a prévia completa ou a confirmação final `CONFIRMAR`.
+
+### Idempotência persistente
+
+`IntakeHistoryRepository` usa exclusivamente `sqlite3` da biblioteca padrão. O schema versionado (`schema_version = 1`) é criado de forma idempotente e nunca recria ou apaga automaticamente um banco existente.
+
+```text
+mensagem selecionada -> verificação do Gmail fingerprint
+download + SHA-256 -> DOWNLOADED -> verificação forte do arquivo
+extração -> EXTRACTED
+paciente + destino -> verificação contextual -> READY_FOR_CONFIRMATION
+CONFIRMAR -> cópia + manifesto -> COMPLETED
+```
+
+Falhas e cancelamentos são preservados como `FAILED` e `CANCELLED` e não bloqueiam retry. Duplicidades concluídas geram `DUPLICATE_DETECTED`; uma reimportação exige opção CLI, `REIMPORTAR` e depois a confirmação final independente. Conexões SQLite são curtas, usam transações explícitas, busy timeout e WAL para concorrência local simples.
+
+O banco não contém nomes completos, IDs puros, URLs, tokens ou caminhos completos. Fingerprints SHA-256 representam Gmail, transferência, paciente, destino, manifesto e checksums. O arquivo compactado mantém seu SHA-256 integral como identificador técnico forte.
 
 ## Radiology Intake Phase 2
 

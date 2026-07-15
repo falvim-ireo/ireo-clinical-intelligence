@@ -58,7 +58,7 @@ class FakeExpectation:
 
 
 class FakePage:
-    def __init__(self, download, *, final_url="https://transfernow.net/dl/x", control=True, control_kind="button", control_visible=True, control_enabled=True, control_href="https://transfernow.net/download/file", multiple=False, timeout=False, navigation_error=None):
+    def __init__(self, download, *, final_url="https://transfernow.net/dl/x", control=True, control_kind="button", control_visible=True, control_enabled=True, control_href="https://transfernow.net/download/file", multiple=False, timeout=False, navigation_error=None, protection=False):
         self.download = download
         self.url = final_url
         self.control = control
@@ -69,6 +69,7 @@ class FakePage:
         self.multiple = multiple
         self.timeout = timeout
         self.navigation_error = navigation_error
+        self.protection = protection
         self.handlers = {}
         self.expectation = None
         self.goto_urls = []
@@ -93,9 +94,19 @@ class FakePage:
             self.control and role == self.control_kind,
             self.control_href if role == "link" else None,
         )
-    def get_by_text(self, pattern): return self._locator(self.control and self.control_kind == "text")
+    def get_by_text(self, pattern):
+        protection_search = "captcha" in getattr(pattern, "pattern", "").casefold()
+        if protection_search and not self.protection:
+            return FakeLocator(self, found=False)
+        return self._locator(
+            (self.protection and protection_search)
+            or (self.control and self.control_kind == "text" and not protection_search)
+        )
     def locator(self, selector):
-        assert selector == "a[href]"
+        if selector != "a[href]":
+            if not self.protection:
+                return FakeLocator(self, found=False)
+            return self._locator(True)
         return self._locator(
             self.control and self.control_kind == "href", self.control_href
         )
@@ -176,6 +187,33 @@ def test_manual_assisted_download_when_button_not_found(tmp_path):
     instance, _ = make_downloader(FakePage(FakeDownload(), control=False), outputs)
     assert run_browser(instance, tmp_path).size_bytes == 3
     assert outputs == ["Clique manualmente no botão de download da página."]
+
+
+def test_automatic_visible_mode_never_waits_for_manual_input(tmp_path):
+    outputs = []
+    page = FakePage(FakeDownload(), control=False)
+    instance, fake = make_downloader(page, outputs)
+    instance.allow_manual_interaction = False
+    with pytest.raises(TransferNowDownloadError, match="DOWNLOAD_WAIT"):
+        run_browser(instance, tmp_path)
+    assert outputs == []
+    assert fake.chromium.headless is False
+    assert fake.chromium.browser.closed and fake.chromium.browser.context.closed
+
+
+@pytest.mark.parametrize(
+    "page",
+    (
+        FakePage(FakeDownload(), protection=True),
+        FakePage(FakeDownload(), final_url="https://transfernow.net/login"),
+    ),
+)
+def test_login_or_captcha_is_not_bypassed_and_browser_closes(tmp_path, page):
+    instance, fake = make_downloader(page)
+    instance.allow_manual_interaction = False
+    with pytest.raises(TransferNowDownloadError, match="PROTECTION_CHECK"):
+        run_browser(instance, tmp_path)
+    assert fake.chromium.browser.closed and fake.chromium.browser.context.closed
 
 
 def test_download_button_uses_locator_count_and_nth(tmp_path):

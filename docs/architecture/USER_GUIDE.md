@@ -2,6 +2,14 @@
 
 Este fluxo é exclusivamente supervisionado. Antes de começar, confirme que o exame, o ambiente e as autorizações pertencem ao atendimento correto.
 
+## Execução automática (piloto)
+
+Mantenha `IREO_AUTO_RUN_ENABLED=false` e `IREO_AUTO_RUN_ALLOW_COPY=false` até validar o piloto. A tarefa do Windows deve executar `scripts/run_radiology_auto.ps1`. Execute `ireo-clinical-intelligence intake-review-list` para pendências e `ireo-clinical-intelligence radiology-auto-status` para a última execução. Em caso de dúvida, desative `IREO_AUTO_RUN_ENABLED` e retome o caso pelo fluxo supervisionado normal usando o arquivo preservado na quarentena.
+
+No piloto A, configure `IREO_AUTO_RUN_BROWSER_MODE=headless` e mantenha a cópia desligada. Confirme uma única mensagem, download, extração, destino proposto e status de revisão/aguardo, sem cópia. Só após autorização explícita avance ao piloto B com `IREO_AUTO_RUN_ALLOW_COPY=true`. A máquina deve permanecer ligada para o Agendador executar.
+
+O modo `visible` executa a mesma automação com `headless=False`, perfil temporário e sem solicitar clique, confirmação ou `ABRIR NAVEGADOR`. No Agendador de Tarefas, selecione **Executar somente quando o usuário estiver conectado**, mantenha o computador ligado e uma sessão Windows ativa. Nenhuma intervenção do operador é necessária; o Chromium pode aparecer brevemente na tela. Se o botão não for localizado, ou se houver CAPTCHA, login, senha ou outra proteção, o navegador fecha e o caso segue para `REVIEW_REQUIRED`, sem contornar a proteção.
+
 ## Fluxo operacional aprovado
 
 1. Verifique se o OAuth Gmail está configurado com escopo readonly.
@@ -46,6 +54,21 @@ IREO_AUTO_SELECT_MIN_SCORE=0.95
 Com a flag ativa, o terminal informa o paciente e a pasta selecionados automaticamente e seus motivos. Isso só ocorre com um candidato Clinicorp elegível, PatientId presente, score suficiente, resolução não ambígua e uma única pasta coerente dentro da raiz. Modo offline, mais de um candidato ou pasta, score baixo, indisponibilidade, inconsistência ou motivo não reconhecido exigem seleção humana.
 
 Use `--force-manual-selection` em qualquer comando de importação para ignorar a automação naquela execução. Em caso de dúvida operacional, altere imediatamente `IREO_AUTO_SELECT_UNAMBIGUOUS=false` e reinicie o comando. Mesmo com auto-seleção, revise todos os dados da prévia e digite `CONFIRMAR`; sem essa confirmação nenhum arquivo é copiado.
+
+### Duplicidade e histórico
+
+O histórico local fica no caminho configurado por `IREO_INTAKE_DATABASE_PATH`. Antes do download e da cópia, o sistema compara fingerprints e o SHA-256 do arquivo. Registros `FAILED` ou `CANCELLED` permitem nova tentativa; registros `COMPLETED` coincidentes são bloqueados.
+
+Para consultar sem revelar dados clínicos:
+
+```powershell
+ireo-clinical-intelligence intake-history --limit 20
+ireo-clinical-intelligence intake-history --status COMPLETED
+```
+
+Se uma reimportação for clinicamente justificada, execute o comando original com `--allow-reimport`, revise o alerta e digite `REIMPORTAR`. Isso não substitui a prévia nem `CONFIRMAR`. Sem a opção, a duplicidade é bloqueada; com a opção mas sem a palavra exata, ela é cancelada.
+
+Faça backup do banco em armazenamento local protegido com o processo parado. Preserve também arquivos SQLite `-wal` e `-shm` presentes. Não edite o banco manualmente. A retenção ainda não possui política aprovada e nenhuma limpeza automática é executada.
 
 ## Gmail Radiology Dry-Run
 

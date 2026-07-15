@@ -1,5 +1,6 @@
 import sys
 import argparse
+import hashlib
 from typing import Optional, Sequence
 
 from api.clinicorp_connector import ClinicorpAPI
@@ -214,6 +215,170 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             return 1
         return 0
 
+    if arguments and arguments[0] == "intake-history":
+        from core.config import Config
+        from radiology.intake_history import (
+            ALLOWED_STATUSES,
+            IntakeHistoryError,
+            IntakeHistoryRepository,
+            sanitized_history_lines,
+        )
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence intake-history"
+        )
+        parser.add_argument("--limit", type=int, default=20)
+        parser.add_argument("--status", choices=sorted(ALLOWED_STATUSES))
+        parser.add_argument("--correlation-id")
+        try:
+            options = parser.parse_args(arguments[1:])
+            history = IntakeHistoryRepository(Config.IREO_INTAKE_DATABASE_PATH)
+            records = history.list_records(
+                limit=options.limit,
+                status=options.status,
+                correlation_id=options.correlation_id,
+            )
+        except (SystemExit, IntakeHistoryError, ValueError):
+            print("Não foi possível consultar o histórico com segurança.")
+            return 2
+        for line in sanitized_history_lines(records):
+            print(line)
+        return 0
+
+    if arguments and arguments[0] == "intake-review-list":
+        from core.config import Config
+        from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository, sanitized_history_lines
+        try:
+            records = IntakeHistoryRepository(Config.IREO_INTAKE_DATABASE_PATH).list_records(
+                limit=100, status="REVIEW_REQUIRED"
+            )
+        except IntakeHistoryError:
+            print("Não foi possível consultar pendências com segurança.")
+            return 2
+        for line in sanitized_history_lines(records):
+            print(line)
+        if not records:
+            print("Nenhuma pendência de revisão.")
+        return 0
+
+    if arguments and arguments[0] == "intake-review-resume":
+        from core.config import Config
+        from pathlib import Path
+        import hashlib
+        from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence intake-review-resume")
+        parser.add_argument("--correlation-id", required=True)
+        try:
+            options = parser.parse_args(arguments[1:])
+            records = IntakeHistoryRepository(Config.IREO_INTAKE_DATABASE_PATH).list_records(
+                limit=100, status="REVIEW_REQUIRED", correlation_id=options.correlation_id
+            )
+        except (SystemExit, IntakeHistoryError):
+            print("Não foi possível localizar a pendência com segurança.")
+            return 2
+        record = next((item for item in records if item.archive_sha256), None)
+        if record is None:
+            print("A pendência não possui arquivo local; revise a mensagem no Gmail manualmente.")
+            return 1
+        archive = next((path for path in Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH).rglob("*")
+                        if path.is_file() and _sha256_for_resume(path) == record.archive_sha256), None)
+        if archive is None:
+            print("Arquivo de quarentena não encontrado; nenhuma ação foi feita.")
+            return 1
+        return main(["radiology-import-supervised", "--archive-path", str(archive),
+                     "--patient-source", "clinicorp"])
+
+    if arguments and arguments[0] == "radiology-auto-status":
+        from core.config import Config
+        import json
+        from pathlib import Path
+        try:
+            value = json.loads(Path(Config.IREO_AUTO_RUN_SUMMARY_PATH).read_text(encoding="utf-8"))
+            print("Última execução:", value.get("finished_at", "não disponível"))
+            print("Concluídos:", int(value.get("completed", 0)))
+            print("Em revisão:", int(value.get("review_required", 0)))
+            print("Falhas:", int(value.get("failed", 0)))
+            print("Duplicidades bloqueadas:", int(value.get("duplicates_blocked", 0)))
+            return 0
+        except (OSError, ValueError, TypeError):
+            print("Nenhuma execução automática registrada.")
+            return 1
+
+    if arguments and arguments[0] == "radiology-auto-run":
+        from core.config import Config
+        from integrations.gmail_connector import GmailConnector
+        from observability.audit_logger import AuditLogger
+        from radiology.auto_run import (
+            RadiologyAutoRunner, new_summary, sanitized_failure, write_summary_atomic,
+        )
+        from radiology.intake_history import IntakeHistoryRepository
+        from radiology.supervised_import import SupervisedRadiologyImporter
+        from radiology.transfernow_download import TransferNowDownloader
+        from radiology.transfernow_browser_download import TransferNowBrowserDownloader
+        from repositories.clinicorp_patient_repository import ClinicorpPatientRepository
+        summary = new_summary()
+        code = 1
+        try:
+            audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
+            importer = SupervisedRadiologyImporter(
+                patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
+                quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+                archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
+                patient_repository=ClinicorpPatientRepository(ClinicorpAPI(), audit_logger=audit),
+                audit_logger=audit, auto_select_unambiguous=True,
+                auto_select_min_score=.98, patient_source_mode="clinicorp",
+                intake_history=IntakeHistoryRepository(Config.IREO_INTAKE_DATABASE_PATH),
+            )
+            code, summary = RadiologyAutoRunner(
+                gmail=GmailConnector(), downloader=TransferNowDownloader(
+                    connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=Config.IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS,
+                    max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES),
+                browser_downloader=TransferNowBrowserDownloader(
+                    timeout_seconds=Config.IREO_BROWSER_DOWNLOAD_TIMEOUT_SECONDS,
+                    max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES,
+                    headless=Config.IREO_AUTO_RUN_BROWSER_MODE == "headless",
+                    allow_manual_interaction=False, debug=False),
+                importer=importer, history=importer.intake_history,
+                enabled=Config.IREO_AUTO_RUN_ENABLED, allow_copy=Config.IREO_AUTO_RUN_ALLOW_COPY,
+                max_messages=Config.IREO_AUTO_RUN_MAX_MESSAGES,
+                browser_mode=Config.IREO_AUTO_RUN_BROWSER_MODE,
+                require_exact_match=Config.IREO_AUTO_RUN_REQUIRE_EXACT_MATCH,
+                summary_path=Config.IREO_AUTO_RUN_SUMMARY_PATH,
+                review_report_path=Config.IREO_AUTO_RUN_REVIEW_REPORT_PATH,
+                start_date=Config.IREO_AUTO_RUN_START_DATE,
+                debug=Config.IREO_AUTO_RUN_DEBUG,
+            ).run()
+        except Exception as exc:
+            summary.failed += 1
+            summary.reason_codes.append("GLOBAL_AUTO_RUN_FAILURE")
+            summary.global_failure = sanitized_failure(
+                exc, "INITIALIZATION", "GLOBAL_AUTO_RUN_FAILURE",
+                debug=Config.IREO_AUTO_RUN_DEBUG,
+            )
+            code = 1
+        finally:
+            from datetime import datetime, timezone
+            summary.finished_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            summary.duration_seconds = max(0.0, (
+                datetime.fromisoformat(summary.finished_at.replace("Z", "+00:00"))
+                - datetime.fromisoformat(summary.started_at.replace("Z", "+00:00"))
+            ).total_seconds())
+            summary.exit_code = code
+            write_summary_atomic(summary, Config.IREO_AUTO_RUN_SUMMARY_PATH)
+        if summary.review_required:
+            print("Execução concluída com pendências; consulte intake-review-list.")
+        elif summary.failed:
+            print("Execução automática falhou; consulte radiology-auto-status.")
+            if Config.IREO_AUTO_RUN_DEBUG and summary.global_failure:
+                failure = summary.global_failure
+                print(" | ".join((failure["stage"], failure["exception_type"], failure["reason_code"], failure["sanitized_message"])))
+                for key in ("function", "line", "operation", "argument_types"):
+                    if key in failure:
+                        print(f"{key}: {failure[key]}")
+        return code
+
     if arguments and arguments[0] == "radiology-gmail-dry-run":
         from integrations.gmail_connector import GmailConnectorError
         from radiology.gmail_dry_run import run_gmail_dry_run
@@ -248,6 +413,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         )
         from observability.audit_logger import AuditLogger
         from radiology.archive_extractor import ArchiveExtractionError
+        from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
         from radiology.supervised_import import (
             SupervisedImportCancelled,
             SupervisedImportError,
@@ -267,6 +433,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             default="offline",
         )
         parser.add_argument("--force-manual-selection", action="store_true")
+        parser.add_argument("--allow-reimport", action="store_true")
         try:
             options = parser.parse_args(arguments[1:])
         except SystemExit:
@@ -300,6 +467,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                 auto_select_min_score=Config.IREO_AUTO_SELECT_MIN_SCORE,
                 force_manual_selection=options.force_manual_selection,
                 patient_source_mode=options.patient_source,
+                intake_history=IntakeHistoryRepository(
+                    Config.IREO_INTAKE_DATABASE_PATH
+                ),
+                allow_reimport=options.allow_reimport,
             )
             result = importer.run(
                 archive_path=options.archive_path,
@@ -311,6 +482,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         except (
             ArchiveExtractionError,
             GmailConnectorError,
+            IntakeHistoryError,
             SupervisedImportError,
             ValueError,
         ) as exc:
@@ -327,6 +499,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         from observability.audit_logger import AuditLogger
         from radiology.gmail_import import run_gmail_import
         from radiology.archive_extractor import ArchiveExtractionError
+        from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
         from radiology.supervised_import import (
             SupervisedImportCancelled,
             SupervisedImportError,
@@ -346,10 +519,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             "--patient-source", choices=("clinicorp", "offline"), default="offline"
         )
         parser.add_argument("--force-manual-selection", action="store_true")
+        parser.add_argument("--allow-reimport", action="store_true")
         try:
             options = parser.parse_args(arguments[1:])
         except SystemExit:
             return 2
+        try:
+            intake_history = IntakeHistoryRepository(
+                Config.IREO_INTAKE_DATABASE_PATH
+            )
+        except IntakeHistoryError:
+            print("Importação não concluída: histórico local indisponível.")
+            return 1
         audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
         if options.patient_source == "clinicorp":
             from repositories.clinicorp_patient_repository import ClinicorpPatientRepository
@@ -368,6 +549,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             auto_select_min_score=Config.IREO_AUTO_SELECT_MIN_SCORE,
             force_manual_selection=options.force_manual_selection,
             patient_source_mode=options.patient_source,
+            intake_history=intake_history,
+            allow_reimport=options.allow_reimport,
         )
         downloader = TransferNowDownloader(
             connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,
@@ -392,6 +575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         except (
             ArchiveExtractionError,
             GmailConnectorError,
+            IntakeHistoryError,
             SupervisedImportCancelled,
             SupervisedImportError,
             TransferNowDownloadError,
@@ -409,9 +593,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         "Uso: ireo-clinical-intelligence "
         "[radiology-gmail-dry-run | radiology-import-supervised | "
         "radiology-import-from-gmail | browser-self-test | "
-        "transfernow-link-diagnosis]"
+        "transfernow-link-diagnosis | intake-history | intake-review-list | intake-review-resume | "
+        "radiology-auto-run | radiology-auto-status]"
     )
     return 2
+
+
+def _sha256_for_resume(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

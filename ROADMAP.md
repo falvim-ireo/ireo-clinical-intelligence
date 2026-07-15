@@ -8,14 +8,14 @@
 - TransferNow
 - Radiology Intake supervisionado
 - MVP v1.0.0
+- idempotência persistente e prevenção de reimportações
 
 ## Próximos
 
 - validação em múltiplos exames;
 - upload direto Microsoft Graph;
 - limpeza supervisionada da quarentena;
-- idempotência persistente;
 - fila de revisão;
-- processamento automático agendado;
+- retomada supervisionada de pendências automáticas por correlation id;
 - leitura DICOM;
 - painel operacional.

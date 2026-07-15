@@ -66,6 +66,36 @@ O limiar é independente do `PatientResolver`. A auto-seleção exige exatamente
 
 Para forçar o comportamento manual em uma execução, acrescente `--force-manual-selection` a `radiology-import-supervised` ou `radiology-import-from-gmail`. Para desativar rapidamente em todo o ambiente, defina `IREO_AUTO_SELECT_UNAMBIGUOUS=false`. A prévia e a confirmação final digitada `CONFIRMAR` permanecem obrigatórias em todos os casos.
 
+### Histórico e prevenção de reimportações
+
+Importações são registradas localmente em SQLite, por padrão em `data/ireo_intake.db`. Configure outro local protegido com:
+
+```env
+IREO_INTAKE_DATABASE_PATH=data/ireo_intake.db
+```
+
+O SHA-256 do arquivo compactado é o sinal mais forte. Message ID do Gmail, URL de transferência, PatientId, destino, manifesto e checksums são persistidos somente como fingerprints SHA-256; nomes de paciente, URLs e caminhos clínicos completos não são armazenados.
+
+Uma duplicidade concluída é bloqueada. A opção `--allow-reimport` apenas habilita a decisão: o alerta continua visível e o operador precisa digitar exatamente `REIMPORTAR`, além de manter a confirmação final `CONFIRMAR`.
+
+Consulte o histórico sanitizado com:
+
+```powershell
+ireo-clinical-intelligence intake-history --limit 20
+ireo-clinical-intelligence intake-history --status COMPLETED
+ireo-clinical-intelligence intake-history --correlation-id correlation-local
+```
+
+Inclua o banco em backups locais protegidos, preferencialmente com o aplicativo parado e junto aos arquivos auxiliares `-wal` e `-shm`, se existirem. A política formal de retenção ainda não foi definida; não apague registros automaticamente.
+
+### Execução automática agendada
+
+O piloto começa desligado e nunca copia arquivos enquanto `IREO_AUTO_RUN_ALLOW_COPY=false`. Para ativar a consulta automática, configure em ambiente protegido `IREO_AUTO_RUN_ENABLED=true`, mantenha a cópia desligada e execute `ireo-clinical-intelligence radiology-auto-run`. Casos não inequívocos ficam em `intake-review-list`; consulte `radiology-auto-status` para o resumo sanitizado em `data/last_auto_run_summary.json`.
+
+Para o Agendador de Tarefas do Windows, execute `scripts/run_radiology_auto.ps1` com uma conta que já possua token OAuth válido e acesso às pastas locais. Agende a cada 10 minutos, também na inicialização, somente com rede, com repetição em falha e sem iniciar uma segunda instância. O computador precisa estar ligado. O script usa lock local e remove lock abandonado após seis horas. Os modos aceitos são `review`, `headless` e `visible`. Em `visible`, marque **Executar somente quando o usuário estiver conectado**, mantenha o computador ligado e uma sessão Windows ativa; nenhuma intervenção do operador é necessária, embora o Chromium possa aparecer brevemente na tela. Falhas de automação, CAPTCHA, login, senha ou proteção viram revisão, sem tentativa de contorno. Para interromper imediatamente, defina `IREO_AUTO_RUN_ENABLED=false`.
+
+`IREO_AUTO_RUN_START_DATE=YYYY-MM-DD` limita o primeiro processamento a mensagens a partir da data indicada. As pendências também são escritas sem dados clínicos em `data/radiology_review_required.txt`; execute `scripts/open_radiology_review.ps1` para listá-las.
+
 ## Solução de problemas
 
 - **OAuth Gmail:** confira os caminhos de credencial/token e o escopo readonly; revogue e refaça o consentimento se o token estiver inválido.

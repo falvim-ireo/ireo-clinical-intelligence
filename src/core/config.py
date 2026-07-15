@@ -67,6 +67,31 @@ class Config:
     IREO_AUTO_SELECT_MIN_SCORE = _bounded_float(
         os.getenv("IREO_AUTO_SELECT_MIN_SCORE"), 0.95, 0.0, 1.0
     )
+    IREO_INTAKE_DATABASE_PATH = os.getenv(
+        "IREO_INTAKE_DATABASE_PATH", "data/ireo_intake.db"
+    )
+    IREO_AUTO_RUN_ENABLED = _bool(os.getenv("IREO_AUTO_RUN_ENABLED"), False)
+    IREO_AUTO_RUN_MAX_MESSAGES = _bounded_int(
+        os.getenv("IREO_AUTO_RUN_MAX_MESSAGES"), 3, 20
+    )
+    IREO_AUTO_RUN_ALLOW_COPY = _bool(os.getenv("IREO_AUTO_RUN_ALLOW_COPY"), False)
+    IREO_AUTO_RUN_REQUIRE_EXACT_MATCH = _bool(
+        os.getenv("IREO_AUTO_RUN_REQUIRE_EXACT_MATCH"), True
+    )
+    IREO_AUTO_RUN_NOTIFY_ON_SUCCESS = _bool(
+        os.getenv("IREO_AUTO_RUN_NOTIFY_ON_SUCCESS"), False
+    )
+    IREO_AUTO_RUN_BROWSER_MODE = os.getenv(
+        "IREO_AUTO_RUN_BROWSER_MODE", "review"
+    ).strip().casefold()
+    IREO_AUTO_RUN_SUMMARY_PATH = os.getenv(
+        "IREO_AUTO_RUN_SUMMARY_PATH", "data/last_auto_run_summary.json"
+    )
+    IREO_AUTO_RUN_START_DATE = os.getenv("IREO_AUTO_RUN_START_DATE", "").strip()
+    IREO_AUTO_RUN_REVIEW_REPORT_PATH = os.getenv(
+        "IREO_AUTO_RUN_REVIEW_REPORT_PATH", "data/radiology_review_required.txt"
+    )
+    IREO_AUTO_RUN_DEBUG = _bool(os.getenv("IREO_AUTO_RUN_DEBUG"), False)
     CLINICORP_SUBSCRIBER_ID = os.getenv("CLINICORP_SUBSCRIBER_ID")
     CLINICORP_BUSINESS_ID = os.getenv("CLINICORP_BUSINESS_ID")
     CLINICORP_API_USER = os.getenv("CLINICORP_API_USER")

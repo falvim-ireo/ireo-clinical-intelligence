@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import re
 from typing import Callable
 from urllib.parse import urlsplit
@@ -70,6 +71,9 @@ def run_gmail_import(
     message, transfer, _, validity = parsed[selected - 1]
     if not transfer.original_filename:
         raise ValueError("A mensagem selecionada não informa o arquivo esperado.")
+    precheck = getattr(importer, "check_message_duplicate", None)
+    if callable(precheck):
+        precheck(message.message_id, transfer.download_url)
     output(f"Arquivo esperado: {transfer.display_filename}")
     output(f"Domínio: {urlsplit(transfer.download_url).hostname}")
     output(f"Validade: {validity or 'não informada'}")
@@ -109,13 +113,28 @@ def run_gmail_import(
     output(f"Tamanho: {downloaded.size_bytes} bytes")
     output(f"SHA-256: {downloaded.sha256}")
     output(f"Caminho na quarentena: {downloaded.path}")
+    intake_record_id = None
+    register_download = getattr(importer, "register_download", None)
+    if callable(register_download):
+        intake_record_id = register_download(
+            archive_path=downloaded.path,
+            archive_sha256=downloaded.sha256,
+            gmail_message_id=message.message_id,
+            transfer_url=transfer.download_url,
+        )
     if input_func(
         "Digite CONFIRMAR para continuar ao fluxo supervisionado ou ENTER para encerrar: "
     ).strip().casefold() != "confirmar":
+        cancel_download = getattr(importer, "cancel_registered_download", None)
+        if callable(cancel_download):
+            cancel_download(intake_record_id)
         return GmailImportOutcome(downloaded, None)
     return GmailImportOutcome(
         downloaded,
-        importer.run(archive_path=downloaded.path),
+        _run_supervised_import(
+            importer, downloaded, message.message_id, transfer.download_url,
+            intake_record_id,
+        ),
     )
 
 
@@ -127,6 +146,26 @@ def _choice(value: str, maximum: int) -> int:
     if not 1 <= selected <= maximum:
         raise ValueError("Seleção inválida.")
     return selected
+
+
+def _run_supervised_import(
+    importer, downloaded, message_id: str, transfer_url: str,
+    intake_record_id: int | None,
+):
+    parameters = inspect.signature(importer.run).parameters
+    accepts_metadata = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ) or "gmail_message_id" in parameters
+    if not accepts_metadata:
+        return importer.run(archive_path=downloaded.path)
+    return importer.run(
+        archive_path=downloaded.path,
+        gmail_message_id=message_id,
+        transfer_url=transfer_url,
+        archive_sha256=downloaded.sha256,
+        intake_record_id=intake_record_id,
+    )
 
 
 def _first_match(text: str, pattern: str) -> str | None:
