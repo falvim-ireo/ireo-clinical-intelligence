@@ -1,8 +1,9 @@
-"""Cliente mínimo e somente leitura para OneDrive via Microsoft Graph."""
+"""Cliente mínimo para consultas e uploads no OneDrive via Microsoft Graph."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -35,12 +36,21 @@ class GraphFolder:
     is_remote: bool = False
     remote_item_id: str | None = None
     remote_drive_id: str | None = None
+    drive_id: str | None = None
+
+
+@dataclass(frozen=True)
+class GraphUploadedItem:
+    name: str
+    size: int
+    has_id: bool
 
 
 class OneDriveGraphClient:
-    """Executa apenas consultas GET no drive do usuário autenticado."""
+    """Executa consultas e uploads pequenos no drive do usuário autenticado."""
 
     BASE_URL = "https://graph.microsoft.com/v1.0"
+    MAX_SMALL_UPLOAD_BYTES = 250 * 1024 * 1024
 
     def __init__(
         self,
@@ -79,14 +89,20 @@ class OneDriveGraphClient:
         try:
             payload = self._get(
                 f"/me/drive/root:/{encoded_path}",
-                params={"$select": "id,name,folder,remoteItem"},
+                params={"$select": "id,name,folder,parentReference,remoteItem"},
             )
         except OneDriveRootNotFoundError:
             raise
         item_id = self._required_text(payload, "id", "Root Item ID")
         if isinstance(payload.get("folder"), dict):
             name = self._required_text(payload, "name", "nome da pasta")
-            return GraphFolder(item_id=item_id, name=name)
+            parent_reference = payload.get("parentReference")
+            drive_id = (
+                self._optional_text(parent_reference.get("driveId"))
+                if isinstance(parent_reference, dict)
+                else None
+            )
+            return GraphFolder(item_id=item_id, name=name, drive_id=drive_id)
 
         remote_item = payload.get("remoteItem")
         if isinstance(remote_item, dict) and isinstance(
@@ -140,6 +156,97 @@ class OneDriveGraphClient:
         if not isinstance(values, list):
             raise OneDriveGraphError("Resposta inválida ao listar itens do OneDrive.")
         return [item for item in values if isinstance(item, dict)]
+
+    def upload_small_file(
+        self,
+        parent_folder: GraphFolder,
+        local_file_path: str | Path,
+        remote_filename: str | None = None,
+    ) -> GraphUploadedItem:
+        local_path = Path(local_file_path)
+        if not local_path.is_file():
+            raise OneDriveGraphError("Arquivo local para upload não encontrado.")
+        try:
+            content = local_path.read_bytes()
+        except OSError:
+            raise OneDriveGraphError(
+                "Não foi possível ler o arquivo local para upload."
+            ) from None
+        file_size = len(content)
+        if file_size > self.MAX_SMALL_UPLOAD_BYTES:
+            raise OneDriveGraphError(
+                "Arquivo excede o limite permitido para upload direto."
+            )
+
+        filename = (remote_filename or local_path.name).strip()
+        if not filename:
+            raise OneDriveGraphError("Nome remoto do arquivo não foi informado.")
+        if "/" in filename or "\\" in filename:
+            raise OneDriveGraphError("Nome remoto do arquivo é inválido.")
+
+        if parent_folder.is_remote:
+            drive_id = parent_folder.remote_drive_id
+            item_id = parent_folder.remote_item_id
+        else:
+            drive_id = parent_folder.drive_id
+            item_id = parent_folder.item_id
+        if not drive_id or not item_id:
+            raise OneDriveGraphError(
+                "A pasta de destino não informou driveId e itemId para o upload."
+            )
+
+        encoded_drive_id = quote(drive_id, safe="")
+        encoded_item_id = quote(item_id, safe="")
+        encoded_filename = quote(filename, safe="")
+        path = (
+            f"/drives/{encoded_drive_id}/items/{encoded_item_id}:"
+            f"/{encoded_filename}:/content"
+        )
+        try:
+            response = self._session.put(
+                f"{self.BASE_URL}{path}",
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": "application/octet-stream",
+                },
+                data=content,
+                timeout=self._timeout,
+            )
+        except requests.Timeout:
+            raise OneDriveGraphError(
+                "Tempo limite excedido ao enviar arquivo ao Microsoft Graph."
+            ) from None
+        except (OSError, requests.RequestException):
+            raise OneDriveGraphError(
+                "Falha ao enviar arquivo ao Microsoft Graph."
+            ) from None
+
+        if not 200 <= response.status_code < 300:
+            raise OneDriveGraphError(
+                f"Microsoft Graph retornou um erro HTTP ({response.status_code}) "
+                "durante o upload."
+            )
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise OneDriveGraphError(
+                "Resposta inválida do Microsoft Graph após o upload."
+            ) from None
+        if not isinstance(payload, dict):
+            raise OneDriveGraphError(
+                "Resposta inválida do Microsoft Graph após o upload."
+            )
+        uploaded_name = self._required_text(payload, "name", "nome do arquivo")
+        uploaded_size = payload.get("size")
+        if not isinstance(uploaded_size, int) or uploaded_size < 0:
+            raise OneDriveGraphError(
+                "Tamanho do arquivo ausente na resposta do Microsoft Graph."
+            )
+        return GraphUploadedItem(
+            name=uploaded_name,
+            size=uploaded_size,
+            has_id=self._optional_text(payload.get("id")) is not None,
+        )
 
     def _get(self, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         try:
