@@ -188,6 +188,69 @@ def build_radiology_workflow(patient_source: str, audit_logger=None):
     raise ValueError("Fonte de pacientes inválida.")
 
 
+def build_radiology_inbox_processor():
+    """Compõe o comando operacional com as integrações existentes."""
+
+    import logging
+
+    from core.config import Config
+    from integrations.gmail_connector import GmailConnector
+    from integrations.microsoft_graph_auth import MicrosoftGraphAuth
+    from integrations.onedrive_graph import OneDriveGraphClient
+    from radiology.dicom_reader import DicomReader
+    from radiology.inbox_processor import RadiologyInboxProcessor
+    from radiology.patient_matcher import PatientMatcher
+    from radiology.transfernow_download import TransferNowDownloader
+    from radiology.zip_extractor import ZipExtractor
+    from repositories.clinicorp_patient_repository import ClinicorpPatientRepository
+    from storage.onedrive_radiology_organizer import OneDriveRadiologyOrganizer
+    from storage.radiology_storage import RadiologyStorage
+    from workflows.radiology_workflow import RadiologyWorkflow
+
+    required = {
+        "MS_GRAPH_CLIENT_ID": Config.MS_GRAPH_CLIENT_ID,
+        "MS_GRAPH_AUTHORITY": Config.MS_GRAPH_AUTHORITY,
+        "MS_GRAPH_SCOPES": Config.MS_GRAPH_SCOPES,
+        "MS_GRAPH_ONEDRIVE_ROOT": Config.MS_GRAPH_ONEDRIVE_ROOT,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError("Configuração Microsoft Graph incompleta.")
+
+    auth = MicrosoftGraphAuth(
+        client_id=Config.MS_GRAPH_CLIENT_ID,
+        authority=Config.MS_GRAPH_AUTHORITY,
+        scopes=Config.MS_GRAPH_SCOPES,
+        token_cache_file=Config.MS_GRAPH_TOKEN_CACHE_FILE,
+        output=logging.getLogger(__name__).info,
+    )
+    graph = OneDriveGraphClient(auth.acquire_access_token())
+    repository = ClinicorpPatientRepository(ClinicorpAPI())
+    workflow = RadiologyWorkflow(
+        downloader=TransferNowDownloader(
+            connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=Config.IREO_TRANSFERNOW_READ_TIMEOUT_SECONDS,
+            max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES,
+        ),
+        zip_extractor=ZipExtractor(),
+        dicom_reader=DicomReader(),
+        patient_matcher=PatientMatcher(),
+    )
+    storage = RadiologyStorage(Config.IREO_RADIOLOGY_STORAGE_PATH)
+    return RadiologyInboxProcessor(
+        gmail=GmailConnector(),
+        workflow=workflow,
+        storage=storage,
+        organizer=OneDriveRadiologyOrganizer(
+            graph, Config.MS_GRAPH_ONEDRIVE_ROOT
+        ),
+        patient_provider=lambda transfer: repository.find_candidates(
+            transfer.patient_name_candidate or ""
+        ),
+        download_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
@@ -213,6 +276,42 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         except (GmailConnectorError, ValueError) as exc:
             print(f"Diagnóstico não concluído: {exc}")
             return 1
+        return 0
+
+    if arguments and arguments[0] == "process-radiology-inbox":
+        import logging
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence process-radiology-inbox"
+        )
+        parser.add_argument("--max-messages", type=int, default=5)
+        try:
+            options = parser.parse_args(arguments[1:])
+            if not 1 <= options.max_messages <= 20:
+                raise ValueError("limite inválido")
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(levelname)s %(name)s: %(message)s",
+            )
+            summary = build_radiology_inbox_processor().run(
+                max_messages=options.max_messages
+            )
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except Exception as exc:
+            logging.getLogger(__name__).error(
+                "Falha global do comando (%s).", type(exc).__name__
+            )
+            print("Processamento da caixa radiológica não foi iniciado.")
+            return 1
+        print(
+            "Resumo: "
+            f"encontradas={summary.found}, "
+            f"processadas={summary.processed}, "
+            f"duplicadas={summary.duplicates}, "
+            f"revisar={summary.review_required}, "
+            f"falhas={summary.failed}"
+        )
         return 0
 
     if arguments and arguments[0] == "intake-history":
@@ -594,7 +693,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         "[radiology-gmail-dry-run | radiology-import-supervised | "
         "radiology-import-from-gmail | browser-self-test | "
         "transfernow-link-diagnosis | intake-history | intake-review-list | intake-review-resume | "
-        "radiology-auto-run | radiology-auto-status]"
+        "radiology-auto-run | radiology-auto-status | process-radiology-inbox]"
     )
     return 2
 

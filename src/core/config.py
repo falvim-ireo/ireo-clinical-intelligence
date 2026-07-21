@@ -114,3 +114,13 @@ class Config:
         default=5,
         maximum=5,
     )
+    IREO_RADIOLOGY_STORAGE_PATH = os.getenv(
+        "IREO_RADIOLOGY_STORAGE_PATH", "data/radiology"
+    )
+    MS_GRAPH_CLIENT_ID = os.getenv("MS_GRAPH_CLIENT_ID", "").strip()
+    MS_GRAPH_AUTHORITY = os.getenv("MS_GRAPH_AUTHORITY", "").strip()
+    MS_GRAPH_SCOPES = os.getenv("MS_GRAPH_SCOPES", "").strip()
+    MS_GRAPH_TOKEN_CACHE_FILE = os.getenv(
+        "MS_GRAPH_TOKEN_CACHE_FILE", "data/ms_graph_token_cache.json"
+    ).strip()
+    MS_GRAPH_ONEDRIVE_ROOT = os.getenv("MS_GRAPH_ONEDRIVE_ROOT", "").strip()

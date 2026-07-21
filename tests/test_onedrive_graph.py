@@ -5,6 +5,7 @@ from integrations.onedrive_graph import (
     GraphFolder,
     OneDriveGraphClient,
     OneDriveGraphError,
+    OneDriveFolderConflictError,
     OneDriveRootNotFoundError,
 )
 
@@ -31,6 +32,12 @@ class FakeSession:
         return self.responses.pop(0)
 
     def put(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.responses.pop(0)
+
+    def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         if self.error is not None:
             raise self.error
@@ -303,3 +310,310 @@ def test_upload_rejects_folder_without_drive_id_or_item_id(tmp_path, folder) -> 
 
     with pytest.raises(OneDriveGraphError, match="driveId e itemId"):
         client.upload_small_file(folder, local_file)
+
+
+def test_finds_existing_child_folder() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [
+                        {
+                            "id": "child-id",
+                            "name": "Teste Paciente API",
+                            "folder": {},
+                            "parentReference": {"driveId": "drive-id"},
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    child = client.find_child_folder(parent, "Teste Paciente API")
+
+    assert child == GraphFolder(
+        "child-id", "Teste Paciente API", drive_id="drive-id"
+    )
+    assert "/drives/drive-id/items/parent-id/children" in session.calls[0][0]
+
+
+def test_find_child_folder_ignores_file_with_same_name() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [
+                        {
+                            "id": "file-id",
+                            "name": "Teste Paciente API",
+                            "file": {},
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    assert client.find_child_folder(parent, "Teste Paciente API") is None
+
+
+def test_creates_child_folder() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                201,
+                {
+                    "id": "created-id",
+                    "name": "Teste Paciente API",
+                    "folder": {},
+                    "parentReference": {"driveId": "drive-id"},
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    created = client.create_folder(parent, "Teste Paciente API")
+
+    assert created == GraphFolder(
+        "created-id", "Teste Paciente API", drive_id="drive-id"
+    )
+    assert session.calls[0][1]["json"] == {
+        "name": "Teste Paciente API",
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "fail",
+    }
+    assert session.calls[0][1]["headers"]["Content-Type"] == "application/json"
+
+
+def test_ensure_folder_returns_existing_folder_without_creating() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [
+                        {"id": "existing-id", "name": "Paciente", "folder": {}}
+                    ]
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    folder = client.ensure_folder(parent, "Paciente")
+
+    assert folder.item_id == "existing-id"
+    assert len(session.calls) == 1
+
+
+def test_ensure_folder_creates_missing_folder() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"value": []}),
+            FakeResponse(
+                201,
+                {"id": "created-id", "name": "Paciente", "folder": {}},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    folder = client.ensure_folder(parent, "Paciente")
+
+    assert folder == GraphFolder("created-id", "Paciente", drive_id="drive-id")
+    assert len(session.calls) == 2
+
+
+def test_ensure_folder_path_creates_nested_path() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"value": []}),
+            FakeResponse(
+                201,
+                {"id": "patient-id", "name": "Paciente", "folder": {}},
+            ),
+            FakeResponse(200, {"value": []}),
+            FakeResponse(
+                201,
+                {"id": "exam-id", "name": "2026-07-21", "folder": {}},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    root = GraphFolder("root-id", "Raiz", drive_id="drive-id")
+
+    final_folder = client.ensure_folder_path(
+        root, ["Paciente", "2026-07-21"]
+    )
+
+    assert final_folder == GraphFolder("exam-id", "2026-07-21", drive_id="drive-id")
+    assert "/items/root-id/children" in session.calls[0][0]
+    assert "/items/patient-id/children" in session.calls[2][0]
+
+
+def test_lists_and_finds_folder_under_remote_parent() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [
+                        {
+                            "id": "shortcut-child-id",
+                            "name": "Atalho",
+                            "remoteItem": {
+                                "id": "remote-child-id",
+                                "name": "Paciente remoto",
+                                "folder": {},
+                                "parentReference": {
+                                    "driveId": "child-remote-drive-id"
+                                },
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder(
+        "shortcut-parent-id",
+        "Raiz remota",
+        is_remote=True,
+        remote_item_id="remote-parent-id",
+        remote_drive_id="remote-parent-drive-id",
+    )
+
+    child = client.find_child_folder(parent, "Paciente remoto")
+
+    assert child is not None
+    assert child.is_remote is True
+    assert child.item_id == "shortcut-child-id"
+    assert child.remote_item_id == "remote-child-id"
+    assert child.remote_drive_id == "child-remote-drive-id"
+    assert (
+        "/drives/remote-parent-drive-id/items/remote-parent-id/children"
+        in session.calls[0][0]
+    )
+
+
+def test_creates_folder_under_remote_parent_using_real_ids() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                201,
+                {
+                    "id": "created-id",
+                    "name": "Paciente",
+                    "folder": {},
+                    "parentReference": {"driveId": "remote-drive-id"},
+                },
+            )
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder(
+        "shortcut-id",
+        "Raiz remota",
+        is_remote=True,
+        remote_item_id="remote-parent-id",
+        remote_drive_id="remote-drive-id",
+    )
+
+    created = client.create_folder(parent, "Paciente")
+
+    assert created == GraphFolder("created-id", "Paciente", drive_id="remote-drive-id")
+    assert (
+        "/drives/remote-drive-id/items/remote-parent-id/children"
+        in session.calls[0][0]
+    )
+    assert "shortcut-id" not in session.calls[0][0]
+
+
+def test_create_folder_reports_name_conflict() -> None:
+    client = OneDriveGraphClient(
+        "fixture-token", session=FakeSession([FakeResponse(409)])
+    )
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    with pytest.raises(OneDriveFolderConflictError, match="Já existe"):
+        client.create_folder(parent, "Paciente")
+
+
+def test_ensure_folder_recovers_from_concurrent_name_conflict() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"value": []}),
+            FakeResponse(409),
+            FakeResponse(
+                200,
+                {"value": [{"id": "existing-id", "name": "Paciente", "folder": {}}]},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient("fixture-token", session=session)
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    folder = client.ensure_folder(parent, "Paciente")
+
+    assert folder == GraphFolder("existing-id", "Paciente", drive_id="drive-id")
+    assert len(session.calls) == 3
+
+
+@pytest.mark.parametrize("folder_name", ["", "   "])
+def test_create_folder_rejects_empty_name(folder_name: str) -> None:
+    client = OneDriveGraphClient("fixture-token", session=FakeSession())
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    with pytest.raises(OneDriveGraphError, match="Nome da pasta"):
+        client.create_folder(parent, folder_name)
+
+
+@pytest.mark.parametrize(
+    "parent",
+    [
+        GraphFolder("parent-id", "Sem drive"),
+        GraphFolder("", "Sem item", drive_id="drive-id"),
+        GraphFolder(
+            "shortcut-id",
+            "Remota sem drive",
+            is_remote=True,
+            remote_item_id="remote-id",
+        ),
+        GraphFolder(
+            "shortcut-id",
+            "Remota sem item",
+            is_remote=True,
+            remote_drive_id="remote-drive-id",
+        ),
+    ],
+)
+def test_create_folder_rejects_missing_drive_id_or_item_id(parent) -> None:
+    client = OneDriveGraphClient("fixture-token", session=FakeSession())
+
+    with pytest.raises(OneDriveGraphError, match="driveId e itemId"):
+        client.create_folder(parent, "Paciente")
+
+
+def test_create_folder_reports_generic_http_error() -> None:
+    client = OneDriveGraphClient(
+        "fixture-token",
+        session=FakeSession([FakeResponse(500, {"secret": "details"})]),
+    )
+    parent = GraphFolder("parent-id", "Raiz", drive_id="drive-id")
+
+    with pytest.raises(OneDriveGraphError, match="500") as captured:
+        client.create_folder(parent, "Paciente")
+
+    assert "secret" not in str(captured.value)

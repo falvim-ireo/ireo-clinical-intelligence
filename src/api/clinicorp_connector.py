@@ -6,6 +6,7 @@ Responsável pela comunicação com a API da Clinicorp.
 """
 
 from typing import Any
+import logging
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -34,7 +35,7 @@ class ClinicorpAPI:
             "Content-Type": "application/json",
         }
 
-        print("Clinicorp Connector inicializado.")
+        logging.getLogger(__name__).info("Clinicorp Connector inicializado.")
 
     def _validar_configuracao(self) -> None:
         """Confirma se as variáveis obrigatórias estão no arquivo .env."""

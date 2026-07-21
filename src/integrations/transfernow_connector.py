@@ -8,12 +8,24 @@ do e-mail recebido.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import html
+from pathlib import Path
 import re
+import tempfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Optional
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+
+import requests
+
+from radiology.transfernow_download import (
+    DownloadResult,
+    TransferNowDownloader,
+    TransferNowDownloadError,
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +127,50 @@ class TransferNowConnector:
     )
 
     _SUPPORTED_EXTENSIONS = (".rar", ".zip", ".7z")
+
+    @classmethod
+    def validar_link_download(cls, url: str) -> str:
+        """Valida e normaliza um link público legítimo do TransferNow."""
+
+        normalized = cls._normalizar_url(url)
+        if normalized is None:
+            raise TransferNowDownloadError("Link TransferNow inválido.")
+        try:
+            return cls.interpretar(normalized).download_url
+        except ValueError:
+            raise TransferNowDownloadError("Link TransferNow inválido.") from None
+
+    @classmethod
+    @contextmanager
+    def baixar_temporariamente(
+        cls,
+        url: str,
+        *,
+        session: requests.Session | None = None,
+        connect_timeout: int = 30,
+        read_timeout: int = 1800,
+        max_download_bytes: int = 250 * 1024 * 1024,
+        max_redirects: int = 5,
+    ) -> Iterator[DownloadResult]:
+        """Baixa um arquivo para uma área temporária removida ao terminar."""
+
+        validated_url = cls.validar_link_download(url)
+        downloader = TransferNowDownloader(
+            session=session,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_download_bytes=max_download_bytes,
+            max_redirects=max_redirects,
+        )
+        with tempfile.TemporaryDirectory(prefix="ireo_transfernow_") as temporary_dir:
+            result = downloader.download(
+                validated_url,
+                None,
+                Path(temporary_dir),
+                "transfernow-direct",
+                "direct-transfernow-link",
+            )
+            yield result
 
     @classmethod
     def extrair_nome_paciente_do_arquivo(

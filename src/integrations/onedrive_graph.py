@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,10 @@ class OneDriveGraphError(RuntimeError):
 
 class OneDriveRootNotFoundError(OneDriveGraphError):
     """A pasta clínica configurada não foi localizada."""
+
+
+class OneDriveFolderConflictError(OneDriveGraphError):
+    """Já existe um item com o nome solicitado na pasta de destino."""
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,132 @@ class OneDriveGraphClient:
             raise OneDriveGraphError("Resposta inválida ao listar itens do OneDrive.")
         return [item for item in values if isinstance(item, dict)]
 
+    def list_children(self, folder: GraphFolder) -> list[dict[str, Any]]:
+        drive_id, item_id = self._folder_location(folder)
+        encoded_drive_id = quote(drive_id, safe="")
+        encoded_item_id = quote(item_id, safe="")
+        payload = self._get(
+            f"/drives/{encoded_drive_id}/items/{encoded_item_id}/children",
+            params={
+                "$select": "id,name,file,folder,parentReference,remoteItem",
+                "$top": "999",
+            },
+        )
+        values = payload.get("value")
+        if not isinstance(values, list):
+            raise OneDriveGraphError("Resposta inválida ao listar itens do OneDrive.")
+        return [item for item in values if isinstance(item, dict)]
+
+    def find_child_folder(
+        self, parent_folder: GraphFolder, folder_name: str
+    ) -> GraphFolder | None:
+        expected_name = folder_name.strip()
+        if not expected_name:
+            raise OneDriveGraphError("Nome da pasta não foi informado.")
+        parent_drive_id, _ = self._folder_location(parent_folder)
+        for item in self.list_children(parent_folder):
+            item_name = self._optional_text(item.get("name"))
+            if item_name is None:
+                continue
+            item_id = self._optional_text(item.get("id"))
+            if (
+                item_name.casefold() == expected_name.casefold()
+                and isinstance(item.get("folder"), dict)
+                and item_id is not None
+            ):
+                parent_reference = item.get("parentReference")
+                drive_id = (
+                    self._optional_text(parent_reference.get("driveId"))
+                    if isinstance(parent_reference, dict)
+                    else None
+                )
+                return GraphFolder(
+                    item_id=item_id,
+                    name=item_name,
+                    drive_id=drive_id or parent_drive_id,
+                )
+
+            remote_item = item.get("remoteItem")
+            if not isinstance(remote_item, dict) or not isinstance(
+                remote_item.get("folder"), dict
+            ):
+                continue
+            remote_name = self._optional_text(remote_item.get("name")) or item_name
+            if remote_name.casefold() != expected_name.casefold():
+                continue
+            remote_parent = remote_item.get("parentReference")
+            return GraphFolder(
+                item_id=item_id or "",
+                name=remote_name,
+                is_remote=True,
+                remote_item_id=self._optional_text(remote_item.get("id")),
+                remote_drive_id=(
+                    self._optional_text(remote_parent.get("driveId"))
+                    if isinstance(remote_parent, dict)
+                    else None
+                ),
+            )
+        return None
+
+    def create_folder(
+        self, parent_folder: GraphFolder, folder_name: str
+    ) -> GraphFolder:
+        name = folder_name.strip()
+        if not name:
+            raise OneDriveGraphError("Nome da pasta não foi informado.")
+        if "/" in name or "\\" in name:
+            raise OneDriveGraphError("Nome da pasta é inválido.")
+        drive_id, item_id = self._folder_location(parent_folder)
+        encoded_drive_id = quote(drive_id, safe="")
+        encoded_item_id = quote(item_id, safe="")
+        payload = self._post(
+            f"/drives/{encoded_drive_id}/items/{encoded_item_id}/children",
+            json={
+                "name": name,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail",
+            },
+        )
+        created_item_id = self._required_text(payload, "id", "Item ID")
+        created_name = self._required_text(payload, "name", "nome da pasta")
+        if not isinstance(payload.get("folder"), dict):
+            raise OneDriveGraphError(
+                "A resposta do Microsoft Graph não representa uma pasta."
+            )
+        parent_reference = payload.get("parentReference")
+        created_drive_id = (
+            self._optional_text(parent_reference.get("driveId"))
+            if isinstance(parent_reference, dict)
+            else None
+        )
+        return GraphFolder(
+            item_id=created_item_id,
+            name=created_name,
+            drive_id=created_drive_id or drive_id,
+        )
+
+    def ensure_folder(
+        self, parent_folder: GraphFolder, folder_name: str
+    ) -> GraphFolder:
+        existing = self.find_child_folder(parent_folder, folder_name)
+        if existing is not None:
+            return existing
+        try:
+            return self.create_folder(parent_folder, folder_name)
+        except OneDriveFolderConflictError:
+            existing = self.find_child_folder(parent_folder, folder_name)
+            if existing is not None:
+                return existing
+            raise
+
+    def ensure_folder_path(
+        self, root_folder: GraphFolder, parts: Sequence[str]
+    ) -> GraphFolder:
+        current = root_folder
+        for part in parts:
+            current = self.ensure_folder(current, part)
+        return current
+
     def upload_small_file(
         self,
         parent_folder: GraphFolder,
@@ -184,16 +315,7 @@ class OneDriveGraphClient:
         if "/" in filename or "\\" in filename:
             raise OneDriveGraphError("Nome remoto do arquivo é inválido.")
 
-        if parent_folder.is_remote:
-            drive_id = parent_folder.remote_drive_id
-            item_id = parent_folder.remote_item_id
-        else:
-            drive_id = parent_folder.drive_id
-            item_id = parent_folder.item_id
-        if not drive_id or not item_id:
-            raise OneDriveGraphError(
-                "A pasta de destino não informou driveId e itemId para o upload."
-            )
+        drive_id, item_id = self._folder_location(parent_folder)
 
         encoded_drive_id = quote(drive_id, safe="")
         encoded_item_id = quote(item_id, safe="")
@@ -247,6 +369,59 @@ class OneDriveGraphClient:
             size=uploaded_size,
             has_id=self._optional_text(payload.get("id")) is not None,
         )
+
+    def _folder_location(self, folder: GraphFolder) -> tuple[str, str]:
+        if folder.is_remote:
+            drive_id = folder.remote_drive_id
+            item_id = folder.remote_item_id
+        else:
+            drive_id = folder.drive_id
+            item_id = folder.item_id
+        if not drive_id or not item_id:
+            raise OneDriveGraphError(
+                "A pasta não informou driveId e itemId para a operação."
+            )
+        return drive_id, item_id
+
+    def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self._session.post(
+                f"{self.BASE_URL}{path}",
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": "application/json",
+                },
+                json=json,
+                timeout=self._timeout,
+            )
+        except requests.Timeout:
+            raise OneDriveGraphError(
+                "Tempo limite excedido ao criar pasta no Microsoft Graph."
+            ) from None
+        except requests.RequestException:
+            raise OneDriveGraphError(
+                "Falha de comunicação ao criar pasta no Microsoft Graph."
+            ) from None
+        if response.status_code == 409:
+            raise OneDriveFolderConflictError(
+                "Já existe um item com esse nome na pasta de destino."
+            )
+        if not 200 <= response.status_code < 300:
+            raise OneDriveGraphError(
+                f"Microsoft Graph retornou um erro HTTP ({response.status_code}) "
+                "ao criar a pasta."
+            )
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise OneDriveGraphError(
+                "Resposta inválida do Microsoft Graph ao criar a pasta."
+            ) from None
+        if not isinstance(payload, dict):
+            raise OneDriveGraphError(
+                "Resposta inválida do Microsoft Graph ao criar a pasta."
+            )
+        return payload
 
     def _get(self, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         try:

@@ -232,7 +232,7 @@ def test_connector_uses_only_read_operations_and_safe_pilot_limit() -> None:
     get_arguments = service.messages_api.operations[1][1]
     assert get_arguments["format"] == "full"
     assert GmailConnector.SCOPES == (
-        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.modify",
     )
 
 

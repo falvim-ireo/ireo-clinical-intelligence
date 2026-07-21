@@ -1,4 +1,4 @@
-"""Cliente Gmail somente leitura e conversão para o modelo de domínio."""
+"""Cliente Gmail para leitura de mensagens e aplicação de labels operacionais."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ class GmailCredentialsError(GmailConnectorError):
 
 
 class GmailConnector:
-    """Lê mensagens via Gmail API usando exclusivamente `gmail.readonly`."""
+    """Lê mensagens e aplica labels sem excluir, arquivar ou alterar seu estado."""
 
-    SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
+    SCOPES = ("https://www.googleapis.com/auth/gmail.modify",)
     PILOT_MAX_MESSAGES = 5
 
     def __init__(
@@ -113,6 +113,56 @@ class GmailConnector:
                 "A leitura da mensagem selecionada do Gmail falhou."
             ) from None
         return self.parse_message(raw_message)
+
+    def apply_label(self, message_id: str, label_name: str) -> None:
+        """Cria, se necessário, e aplica uma label sem remover outras labels."""
+
+        safe_message_id = str(message_id or "").strip()
+        safe_label_name = str(label_name or "").strip()
+        if not safe_message_id or not safe_label_name:
+            raise GmailConnectorError("Mensagem e label são obrigatórias.")
+        service = self._get_service()
+        try:
+            labels = service.users().labels().list(userId="me").execute()
+            label_id = next(
+                (
+                    str(item.get("id", "")).strip()
+                    for item in labels.get("labels", [])
+                    if str(item.get("name", "")).strip() == safe_label_name
+                ),
+                "",
+            )
+            if not label_id:
+                created = (
+                    service.users()
+                    .labels()
+                    .create(
+                        userId="me",
+                        body={
+                            "name": safe_label_name,
+                            "labelListVisibility": "labelShow",
+                            "messageListVisibility": "show",
+                        },
+                    )
+                    .execute()
+                )
+                label_id = str(created.get("id", "")).strip()
+            if not label_id:
+                raise ValueError("label sem identificador")
+            (
+                service.users()
+                .messages()
+                .modify(
+                    userId="me",
+                    id=safe_message_id,
+                    body={"addLabelIds": [label_id], "removeLabelIds": []},
+                )
+                .execute()
+            )
+        except Exception:
+            raise GmailConnectorError(
+                "Não foi possível aplicar a label operacional no Gmail."
+            ) from None
 
     @classmethod
     def parse_message(cls, raw_message: dict[str, Any]) -> EmailMessage:
