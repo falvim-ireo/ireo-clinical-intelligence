@@ -43,3 +43,9 @@ data/radiology_auto_run.lock
 *.db-wal
 *.sqlite
 *.sqlite3
+
+# Microsoft Graph token cache
+.ms_graph_token_cache.json
+
+# Microsoft Graph token cache
+.ms_graph_token_cache.json
