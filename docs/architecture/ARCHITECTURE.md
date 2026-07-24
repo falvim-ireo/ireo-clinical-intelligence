@@ -1,5 +1,136 @@
 # IREO Clinical Intelligence Architecture
 
+## Sprint 15 — aquisição multiprovedor
+
+`acquisition.base.AcquisitionProvider` separa autenticação, descoberta,
+download, classificação e finalização da cadeia clínica. Providers produzem um
+`AcquiredPackage` dentro da quarentena; a partir daí o mesmo
+`SupervisedRadiologyImporter` executa Clinicorp, inventário DICOM, manifesto,
+OneDrive e índice. `TransferNowProvider` adapta o conector/downloader existente
+sem mudar seu comando operacional.
+
+`CfazProvider` usa prioritariamente a API oficial `max.cfaz.net/api/v1`.
+Notificações Gmail servem apenas para extrair um único Request ID; os dados e
+arquivos são enumerados diretamente no pedido autenticado. Token ou credenciais
+de sessão existem somente em memória e headers HTTP. O manifesto recebe uma
+seção aditiva `acquisition` com provider/request, datas, origem canônica sem
+token, clínica, profissional e classificações. A identidade publicada é o
+SHA-256 de provider + request + Exam ID do provider + SHA-256 determinístico do
+pacote.
+
+### Sprint 15.1 — interface operacional Cfaz
+
+`CfazNotificationCatalog` pagina a consulta isolada por `CFAZ_GMAIL_QUERY`,
+extrai Request ID e paciente e cruza os pedidos exclusivamente com
+`cfaz_import_history`. O limite maior dessa consulta não altera o limite
+de segurança do piloto TransferNow. O histórico fica no mesmo SQLite do índice
+radiológico, mas em tabela fisicamente independente das projeções do acervo, e
+registra Request ID, Exam ID do provider, SHA-256 da aquisição, estado, instante
+da importação, duração e destino; o Message ID do Gmail é persistido somente
+como SHA-256. Não existe inferência a partir de `exams`, timeline, dashboard ou
+OneDrive, e nenhum dado da antiga tabela genérica é migrado implicitamente.
+
+Identificadores Cfaz são mantidos separadamente: `provider_request_id` é a
+chave interna da API, `sequential_id` é o número visível do pedido e
+`clinic_number` é o número operacional da clínica. `--request-id` aceita os
+dois primeiros. Um 404 no detalhe ativa somente a listagem pública documentada,
+limitada a 20 páginas, 100 itens por página e janela de 365 dias; a comparação
+de `sequential_id` ocorre localmente. Nenhuma rota não documentada é inferida.
+Correspondências múltiplas geram histórico `AMBIGUOUS` e exigem revisão.
+
+Os comandos de lista, seleção, Request ID, lote pendente e histórico usam esse
+catálogo somente nos modos de descoberta, seleção e lote. O caminho explícito
+`--request-id` consulta apenas `cfaz_import_history` e chama diretamente
+`CfazProvider.discover_request()`, sem construir o conector Gmail. O Message ID
+permanece um detalhe interno dos modos baseados em notificações, sem aparecer
+na interface operacional.
+
+Cada item é baixado primeiro para a quarentena, validado por tamanho e SHA-256
+e consolidado em ZIP determinístico. Estado local sem URLs permite retomar
+itens completos. Pedidos com múltiplos artefatos usam `Documentação
+Radiológica`; nenhum provider conhece OneDrive, Clinicorp, SQLite ou dashboard.
+
+O normalizador Cfaz mapeia explicitamente `images_download_links` do pedido e
+`reports[].associated_images_download_links`, aceitando URL única, listas,
+objetos e coleções aninhadas. `reports[].link` é apenas sondado: somente HTTP
+200 com conteúdo de arquivo não HTML é aceito. Downloads são streaming,
+limitados por tamanho, refinados por MIME/magic bytes e deduplicados pelo
+SHA-256 do conteúdo. URLs assinadas existem apenas em memória; estado de
+retomada e identidade dos assets usam a posição estrutural, nunca a URL.
+
+## Sprint 14 — índice radiológico inteligente
+
+`radiology.exam_index_service.ExamIndexService` mantém um SQLite local
+versionado e inteiramente derivado dos manifestos. O banco não substitui o
+OneDrive nem replica o JSON completo: projeta somente campos necessários para
+consulta em `patients`, `exams`, `studies`, `series`, `import_history` e
+`consistency_issues`. A chave estável é `publication.exam_id`; reindexar o
+mesmo exame atualiza suas projeções e não duplica estudos ou séries.
+
+Após a publicação chegar a `COMPLETE`, o pipeline indexa o manifesto local. Se
+o índice estiver indisponível, o exame remoto permanece válido e uma execução
+posterior do rebuild recupera a projeção. Consultas por paciente, data,
+modalidade, fabricante, Study/Series UID e ExamID, linha do tempo, comparação
+estrutural e dashboard usam exclusivamente o SQLite e não fazem interpretação
+clínica.
+
+`python -m main rebuild-radiology-index` percorre somente a hierarquia de
+pastas e lê `manifest.json` (e `dicom_summary.json` quando a inteligência não
+está incorporada). Não baixa DICOMs, não executa upload e não move, renomeia ou
+exclui itens. Checkpoints `PENDING`/`COMPLETE`/`FAILED` permitem retomada; a
+versão gravada por exame força reprocessamento quando o modelo do índice
+evolui. `--full` limpa apenas as projeções locais derivadas, e `--patient`
+limita o reprocessamento a um paciente.
+
+### Sprint 14.1 — observabilidade e inventário eficiente
+
+O rebuild materializa primeiro um inventário temporário da árvore relevante e
+mantém em memória o resultado de cada chamada `children`. Itens já enumerados
+são convertidos diretamente em `GraphFolder`; não se executa uma nova busca
+por nome para cada filho. Assim, cada pasta de paciente e cada pasta
+`Radiologia` é listada uma única vez por execução.
+
+Chamadas Graph do rebuild têm timeout HTTP explícito, até cinco tentativas para
+timeout, HTTP 429 e HTTP 5xx, além de heartbeat enquanto a resposta está
+pendente. A saída informa conexão, raiz, número e posição dos pacientes,
+exames, retries e duração de inventário/indexação. No modo `--full`, as
+projeções locais só são limpas depois que o inventário remoto termina com
+sucesso; uma falha inicial de rede não destrói o índice utilizável.
+
+## Sprint 13 — inteligência estrutural DICOM
+
+O fluxo supervisionado reutiliza `radiology.dicom_reader.DicomReader` como o
+único leitor estrutural. `read()` mantém o contrato estrito consumido pelo
+workflow radiológico, enquanto `analyze()` inventaria pacotes heterogêneos sem
+carregar pixels (`stop_before_pixels=True`). A análise agrupa estudos e séries,
+gera somente estimativas geométricas com fontes explícitas e não realiza
+diagnóstico, segmentação ou interpretação clínica.
+
+Após a confirmação do paciente Clinicorp, nomes e identificadores DICOM são
+comparados sem reescrever os valores originais. Múltiplos pacientes bloqueiam
+a publicação e exigem revisão. `dicom_summary.json` e `resumo_do_exame.txt` são
+gerados no staging, incorporados de forma aditiva ao `manifest.json` e enviados
+pelo mesmo publicador idempotente do OneDrive. Assim, os relatórios seguem o
+mesmo controle de checksum, estados `IN_PROGRESS`/`COMPLETE`/`FAILED`, retomada
+e proibição de sobrescrita não verificada dos demais arquivos do exame.
+
+Nenhuma etapa DICOM move, renomeia, mescla ou exclui itens remotos. Logs do
+leitor contêm apenas contagens e estados; dados identificadores permanecem nos
+artefatos clínicos autorizados e não são enviados a serviços de IA.
+
+A identidade temporal do exame é resolvida uma única vez e registrada no
+manifesto. A prioridade é: `StudyDate` consistente, timestamp validado do nome
+do pacote, metadado confiável do remetente, recebimento do e-mail e, apenas
+como fallback explícito, início da importação. `exam_date` define o destino;
+`exam_time` diferencia exames distintos no mesmo dia, seguido por modalidade
+ou pelo identificador estável do exame. O `exam_id` sempre prevalece para
+retomada, e sufixos automáticos `(2)`/`(3)` não são usados.
+
+Falha de leitura não equivale por si só a corrupção DICOM. O inventário separa
+DICOM com marcador reconhecível realmente inválido, arquivos não DICOM,
+formatos não reconhecidos e extensões proprietárias. Isso evita transformar
+conteúdo arbitrário de visualizadores em alertas falsos de corrupção.
+
 ## Fluxo oficial v1.0.0
 
 ```text

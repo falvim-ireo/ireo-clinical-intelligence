@@ -184,12 +184,15 @@ def test_selected_full_dl_url_is_tried_by_http_before_playwright(tmp_path):
     class Browser:
         def download(self, *args): raise AssertionError("browser should not open")
 
-    answers = iter(("1", "confirmar", ""))
+    class Importer:
+        def run(self, *, archive_path): return archive_path
+
     outputs = []
     run_gmail_import(
         gmail=Gmail(), downloader=Http(), browser_downloader=Browser(),
-        importer=object(), quarantine_root=tmp_path,
-        correlation_id="correlation-0001", input_func=lambda _: next(answers),
+        importer=Importer(), quarantine_root=tmp_path,
+        correlation_id="correlation-0001",
+        input_func=lambda prompt: pytest.fail(f"prompt inesperado: {prompt}"),
         output=outputs.append,
     )
     assert received == [public]

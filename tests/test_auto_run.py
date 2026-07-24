@@ -148,15 +148,10 @@ def test_visible_download_does_not_copy_when_allow_copy_is_false(
     class Patients:
         def find_candidates(self, name): return [Patient(1, "SAFE")]
 
-    class Folders:
-        def find_compatible(self, name): return [patient_folder]
-        def validate_selection(self, path): return path
-
     class AutomaticImporter(Importer):
         quarantine_root = quarantine
         extractor = Extractor()
         patient_repository = Patients()
-        folder_locator = Folders()
         copy_called = False
 
         def register_download(self, *, archive_path, archive_sha256,
@@ -171,7 +166,8 @@ def test_visible_download_does_not_copy_when_allow_copy_is_false(
             ).id
 
         def _source_files(self, path): return [source_file]
-        def _similar_folder_count(self, name): return 1
+        def _choose_patient_folder(self, name, *, allow_auto=False):
+            return patient_folder, "auto", "CONFIRMED_PATIENT_FOLDER"
         def _next_destination(self, folder): return folder / "EXAME"
 
         def _copy_and_manifest(self, **kwargs):

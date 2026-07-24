@@ -67,21 +67,21 @@ def run_gmail_import(
             f"Tamanho: {size or 'não informado'}; "
             f"Message ID: {mask_message_id(message.message_id)}"
         )
-    selected = _choice(input_func("Selecione o número da mensagem: "), len(parsed))
+    selected = (
+        1
+        if len(parsed) == 1
+        else _choice(input_func("Selecione o número da mensagem: "), len(parsed))
+    )
     message, transfer, _, validity = parsed[selected - 1]
     if not transfer.original_filename:
         raise ValueError("A mensagem selecionada não informa o arquivo esperado.")
     precheck = getattr(importer, "check_message_duplicate", None)
     if callable(precheck):
         precheck(message.message_id, transfer.download_url)
+    output("Gmail................. OK")
     output(f"Arquivo esperado: {transfer.display_filename}")
     output(f"Domínio: {urlsplit(transfer.download_url).hostname}")
     output(f"Validade: {validity or 'não informada'}")
-    if input_func(
-        "Digite CONFIRMAR para iniciar o download ou ENTER para cancelar: "
-    ).strip().casefold() != "confirmar":
-        raise ValueError("Download cancelado pelo operador.")
-
     try:
         downloaded = downloader.download(
             transfer.download_url,
@@ -95,12 +95,8 @@ def run_gmail_import(
             raise
         output(f"Domínio: {urlsplit(transfer.download_url).hostname}")
         output(f"Arquivo esperado: {transfer.display_filename}")
-        output("O navegador visível será aberto com um perfil temporário.")
+        output("Navegador............ ABRINDO")
         output("Nenhuma alteração será feita no Gmail.")
-        if input_func(
-            "Digite ABRIR NAVEGADOR ou ENTER para cancelar: "
-        ).strip().casefold() != "abrir navegador":
-            raise ValueError("Abertura do navegador cancelada pelo operador.")
         downloaded = browser_downloader.download(
             transfer.download_url,
             transfer.original_filename,
@@ -113,6 +109,7 @@ def run_gmail_import(
     output(f"Tamanho: {downloaded.size_bytes} bytes")
     output(f"SHA-256: {downloaded.sha256}")
     output(f"Caminho na quarentena: {downloaded.path}")
+    output("Download.............. OK")
     intake_record_id = None
     register_download = getattr(importer, "register_download", None)
     if callable(register_download):
@@ -122,18 +119,11 @@ def run_gmail_import(
             gmail_message_id=message.message_id,
             transfer_url=transfer.download_url,
         )
-    if input_func(
-        "Digite CONFIRMAR para continuar ao fluxo supervisionado ou ENTER para encerrar: "
-    ).strip().casefold() != "confirmar":
-        cancel_download = getattr(importer, "cancel_registered_download", None)
-        if callable(cancel_download):
-            cancel_download(intake_record_id)
-        return GmailImportOutcome(downloaded, None)
     return GmailImportOutcome(
         downloaded,
         _run_supervised_import(
             importer, downloaded, message.message_id, transfer.download_url,
-            intake_record_id,
+            intake_record_id, message.received_at,
         ),
     )
 
@@ -150,22 +140,27 @@ def _choice(value: str, maximum: int) -> int:
 
 def _run_supervised_import(
     importer, downloaded, message_id: str, transfer_url: str,
-    intake_record_id: int | None,
+    intake_record_id: int | None, email_received_at=None,
 ):
     parameters = inspect.signature(importer.run).parameters
     accepts_metadata = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
-    ) or "gmail_message_id" in parameters
-    if not accepts_metadata:
+    )
+    supports_metadata = accepts_metadata or "gmail_message_id" in parameters
+    if not supports_metadata:
         return importer.run(archive_path=downloaded.path)
-    return importer.run(
+    metadata = dict(
         archive_path=downloaded.path,
         gmail_message_id=message_id,
         transfer_url=transfer_url,
         archive_sha256=downloaded.sha256,
         intake_record_id=intake_record_id,
+        email_received_at=email_received_at,
     )
+    if not accepts_metadata:
+        metadata = {key: value for key, value in metadata.items() if key in parameters}
+    return importer.run(**metadata)
 
 
 def _first_match(text: str, pattern: str) -> str | None:

@@ -110,6 +110,9 @@ class ReadOnlyFakeUsers:
     def messages(self) -> ReadOnlyFakeMessages:
         return self._messages
 
+    def getProfile(self, **kwargs) -> FakeRequest:
+        return FakeRequest({"emailAddress": "ireoaju.cmj@gmail.com"})
+
 
 class ReadOnlyFakeGmailService:
     def __init__(self, raw_messages: list[dict]) -> None:
@@ -234,6 +237,42 @@ def test_connector_uses_only_read_operations_and_safe_pilot_limit() -> None:
     assert GmailConnector.SCOPES == (
         "https://www.googleapis.com/auth/gmail.modify",
     )
+
+
+def test_provider_notifications_use_pagination_without_changing_legacy_limit() -> None:
+    first = gmail_message(text_body="Pedido 1")
+    first["id"] = "message-1"
+    second = gmail_message(text_body="Pedido 2")
+    second["id"] = "message-2"
+
+    class PaginatedMessages(ReadOnlyFakeMessages):
+        def list(self, **kwargs) -> FakeRequest:
+            self.operations.append(("list", kwargs))
+            if kwargs.get("pageToken") == "next":
+                return FakeRequest({"messages": [{"id": "message-2"}]})
+            return FakeRequest({
+                "messages": [{"id": "message-1"}],
+                "nextPageToken": "next",
+            })
+
+    service = ReadOnlyFakeGmailService([])
+    service.messages_api = PaginatedMessages([first, second])
+    service._users = ReadOnlyFakeUsers(service.messages_api)
+    connector = GmailConnector(service=service)
+
+    messages = connector.list_provider_notifications(
+        query="from:cfaz.example", max_results=2
+    )
+
+    assert len(messages) == 2
+    list_calls = [args for operation, args in service.messages_api.operations
+                  if operation == "list"]
+    assert list_calls == [
+        {"userId": "me", "q": "from:cfaz.example", "maxResults": 2},
+        {"userId": "me", "q": "from:cfaz.example", "maxResults": 1,
+         "pageToken": "next"},
+    ]
+    assert connector.authenticated_account() == "ireoaju.cmj@gmail.com"
 
 
 def test_connector_reads_one_selected_message_without_listing_or_mutation() -> None:

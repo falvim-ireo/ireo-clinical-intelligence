@@ -1,5 +1,55 @@
 # Guia do Operador — Radiology Intake v1.0.0
 
+## Aquisição Cfaz
+
+Configure preferencialmente `CFAZ_API_TOKEN`. Para perfis profissionais sem
+token, configure `CFAZ_EMAIL` e `CFAZ_PASSWORD`; a senha nunca é persistida pelo
+IREO. O operador trabalha somente com pedidos e a lista de notificações:
+
+```bash
+python -m main cfaz-list-notifications
+python -m main radiology-import-from-cfaz
+python -m main radiology-import-from-cfaz --request-id 82678
+python -m main radiology-import-from-cfaz --request-id 82678 --debug-auth
+python -m main radiology-import-from-cfaz --request-id 82678 --debug-payload
+python -m main radiology-import-from-cfaz --select
+python -m main cfaz-history
+```
+
+Sem opções, a importação consulta as notificações recentes, ignora pedidos cujo
+histórico esteja `COMPLETE` e processa todas as pendentes. `--select` apresenta
+somente as pendentes e solicita um número; `--request-id` localiza internamente
+o pedido diretamente na API Cfaz, sem consultar Gmail ou exigir uma notificação
+correspondente. Message ID, URL interna e tokens não são exibidos nem precisam
+ser informados pelo operador.
+
+O valor de `--request-id` pode ser tanto o ID interno da API quanto o número
+visível mostrado como “Pedido Nº” no portal. Quando necessário, o sistema
+resolve o número visível pela listagem pública recente e informa o número do
+pedido, o ID interno resolvido e o número da clínica antes de continuar.
+
+`--debug-auth` exibe URL, status HTTP, Content-Type e apenas a presença/tipo de
+token, Authorization e cookies. Em respostas 401, o JSON é sanitizado antes de
+mostrar mensagem e código da API; valores de credenciais nunca são impressos.
+Para diagnóstico, e somente com essa flag, um 401 usando o header oficial
+`Authorization: Token ...` provoca uma única segunda tentativa com
+`access_token` como parâmetro separado. A URL com query nunca é registrada.
+
+`--debug-payload` mostra exclusivamente nomes de chaves, tipos, quantidades e
+domínios de campos relacionados a arquivos. Valores, nomes, documentos,
+conteúdo de laudos e URLs completas não são serializados. A API pública
+documenta a leitura detalhada pelo endpoint do pedido e coleções aninhadas; não
+há rota pública documentada de leitura individual por `exam_id`, portanto o
+diagnóstico não tenta endpoints inferidos.
+
+As listas `images_download_links` e imagens associadas a laudos são adquiridas
+automaticamente. Links de edição/visualização de relatório que retornem HTML
+são ignorados com segurança. O total final pode ser menor que o total de URLs
+quando conteúdos repetidos possuem o mesmo SHA-256.
+
+O Gmail é somente o gatilho. Pedido, metadados e arquivos são obtidos pela API
+oficial e sempre passam pela quarentena antes do pipeline clínico existente.
+
 Este fluxo é exclusivamente supervisionado. Antes de começar, confirme que o exame, o ambiente e as autorizações pertencem ao atendimento correto.
 
 ## Execução automática (piloto)
@@ -266,10 +316,10 @@ fallback is offered. JavaScript supplied externally is not executed by the
 application, and CAPTCHA, passwords, and browser protections are not bypassed.
 Failures preserve the manual `radiology-import-supervised --archive-path` fallback.
 
-The configured local paths are:
+The configured remote root and local quarantine/tool paths are:
 
 ```text
-IREO_ONEDRIVE_PATIENTS_PATH=C:\IREO\OneDrive\Pacientes
+MS_GRAPH_ONEDRIVE_ROOT=Pasta pacientes 2026
 IREO_RADIOLOGY_QUARANTINE_PATH=C:\IREO\QuarentenaRadiologia
 IREO_ARCHIVE_TOOL_PATH=C:\Program Files\WinRAR\UnRAR.exe
 IREO_ARCHIVE_TIMEOUT_SECONDS=1800
@@ -312,3 +362,20 @@ passwords, guarantee that a TransferNow landing URL is a direct download, or
 clean partial destinations after a local write failure. Any partial result must
 be reviewed manually because the application deliberately performs no
 automatic deletion.
+### Reconstruir o índice radiológico
+
+```bash
+python -m main rebuild-radiology-index
+python -m main rebuild-radiology-index --patient "Nome do paciente"
+python -m main rebuild-radiology-index --full
+```
+
+O comando é somente leitura no OneDrive. `--full` reconstrói apenas o banco
+SQLite local configurado em `IREO_RADIOLOGY_INDEX_DATABASE_PATH`; nenhum exame
+remoto é modificado.
+
+Durante a execução são exibidos conexão, enumeração de pacientes, progresso de
+exames, heartbeat de chamadas lentas, retries e tempos por etapa. Os padrões
+são timeout Graph de 30 segundos, heartbeat a cada 5 segundos e até 5
+tentativas, configuráveis por `MS_GRAPH_READ_TIMEOUT_SECONDS`,
+`IREO_REBUILD_HEARTBEAT_SECONDS` e `IREO_REBUILD_MAX_ATTEMPTS`.

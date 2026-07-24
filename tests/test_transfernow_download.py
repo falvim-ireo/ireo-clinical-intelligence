@@ -350,11 +350,16 @@ def test_gmail_display_filename_is_separate_from_original_download_name(tmp_path
             return DownloadResult(path, 3, hashlib.sha256(b"rar").hexdigest())
 
     outputs = []
-    answers = iter(("1", "confirmar", ""))
+
+    class Importer:
+        def run(self, *, archive_path):
+            return archive_path
+
     outcome = run_gmail_import(
-        gmail=Gmail(), downloader=Downloader(), importer=object(),
+        gmail=Gmail(), downloader=Downloader(), importer=Importer(),
         quarantine_root=tmp_path, correlation_id="correlation-0001",
-        input_func=lambda _: next(answers), output=outputs.append,
+        input_func=lambda prompt: pytest.fail(f"prompt inesperado: {prompt}"),
+        output=outputs.append,
     )
     assert received == [original]
     assert any("... .rar" in line for line in outputs)
@@ -364,7 +369,7 @@ def test_gmail_display_filename_is_separate_from_original_download_name(tmp_path
     assert outcome.download.path.suffix == ".rar"
 
 
-def test_cancel_after_download_does_not_call_onedrive_or_delete(tmp_path: Path, monkeypatch) -> None:
+def test_pipeline_continues_automatically_after_download(tmp_path: Path, monkeypatch) -> None:
     message = EmailMessage(
         message_id="id",
         subject='TransferNow "PACIENTE_20991231.zip"',
@@ -383,15 +388,20 @@ def test_cancel_after_download_does_not_call_onedrive_or_delete(tmp_path: Path, 
             path.write_bytes(b"kept")
             return DownloadResult(path, 4, hashlib.sha256(b"kept").hexdigest())
 
-    class ForbiddenImporter:
-        def run(self, **kwargs): raise AssertionError("OneDrive/extraction must not run")
+    calls = []
+
+    class RecordingImporter:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return "published"
 
     monkeypatch.setattr(Path, "unlink", lambda *args: (_ for _ in ()).throw(AssertionError("delete")))
-    answers = iter(("1", "confirmar", ""))
     outcome = run_gmail_import(
-        gmail=Gmail(), downloader=Downloader(), importer=ForbiddenImporter(),
+        gmail=Gmail(), downloader=Downloader(), importer=RecordingImporter(),
         quarantine_root=tmp_path, correlation_id="correlation-0001",
-        input_func=lambda _: next(answers), output=lambda _: None,
+        input_func=lambda prompt: pytest.fail(f"prompt inesperado: {prompt}"),
+        output=lambda _: None,
     )
-    assert outcome.import_result is None
+    assert outcome.import_result == "published"
+    assert calls[0]["archive_path"] == outcome.download.path
     assert outcome.download.path.read_bytes() == b"kept"

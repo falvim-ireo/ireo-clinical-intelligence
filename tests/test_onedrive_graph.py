@@ -3,6 +3,7 @@ import requests
 
 from integrations.onedrive_graph import (
     GraphFolder,
+    GraphUploadedItem,
     OneDriveGraphClient,
     OneDriveGraphError,
     OneDriveFolderConflictError,
@@ -11,9 +12,10 @@ from integrations.onedrive_graph import (
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload=None) -> None:
+    def __init__(self, status_code: int, payload=None, headers=None) -> None:
         self.status_code = status_code
         self.payload = payload or {}
+        self.headers = headers or {}
 
     def json(self):
         return self.payload
@@ -38,6 +40,12 @@ class FakeSession:
         return self.responses.pop(0)
 
     def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.responses.pop(0)
+
+    def patch(self, url, **kwargs):
         self.calls.append((url, kwargs))
         if self.error is not None:
             raise self.error
@@ -112,6 +120,48 @@ def test_finds_remote_root_folder_and_lists_remote_items() -> None:
         in session.calls[1][0]
     )
     assert "shortcut-id" not in session.calls[1][0]
+
+
+def test_renames_existing_remote_file_without_automatic_conflict_suffix() -> None:
+    session = FakeSession([
+        FakeResponse(200, {"value": [{
+            "id": "file-id", "name": "sem-extensao", "file": {},
+        }]}),
+        FakeResponse(200, {"id": "file-id", "name": "imagem_001.jpg"}),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    client.rename_child_file(
+        GraphFolder("folder-id", "Exame", drive_id="drive-id"),
+        "sem-extensao",
+        "imagem_001.jpg",
+    )
+
+    assert session.calls[1][1]["json"] == {"name": "imagem_001.jpg"}
+    assert session.calls[1][0].endswith("/drives/drive-id/items/file-id")
+
+
+def test_moves_file_to_clinical_folder_with_deterministic_name() -> None:
+    session = FakeSession([
+        FakeResponse(200, {"value": []}),
+        FakeResponse(200, {"value": [{
+            "id": "file-id", "name": "sem-extensao", "file": {},
+        }]}),
+        FakeResponse(200, {"id": "file-id", "name": "radiografia_001.jpg"}),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    client.move_child_file(
+        GraphFolder("exam-id", "Exame", drive_id="drive-id"),
+        "sem-extensao",
+        GraphFolder("radiographs-id", "01 - Radiografias", drive_id="drive-id"),
+        "radiografia_001.jpg",
+    )
+
+    assert session.calls[2][1]["json"] == {
+        "name": "radiografia_001.jpg",
+        "parentReference": {"id": "radiographs-id"},
+    }
 
 
 def test_rejects_remote_item_that_is_a_file() -> None:
@@ -216,6 +266,133 @@ def test_uploads_small_file_to_local_folder(tmp_path) -> None:
         session.calls[0][1]["headers"]["Content-Type"]
         == "application/octet-stream"
     )
+
+
+def test_uploads_jpeg_with_detected_content_type(tmp_path) -> None:
+    local_file = tmp_path / "imagem_001.jpg"
+    content = b"\xff\xd8\xff\xe0" + b"jpeg"
+    local_file.write_bytes(content)
+    session = FakeSession([
+        FakeResponse(201, {"id": "jpeg-id", "name": local_file.name, "size": len(content)})
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    client.upload_small_file(
+        GraphFolder("folder-id", "Exame", drive_id="drive-id"), local_file
+    )
+
+    assert session.calls[0][1]["headers"]["Content-Type"] == "image/jpeg"
+
+
+def test_large_file_uses_upload_session_and_commits_final_item(tmp_path) -> None:
+    chunk_size = 320 * 1024
+    content = b"a" * (chunk_size + 17)
+    local_file = tmp_path / "large.bin"
+    local_file.write_bytes(content)
+    upload_url = "https://upload.example/session?opaque=secret"
+    session = FakeSession(
+        [
+            FakeResponse(200, {"uploadUrl": upload_url}),
+            FakeResponse(202, {"nextExpectedRanges": [f"{chunk_size}-"]}),
+            FakeResponse(
+                201,
+                {"id": "large-id", "name": "large.bin", "size": len(content)},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient(
+        "fixture-token", session=session, large_upload_chunk_size=chunk_size
+    )
+    client.MAX_SMALL_UPLOAD_BYTES = 1
+    folder = GraphFolder("folder-id", "Pacientes", drive_id="drive-id")
+    progress: list[tuple[int, int]] = []
+
+    uploaded = client.upload_small_file(
+        folder,
+        local_file,
+        progress_callback=lambda sent, total: progress.append((sent, total)),
+    )
+
+    assert uploaded == GraphUploadedItem("large.bin", len(content), True)
+    assert "createUploadSession" in session.calls[0][0]
+    assert session.calls[1][0] == upload_url
+    assert session.calls[1][1]["headers"]["Content-Range"] == (
+        f"bytes 0-{chunk_size - 1}/{len(content)}"
+    )
+    assert session.calls[2][1]["headers"]["Content-Range"] == (
+        f"bytes {chunk_size}-{len(content) - 1}/{len(content)}"
+    )
+    assert "Authorization" not in session.calls[1][1]["headers"]
+    assert progress == [(chunk_size, len(content)), (len(content), len(content))]
+
+
+def test_large_upload_propagates_error_during_chunk(tmp_path) -> None:
+    local_file = tmp_path / "large.bin"
+    local_file.write_bytes(b"a" * (320 * 1024))
+    upload_url = "https://upload.example/session?opaque=secret"
+    session = FakeSession(
+        [
+            FakeResponse(200, {"uploadUrl": upload_url}),
+            FakeResponse(
+                400,
+                {"error": {"code": "invalidRange", "message": "Chunk inválido."}},
+                headers={"request-id": "chunk-request-id"},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient(
+        "fixture-token", session=session, large_upload_chunk_size=320 * 1024
+    )
+    folder = GraphFolder("folder-id", "Pacientes", drive_id="drive-id")
+
+    with pytest.raises(OneDriveGraphError, match="Chunk inválido") as captured:
+        client.upload_large_file(folder, local_file)
+
+    assert captured.value.graph_code == "invalidRange"
+    assert captured.value.request_id == "chunk-request-id"
+    assert captured.value.endpoint == "https://upload.example/session"
+    assert "opaque=secret" not in str(captured.value)
+
+
+def test_large_upload_resumes_from_server_offset_after_transient_failure(
+    tmp_path,
+) -> None:
+    chunk_size = 320 * 1024
+    content = b"a" * (chunk_size + 11)
+    local_file = tmp_path / "large.bin"
+    local_file.write_bytes(content)
+    upload_url = "https://upload.example/session?opaque=secret"
+    session = FakeSession(
+        [
+            FakeResponse(200, {"uploadUrl": upload_url}),
+            FakeResponse(503, {"error": {"code": "serviceUnavailable"}}),
+            FakeResponse(200, {"nextExpectedRanges": [f"{chunk_size}-"]}),
+            FakeResponse(
+                201,
+                {"id": "large-id", "name": "large.bin", "size": len(content)},
+            ),
+        ]
+    )
+    client = OneDriveGraphClient(
+        "fixture-token", session=session, large_upload_chunk_size=chunk_size
+    )
+    folder = GraphFolder("folder-id", "Pacientes", drive_id="drive-id")
+    retries: list[tuple[int, int, int]] = []
+
+    uploaded = client.upload_large_file(
+        folder,
+        local_file,
+        retry_callback=lambda offset, attempt, maximum: retries.append(
+            (offset, attempt, maximum)
+        ),
+    )
+
+    assert uploaded.size == len(content)
+    assert session.calls[2][0] == upload_url
+    assert session.calls[3][1]["headers"]["Content-Range"] == (
+        f"bytes {chunk_size}-{len(content) - 1}/{len(content)}"
+    )
+    assert retries == [(chunk_size, 2, 4)]
 
 
 def test_uploads_small_file_to_remote_folder(tmp_path) -> None:
@@ -617,3 +794,43 @@ def test_create_folder_reports_generic_http_error() -> None:
         client.create_folder(parent, "Paciente")
 
     assert "secret" not in str(captured.value)
+
+
+def test_graph_error_preserves_complete_response_diagnostics() -> None:
+    response = FakeResponse(
+        403,
+        {
+            "error": {
+                "code": "accessDenied",
+                "message": "A operação completa foi recusada pelo administrador.",
+                "innerError": {
+                    "request-id": "inner-request-id",
+                    "client-request-id": "inner-client-request-id",
+                },
+            }
+        },
+        headers={
+            "request-id": "header-request-id",
+            "client-request-id": "header-client-request-id",
+        },
+    )
+    session = FakeSession([response])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    with pytest.raises(OneDriveGraphError) as captured:
+        client.get_authenticated_user()
+
+    error = captured.value
+    assert error.http_status == 403
+    assert error.graph_code == "accessDenied"
+    assert error.graph_message == "A operação completa foi recusada pelo administrador."
+    assert error.request_id == "header-request-id"
+    assert error.client_request_id == "header-client-request-id"
+    assert error.endpoint == "https://graph.microsoft.com/v1.0/me"
+    diagnostic = str(error)
+    assert "HTTP status=403" in diagnostic
+    assert "Graph code=accessDenied" in diagnostic
+    assert "Graph message=A operação completa foi recusada pelo administrador." in diagnostic
+    assert "request-id=header-request-id" in diagnostic
+    assert "client-request-id=header-client-request-id" in diagnostic
+    assert "endpoint=https://graph.microsoft.com/v1.0/me" in diagnostic

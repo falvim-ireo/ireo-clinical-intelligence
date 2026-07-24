@@ -475,10 +475,7 @@ def test_browser_self_test_uses_about_blank_and_closes():
     assert fake.chromium.browser.closed and fake.chromium.browser.context.closed
 
 
-@pytest.mark.parametrize("browser_confirmation", ("", "texto diferente"))
-def test_user_cancels_before_browser_and_importer_is_not_called(
-    tmp_path, browser_confirmation
-):
+def test_browser_fallback_opens_and_continues_without_confirmation(tmp_path):
     message = EmailMessage(
         message_id="secret", subject='TransferNow "PACIENTE.rar"', sender="TransferNow",
         reply_to=None, received_at=datetime.now(timezone.utc),
@@ -488,16 +485,24 @@ def test_user_cancels_before_browser_and_importer_is_not_called(
         def list_messages(self, **kwargs): return [message]
     class Http:
         def download(self, *args): raise BrowserInteractionRequired("landing")
-    class Forbidden:
-        def download(self, *args): raise AssertionError("browser opened")
-        def run(self, **kwargs): raise AssertionError("import started")
-    answers = iter(("1", "confirmar", browser_confirmation))
-    with pytest.raises(ValueError, match="cancelada"):
-        run_gmail_import(
-            gmail=Gmail(), downloader=Http(), browser_downloader=Forbidden(), importer=Forbidden(),
-            quarantine_root=tmp_path, correlation_id="correlation-0001",
-            input_func=lambda _: next(answers), output=lambda _: None,
-        )
+    calls = []
+    class Browser:
+        def download(self, *args):
+            path = tmp_path / "PACIENTE.rar"
+            path.write_bytes(b"rar")
+            return DownloadResult(path, 3, hashlib.sha256(b"rar").hexdigest())
+    class Importer:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return "published"
+    outcome = run_gmail_import(
+        gmail=Gmail(), downloader=Http(), browser_downloader=Browser(), importer=Importer(),
+        quarantine_root=tmp_path, correlation_id="correlation-0001",
+        input_func=lambda prompt: pytest.fail(f"prompt inesperado: {prompt}"),
+        output=lambda _: None,
+    )
+    assert outcome.import_result == "published"
+    assert calls[0]["archive_path"] == outcome.download.path
 
 
 @pytest.mark.parametrize(

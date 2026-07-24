@@ -1,6 +1,7 @@
 import sys
 import argparse
 import hashlib
+import re
 from typing import Optional, Sequence
 
 from api.clinicorp_connector import ClinicorpAPI
@@ -12,6 +13,12 @@ from utils.formatters import (
     formatar_horario,
     valor_ou_padrao,
 )
+
+
+def _safe_email_diagnostic_field(value: object) -> str:
+    """Normaliza header para terminal e remove URLs potencialmente assinadas."""
+    single_line = " ".join(str(value or "").split())
+    return re.sub(r"https?://\S+", "[URL omitida]", single_line, flags=re.I)[:500]
 
 
 def exibir_paciente(paciente) -> None:
@@ -224,7 +231,10 @@ def build_radiology_inbox_processor():
         token_cache_file=Config.MS_GRAPH_TOKEN_CACHE_FILE,
         output=logging.getLogger(__name__).info,
     )
-    graph = OneDriveGraphClient(auth.acquire_access_token())
+    graph = OneDriveGraphClient(
+        auth.acquire_access_token(),
+        large_upload_chunk_size=Config.MS_GRAPH_UPLOAD_CHUNK_SIZE_BYTES,
+    )
     repository = ClinicorpPatientRepository(ClinicorpAPI())
     workflow = RadiologyWorkflow(
         downloader=TransferNowDownloader(
@@ -248,6 +258,39 @@ def build_radiology_inbox_processor():
             transfer.patient_name_candidate or ""
         ),
         download_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+    )
+
+
+def build_onedrive_graph_client():
+    """Cria o cliente remoto compartilhado pelos fluxos radiológicos."""
+    import logging
+
+    from core.config import Config
+    from integrations.microsoft_graph_auth import (
+        MicrosoftGraphAuth,
+        MicrosoftGraphAuthError,
+    )
+    from integrations.onedrive_graph import OneDriveGraphClient
+
+    if not Config.MS_GRAPH_ONEDRIVE_ROOT:
+        raise ValueError("MS_GRAPH_ONEDRIVE_ROOT não foi configurado.")
+    auth = MicrosoftGraphAuth(
+        client_id=Config.MS_GRAPH_CLIENT_ID,
+        authority=Config.MS_GRAPH_AUTHORITY,
+        scopes=Config.MS_GRAPH_SCOPES,
+        token_cache_file=Config.MS_GRAPH_TOKEN_CACHE_FILE,
+        output=logging.getLogger(__name__).info,
+    )
+    try:
+        token = auth.acquire_access_token()
+    except MicrosoftGraphAuthError:
+        raise ValueError(
+            "Autenticação do Microsoft Graph não foi concluída."
+        ) from None
+    return OneDriveGraphClient(
+        token,
+        timeout=(10.0, float(Config.MS_GRAPH_READ_TIMEOUT_SECONDS)),
+        large_upload_chunk_size=Config.MS_GRAPH_UPLOAD_CHUNK_SIZE_BYTES,
     )
 
 
@@ -403,6 +446,66 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             print("Nenhuma execução automática registrada.")
             return 1
 
+    if arguments and arguments[0] == "rebuild-radiology-index":
+        from core.config import Config
+        from integrations.onedrive_graph import OneDriveGraphError
+        from time import monotonic
+        from radiology.exam_index_service import (
+            ExamIndexError,
+            ExamIndexService,
+            OneDriveRadiologyIndexRebuilder,
+        )
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence rebuild-radiology-index"
+        )
+        parser.add_argument("--full", action="store_true")
+        parser.add_argument("--patient")
+        try:
+            options = parser.parse_args(arguments[1:])
+            progress = lambda message: print(message, flush=True)
+            progress("Inicializando rebuild...")
+            progress("Preparando índice SQLite local...")
+            index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            progress("Preparando índice SQLite local... OK")
+            progress("Conectando ao Microsoft Graph...")
+            connection_started = monotonic()
+            graph = build_onedrive_graph_client()
+            connection_seconds = monotonic() - connection_started
+            progress("Conectando ao Microsoft Graph... OK")
+            result = OneDriveRadiologyIndexRebuilder(
+                graph=graph,
+                onedrive_root=Config.MS_GRAPH_ONEDRIVE_ROOT,
+                index=index,
+                output=progress,
+                heartbeat_seconds=Config.IREO_REBUILD_HEARTBEAT_SECONDS,
+                max_attempts=Config.IREO_REBUILD_MAX_ATTEMPTS,
+            ).rebuild(full=options.full, patient_name=options.patient)
+            dashboard = index.dashboard()
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except (ExamIndexError, OneDriveGraphError, ValueError) as exc:
+            print(f"Reconstrução não concluída: {exc}")
+            return 1
+        print(
+            "Índice reconstruído: "
+            f"encontrados={result.discovered}, indexados={result.indexed}, "
+            f"inalterados={result.skipped}, falhas={result.failed}."
+        )
+        print(
+            "Dashboard: "
+            f"pacientes={dashboard['patients']}, exames={dashboard['exams']}, "
+            f"pendências={dashboard['pending']}, falhas={dashboard['failures']}."
+        )
+        print(
+            "Tempos: "
+            f"conexão={connection_seconds:.1f}s; "
+            f"inventário={result.stage_seconds.get('inventory', 0.0):.1f}s; "
+            f"indexação={result.stage_seconds.get('indexing', 0.0):.1f}s; "
+            f"rebuild={result.duration_seconds:.1f}s."
+        )
+        return 1 if result.failed else 0
+
     if arguments and arguments[0] == "radiology-auto-run":
         from core.config import Config
         from integrations.gmail_connector import GmailConnector
@@ -411,6 +514,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             RadiologyAutoRunner, new_summary, sanitized_failure, write_summary_atomic,
         )
         from radiology.intake_history import IntakeHistoryRepository
+        from radiology.exam_index_service import ExamIndexService
         from radiology.supervised_import import SupervisedRadiologyImporter
         from radiology.transfernow_download import TransferNowDownloader
         from radiology.transfernow_browser_download import TransferNowBrowserDownloader
@@ -420,14 +524,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         try:
             audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
             importer = SupervisedRadiologyImporter(
-                patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
                 quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
                 archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                onedrive_client=build_onedrive_graph_client(),
+                onedrive_root=Config.MS_GRAPH_ONEDRIVE_ROOT,
                 archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
                 patient_repository=ClinicorpPatientRepository(ClinicorpAPI(), audit_logger=audit),
                 audit_logger=audit, auto_select_unambiguous=True,
                 auto_select_min_score=.98, patient_source_mode="clinicorp",
                 intake_history=IntakeHistoryRepository(Config.IREO_INTAKE_DATABASE_PATH),
+                exam_index_service=ExamIndexService(
+                    Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+                ),
             )
             code, summary = RadiologyAutoRunner(
                 gmail=GmailConnector(), downloader=TransferNowDownloader(
@@ -513,6 +621,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         from observability.audit_logger import AuditLogger
         from radiology.archive_extractor import ArchiveExtractionError
         from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
+        from radiology.exam_index_service import ExamIndexError, ExamIndexService
         from radiology.supervised_import import (
             SupervisedImportCancelled,
             SupervisedImportError,
@@ -553,9 +662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                 repository = EmptyPatientRepository()
 
             importer = SupervisedRadiologyImporter(
-                patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
                 quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
                 archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                onedrive_client=build_onedrive_graph_client(),
+                onedrive_root=Config.MS_GRAPH_ONEDRIVE_ROOT,
                 archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
                 patient_repository=repository,
                 gmail_connector=(
@@ -570,6 +680,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                     Config.IREO_INTAKE_DATABASE_PATH
                 ),
                 allow_reimport=options.allow_reimport,
+                exam_index_service=ExamIndexService(
+                    Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+                ),
             )
             result = importer.run(
                 archive_path=options.archive_path,
@@ -582,13 +695,14 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             ArchiveExtractionError,
             GmailConnectorError,
             IntakeHistoryError,
+            ExamIndexError,
             SupervisedImportError,
             ValueError,
         ) as exc:
             print(f"Importação não concluída: {exc}")
             return 1
 
-        print(f"Importação concluída: {result.destination}")
+        print(f"Importação concluída: {result.onedrive_destination}")
         print(f"Manifesto: {result.manifest_path}")
         return 0
 
@@ -599,6 +713,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         from radiology.gmail_import import run_gmail_import
         from radiology.archive_extractor import ArchiveExtractionError
         from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
+        from radiology.exam_index_service import ExamIndexError, ExamIndexService
         from radiology.supervised_import import (
             SupervisedImportCancelled,
             SupervisedImportError,
@@ -638,9 +753,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         else:
             repository = EmptyPatientRepository()
         importer = SupervisedRadiologyImporter(
-            patients_root=Config.IREO_ONEDRIVE_PATIENTS_PATH,
             quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
             archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+            onedrive_client=build_onedrive_graph_client(),
+            onedrive_root=Config.MS_GRAPH_ONEDRIVE_ROOT,
             archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
             patient_repository=repository,
             audit_logger=audit,
@@ -650,6 +766,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             patient_source_mode=options.patient_source,
             intake_history=intake_history,
             allow_reimport=options.allow_reimport,
+            exam_index_service=ExamIndexService(
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+            ),
         )
         downloader = TransferNowDownloader(
             connect_timeout=Config.IREO_TRANSFERNOW_CONNECT_TIMEOUT_SECONDS,
@@ -661,6 +780,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             max_download_bytes=Config.IREO_TRANSFERNOW_MAX_DOWNLOAD_BYTES,
             headless=False,
             debug=Config.IREO_BROWSER_DEBUG,
+            allow_manual_interaction=False,
         )
         try:
             outcome = run_gmail_import(
@@ -675,6 +795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             ArchiveExtractionError,
             GmailConnectorError,
             IntakeHistoryError,
+            ExamIndexError,
             SupervisedImportCancelled,
             SupervisedImportError,
             TransferNowDownloadError,
@@ -685,15 +806,309 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         if outcome.import_result is None:
             print("Download preservado; fluxo supervisionado não iniciado.")
         else:
-            print(f"Importação concluída: {outcome.import_result.destination}")
+            print(
+                "Importação concluída: "
+                f"{outcome.import_result.onedrive_destination}"
+            )
+        return 0
+
+    if arguments and arguments[0] == "cfaz-list-notifications":
+        from acquisition.cfaz_operations import (
+            CfazHistoryError, CfazHistoryRepository, CfazNotificationCatalog,
+        )
+        from core.config import Config
+        from integrations.gmail_connector import GmailConnector, GmailConnectorError
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence cfaz-list-notifications"
+        )
+        parser.add_argument("--debug", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            gmail = GmailConnector()
+            account = gmail.authenticated_account()
+            history = CfazHistoryRepository(
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+            )
+            catalog = CfazNotificationCatalog(
+                gmail=gmail, history=history,
+                query=Config.CFAZ_GMAIL_QUERY,
+                limit=Config.CFAZ_GMAIL_MAX_MESSAGES,
+            )
+            notifications = catalog.list()
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except (CfazHistoryError, GmailConnectorError) as exc:
+            print(f"Não foi possível listar notificações Cfaz: {exc}")
+            return 1
+        print(f"Conta Gmail autenticada: {account}")
+        print(f"Consulta Gmail: {Config.CFAZ_GMAIL_QUERY}")
+        print(f"Mensagens retornadas pelo Gmail: {catalog.counters.gmail_messages}")
+        print(f"Mensagens com assunto CfazPost: {catalog.counters.cfazpost_subjects}")
+        print(f"Mensagens com link reconhecido: {catalog.counters.recognized_links}")
+        print(f"Notificações operacionais: {catalog.counters.operational_notifications}")
+        if options.debug:
+            print("\nDiagnóstico das mensagens:")
+            for position, item in enumerate(catalog.diagnostics, 1):
+                print(f"\n[{position}]")
+                print(f"From: {_safe_email_diagnostic_field(item.message.sender)}")
+                print(f"Subject: {_safe_email_diagnostic_field(item.message.subject)}")
+                print(
+                    "Data: "
+                    f"{item.received_at.astimezone().strftime('%d/%m/%Y %H:%M')}"
+                )
+                print(f"Link encontrado: {'sim' if item.link_found else 'não'}")
+                print(
+                    "Request ID encontrado: "
+                    f"{'sim' if item.request_id else 'não'}"
+                )
+                print(f"Aceita: {'sim' if item.accepted else 'não'}")
+                print(f"Motivo da rejeição: {item.rejection_reason or 'nenhum'}")
+        print("Notificações encontradas:")
+        for position, item in enumerate(notifications, 1):
+            print(f"\n[{position}]")
+            print(f"Paciente: {item.patient_name or 'não informado'}")
+            print(f"Pedido: {item.request_id or 'não identificado'}")
+            print(f"Data: {item.received_at.astimezone().strftime('%d/%m/%Y %H:%M')}")
+            if not item.request_id:
+                print("Status: notificação reconhecida, pedido não identificado")
+            else:
+                print(f"Status: {'JÁ IMPORTADO' if item.imported else 'NÃO IMPORTADO'}")
+        if not notifications:
+            print("Nenhuma notificação Cfaz encontrada.")
+        return 0
+
+    if arguments and arguments[0] == "cfaz-history":
+        from acquisition.cfaz_operations import CfazHistoryError, CfazHistoryRepository
+        from core.config import Config
+
+        try:
+            records = CfazHistoryRepository(
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+            ).list_records()
+        except CfazHistoryError as exc:
+            print(f"Não foi possível consultar o histórico Cfaz: {exc}")
+            return 1
+        if not records:
+            print("Nenhuma importação Cfaz registrada.")
+            return 0
+        for record in records:
+            print(
+                " | ".join((
+                    record.completed_at or record.started_at or "data indisponível",
+                    record.patient_name or "paciente não informado",
+                    f"pedido={record.sequential_id or record.request_id}",
+                    f"provider={record.provider}",
+                    f"status={record.status}",
+                    f"duração={record.duration_seconds:.1f}s"
+                    if record.duration_seconds is not None else "duração=indisponível",
+                    f"OneDrive={record.onedrive_destination or 'não disponível'}",
+                ))
+            )
+        return 0
+
+    if arguments and arguments[0] == "cfaz-repair-files":
+        from pathlib import Path
+        from acquisition.cfaz_operations import CfazHistoryError, CfazHistoryRepository
+        from acquisition.cfaz_repair import CfazCompletedImportRepair, CfazRepairError
+        from core.config import Config
+        from integrations.onedrive_graph import OneDriveGraphError
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence cfaz-repair-files"
+        )
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument("--request-id", action="append")
+        group.add_argument("--all", action="store_true")
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument(
+            "--dry-run", action="store_true", default=False,
+            help="apenas diagnostica; é o modo padrão operacional",
+        )
+        mode.add_argument(
+            "--apply", action="store_true",
+            help="aplica renomes, movimentos e atualizações no OneDrive",
+        )
+        try:
+            options = parser.parse_args(arguments[1:])
+            history = CfazHistoryRepository(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            repair = CfazCompletedImportRepair(
+                history=history,
+                graph=build_onedrive_graph_client() if options.apply else None,
+                staging_root=(
+                    Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH)
+                    / "supervised-staging"
+                ),
+            )
+            identifiers = (
+                [
+                    record.provider_request_id or record.request_id
+                    for record in history.list_completed()
+                ]
+                if options.all else options.request_id
+            )
+            for identifier in identifiers:
+                apply = bool(options.apply)
+                result = repair.repair(identifier, apply=apply)
+                print(
+                    f"Pedido {identifier}: modo={'APPLY' if apply else 'DRY-RUN'}, "
+                    f"arquivos={result.jpeg_files}, renomeados={result.renamed_files}, "
+                    f"duplicados={result.duplicate_files}, "
+                    f"repair_version={result.repair_version}."
+                )
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except (CfazHistoryError, CfazRepairError, OneDriveGraphError, ValueError) as exc:
+            print(f"Reparo Cfaz não concluído: {exc}")
+            return 1
+        return 0
+
+    if arguments and arguments[0] == "radiology-import-from-cfaz":
+        from acquisition.base import AcquisitionError
+        from acquisition.cfaz_provider import CfazProvider
+        from acquisition.cfaz_operations import (
+            CfazHistoryError, CfazHistoryRepository, CfazNotificationCatalog,
+        )
+        from acquisition.service import ProviderAcquisitionService
+        from core.config import Config
+        from integrations.gmail_connector import GmailConnector, GmailConnectorError
+        from observability.audit_logger import AuditLogger
+        from radiology.archive_extractor import ArchiveExtractionError
+        from radiology.exam_index_service import ExamIndexService
+        from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
+        from radiology.supervised_import import (
+            SupervisedImportError, SupervisedRadiologyImporter,
+        )
+        from repositories.clinicorp_patient_repository import ClinicorpPatientRepository
+
+        parser = argparse.ArgumentParser(
+            prog="ireo-clinical-intelligence radiology-import-from-cfaz"
+        )
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--request-id")
+        mode.add_argument("--select", action="store_true")
+        parser.add_argument(
+            "--debug-auth", "--auth-debug", dest="debug_auth",
+            action="store_true",
+            help="exibe diagnóstico sanitizado da autenticação Cfaz",
+        )
+        parser.add_argument(
+            "--debug-payload", action="store_true",
+            help="exibe somente a estrutura sanitizada do payload Cfaz",
+        )
+        try:
+            options = parser.parse_args(arguments[1:])
+            audit = AuditLogger(level=Config.AUDIT_LOG_LEVEL)
+            history = CfazHistoryRepository(
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+            )
+            explicit_request_id = None
+            if options.request_id:
+                explicit_request_id = str(options.request_id).strip()
+                if not explicit_request_id.isdigit():
+                    raise AcquisitionError("O Request ID do Cfaz é inválido.")
+                if history.is_imported(explicit_request_id):
+                    print("O pedido informado já foi importado.")
+                    return 0
+            else:
+                gmail = GmailConnector()
+                catalog = CfazNotificationCatalog(
+                    gmail=gmail, history=history, query=Config.CFAZ_GMAIL_QUERY,
+                    limit=Config.CFAZ_GMAIL_MAX_MESSAGES,
+                )
+                notifications = catalog.list()
+                pending = catalog.pending(notifications)
+                imported_count = sum(
+                    1 for item in notifications if item.request_id and item.imported
+                )
+                unidentified_count = sum(
+                    1 for item in notifications if not item.request_id
+                )
+                print(f"{len(notifications)} notificações encontradas")
+                print(f"{imported_count} já importadas")
+                if unidentified_count:
+                    print(f"{unidentified_count} com pedido não identificado")
+                print(f"{len(pending)} novas")
+                if options.select:
+                    print("\nNotificações pendentes")
+                    for position, item in enumerate(pending, 1):
+                        print(f"{position} {item.patient_name or 'Paciente não informado'}")
+                    if not pending:
+                        print("Nenhuma notificação pendente.")
+                        return 0
+                    try:
+                        choice = int(input("Escolha: ").strip())
+                    except ValueError:
+                        raise AcquisitionError("Seleção inválida.") from None
+                    if not 1 <= choice <= len(pending):
+                        raise AcquisitionError("Seleção inválida.")
+                    selected = [pending[choice - 1]]
+                else:
+                    selected = pending
+                if not selected:
+                    print("Nenhuma notificação nova para importar.")
+                    return 0
+            importer = SupervisedRadiologyImporter(
+                quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+                archive_tool_path=Config.IREO_ARCHIVE_TOOL_PATH,
+                onedrive_client=build_onedrive_graph_client(),
+                onedrive_root=Config.MS_GRAPH_ONEDRIVE_ROOT,
+                archive_timeout_seconds=Config.IREO_ARCHIVE_TIMEOUT_SECONDS,
+                patient_repository=ClinicorpPatientRepository(
+                    ClinicorpAPI(), audit_logger=audit
+                ),
+                audit_logger=audit, auto_select_unambiguous=True,
+                auto_select_min_score=Config.IREO_AUTO_SELECT_MIN_SCORE,
+                patient_source_mode="clinicorp",
+                intake_history=IntakeHistoryRepository(
+                    Config.IREO_INTAKE_DATABASE_PATH
+                ),
+                exam_index_service=ExamIndexService(
+                    Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+                ),
+            )
+            provider = CfazProvider(
+                api_token=Config.CFAZ_API_TOKEN,
+                email=Config.CFAZ_EMAIL,
+                password=Config.CFAZ_PASSWORD,
+                timeout=(10.0, float(Config.CFAZ_API_TIMEOUT_SECONDS)),
+                max_file_bytes=Config.CFAZ_MAX_FILE_BYTES,
+                auth_diagnostics=options.debug_auth,
+                payload_diagnostics=options.debug_payload,
+            )
+            service = ProviderAcquisitionService(
+                provider=provider, importer=importer,
+                quarantine_root=Config.IREO_RADIOLOGY_QUARANTINE_PATH,
+                correlation_id=audit.correlation_id,
+                history=history,
+            )
+            print("Importando...")
+            if explicit_request_id:
+                imported = list(service.run_request_id(explicit_request_id))
+            else:
+                imported = [
+                    result for item in selected for result in service.run(item.message)
+                ]
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except (
+            AcquisitionError, ArchiveExtractionError, CfazHistoryError,
+            GmailConnectorError, IntakeHistoryError, SupervisedImportError, ValueError,
+        ) as exc:
+            print(f"Aquisição Cfaz não concluída: {exc}")
+            return 1
+        print(f"Pedidos Cfaz concluídos: {len(imported)}")
         return 0
 
     print(
         "Uso: ireo-clinical-intelligence "
         "[radiology-gmail-dry-run | radiology-import-supervised | "
-        "radiology-import-from-gmail | browser-self-test | "
+        "radiology-import-from-gmail | radiology-import-from-cfaz | "
+        "cfaz-list-notifications | cfaz-history | browser-self-test | "
+        "cfaz-repair-files | "
         "transfernow-link-diagnosis | intake-history | intake-review-list | intake-review-resume | "
-        "radiology-auto-run | radiology-auto-status | process-radiology-inbox]"
+        "radiology-auto-run | radiology-auto-status | rebuild-radiology-index | "
+        "process-radiology-inbox]"
     )
     return 2
 

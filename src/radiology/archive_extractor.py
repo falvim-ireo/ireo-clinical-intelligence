@@ -1,11 +1,17 @@
 """Extração local segura de arquivos ZIP e RAR para a quarentena."""
 
 from pathlib import Path, PurePosixPath
+import logging
+import os
 import re
 import shutil
 import stat
 import subprocess
 import zipfile
+
+
+LOGGER = logging.getLogger(__name__)
+_UNRAR_STDERR_LIMIT = 240
 
 
 class ArchiveExtractionError(RuntimeError):
@@ -88,9 +94,7 @@ class ArchiveExtractor:
         for member_name in member_names:
             self._validate_member(member_name, destination)
 
-        target_argument = str(destination)
-        if not target_argument.endswith(("\\", "/")):
-            target_argument += "\\"
+        target_argument = self._destination_argument(destination)
         self._run_tool(
             self.archive_tool_path,
             [
@@ -132,10 +136,44 @@ class ArchiveExtractor:
             ) from None
 
         if completed.returncode != 0:
+            stderr_summary = self._summarize_stderr(completed.stderr, command)
+            LOGGER.warning(
+                "UnRAR falhou (returncode=%d, stderr=%s)",
+                completed.returncode,
+                stderr_summary,
+            )
             raise ArchiveExtractionError(
                 "O UnRAR não conseguiu processar o arquivo compactado."
             )
         return completed
+
+    @staticmethod
+    def _destination_argument(
+        destination: Path,
+        *,
+        os_name: str | None = None,
+    ) -> str:
+        """Formata o diretório de destino como exigido pelo UnRAR da plataforma."""
+        separator = "\\" if (os_name or os.name) == "nt" else "/"
+        return str(destination).rstrip("\\/") + separator
+
+    @staticmethod
+    def _summarize_stderr(stderr: str | None, command: list[str]) -> str:
+        """Produz diagnóstico curto, em uma linha, sem repetir argumentos sensíveis."""
+        summary = " ".join((stderr or "").split())
+        sensitive_arguments = {
+            argument
+            for index, argument in enumerate(command)
+            if index == 0 or "/" in argument or "\\" in argument
+        }
+        for argument in sorted(sensitive_arguments, key=len, reverse=True):
+            if argument:
+                summary = summary.replace(argument, "<redacted>")
+        if not summary:
+            return "<empty>"
+        if len(summary) > _UNRAR_STDERR_LIMIT:
+            return summary[: _UNRAR_STDERR_LIMIT - 3] + "..."
+        return summary
 
     def _next_directory(self, archive_stem: str) -> Path:
         safe_stem = "".join(

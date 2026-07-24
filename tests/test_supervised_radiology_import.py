@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -14,10 +15,13 @@ import zipfile
 
 import pytest
 import requests
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
-from integrations.onedrive_connector import (
-    PatientFolderError,
-    PatientFolderLocator,
+from integrations.onedrive_graph import (
+    GraphFolder,
+    GraphUploadedItem,
+    OneDriveGraphError,
 )
 from models.email_message import EmailMessage
 from models.patient import Patient
@@ -33,13 +37,99 @@ from radiology.supervised_import import (
     SupervisedImportError,
     SupervisedRadiologyImporter,
 )
+
+
+def test_transfernow_viewer_package_keeps_relative_structure_under_tomography(tmp_path):
+    extracted = tmp_path / "extracted"
+    (extracted / "DICOM").mkdir(parents=True)
+    (extracted / "bin").mkdir()
+    (extracted / "viewer.exe").write_bytes(b"MZ")
+    (extracted / "DICOM" / "image").write_bytes(
+        b"\x00" * 128 + b"DICM" + b"dataset"
+    )
+    (extracted / "bin" / "series.dat").write_bytes(b"relative dependency")
+
+    SupervisedRadiologyImporter._preserve_structured_tomography(
+        extracted, "transfernow"
+    )
+
+    package = extracted / "03 - Tomografia" / "Pacote Original"
+    assert (package / "viewer.exe").is_file()
+    assert (package / "DICOM" / "image").is_file()
+    assert (package / "bin" / "series.dat").is_file()
 from radiology.intake_history import IntakeHistoryError, IntakeHistoryRepository
+from radiology.exam_index_service import ExamIndexService
 from repositories.patient_repository import InMemoryPatientRepository
 from repositories.patient_repository import EmptyPatientRepository
 from repositories.patient_repository import PatientRepositoryUnavailableError
 
 
 PATIENT_NAME = "CLÁUDIA EXEMPLO FICTÍCIA"
+
+
+class FakeOneDriveClient:
+    def __init__(self) -> None:
+        self.root = GraphFolder("root", "Pacientes", drive_id="drive")
+        self.folders: dict[tuple[str, str], GraphFolder] = {}
+        self.uploads: list[tuple[str, str, bytes]] = []
+        self.children: dict[str, list[dict[str, object]]] = {"root": []}
+        self.contents: dict[tuple[str, str], bytes] = {}
+        self.fail_once_names: set[str] = set()
+        self.failed_names: set[str] = set()
+        self.counter = 0
+
+    def find_root_folder(self, configured_root: str) -> GraphFolder:
+        assert configured_root == "Pacientes"
+        return self.root
+
+    def find_child_folder(self, parent: GraphFolder, name: str) -> GraphFolder | None:
+        return self.folders.get((parent.item_id, name.casefold()))
+
+    def create_folder(self, parent: GraphFolder, name: str) -> GraphFolder:
+        self.counter += 1
+        folder = GraphFolder(f"folder-{self.counter}", name, drive_id="drive")
+        self.folders[(parent.item_id, name.casefold())] = folder
+        self.children.setdefault(parent.item_id, []).append(
+            {
+                "id": folder.item_id,
+                "name": name,
+                "folder": {},
+                "parentReference": {"driveId": "drive"},
+            }
+        )
+        self.children.setdefault(folder.item_id, [])
+        return folder
+
+    def ensure_folder(self, parent: GraphFolder, name: str) -> GraphFolder:
+        return self.find_child_folder(parent, name) or self.create_folder(parent, name)
+
+    def list_children(self, folder: GraphFolder) -> list[dict[str, object]]:
+        return list(self.children.get(folder.item_id, []))
+
+    def upload_small_file(
+        self, folder: GraphFolder, local_file: str | Path, remote_filename: str | None = None,
+        *, progress_callback=None, retry_callback=None,
+    ) -> GraphUploadedItem:
+        path = Path(local_file)
+        name = remote_filename or path.name
+        if name in self.fail_once_names and name not in self.failed_names:
+            self.failed_names.add(name)
+            raise OneDriveGraphError("falha transitória simulada")
+        content = path.read_bytes()
+        self.uploads.append((folder.item_id, name, content))
+        self.contents[(folder.item_id, name.casefold())] = content
+        children = self.children.setdefault(folder.item_id, [])
+        children[:] = [item for item in children if str(item.get("name", "")).casefold() != name.casefold()]
+        children.append(
+            {"id": f"file-{len(self.uploads)}", "name": name, "size": len(content), "file": {}}
+        )
+        if progress_callback is not None:
+            progress_callback(len(content), len(content))
+        return GraphUploadedItem(name=name, size=path.stat().st_size, has_id=True)
+
+    def download_json_file(self, folder: GraphFolder, filename: str):
+        content = self.contents.get((folder.item_id, filename.casefold()))
+        return json.loads(content) if content is not None else None
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +146,47 @@ def create_zip(path: Path, files: dict[str, bytes] | None = None) -> Path:
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in (files or {"scan/image.dcm": b"dicom-ficticio"}).items():
             archive.writestr(name, content)
+    return path
+
+
+def create_dicom_zip(
+    path: Path,
+    tmp_path: Path,
+    *,
+    patient_names: tuple[str, ...] = (PATIENT_NAME,),
+    study_date: str = "20991231",
+    study_time: str = "235900",
+) -> Path:
+    study_uid = generate_uid()
+    series_uid = generate_uid()
+    sources = []
+    for index, patient_name in enumerate(patient_names, start=1):
+        source = tmp_path / f"dicom-source-{index}"
+        meta = FileMetaDataset()
+        meta.MediaStorageSOPClassUID = CTImageStorage
+        meta.MediaStorageSOPInstanceUID = generate_uid()
+        meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        dataset = FileDataset(str(source), {}, file_meta=meta, preamble=b"\0" * 128)
+        dataset.SOPClassUID = CTImageStorage
+        dataset.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+        dataset.PatientName = patient_name.replace(" ", "^")
+        dataset.PatientID = str(990000010 + index - 1)
+        dataset.StudyInstanceUID = study_uid
+        dataset.SeriesInstanceUID = series_uid
+        dataset.Modality = "CT"
+        dataset.StudyDate = study_date
+        dataset.StudyTime = study_time
+        dataset.StudyDescription = "CBCT odontológica"
+        dataset.SeriesDescription = "Cone Beam"
+        dataset.Rows = 100
+        dataset.Columns = 120
+        dataset.PixelSpacing = ["0.3", "0.3"]
+        dataset.SliceThickness = "0.4"
+        dataset.save_as(source, enforce_file_format=True)
+        sources.append(source)
+    with zipfile.ZipFile(path, "w") as archive:
+        for index, source in enumerate(sources, start=1):
+            archive.write(source, f"DICOM/image-{index}")
     return path
 
 
@@ -80,19 +211,17 @@ def build_importer(
     intake_history=None,
     allow_reimport: bool = False,
 ) -> tuple[SupervisedRadiologyImporter, Path, Path, list[str]]:
-    patients_root = tmp_path / "patients"
-    patients_root.mkdir(exist_ok=True)
-    for folder_name in patient_folders:
-        (patients_root / folder_name).mkdir(exist_ok=True)
     quarantine = tmp_path / "quarantine"
+    patients_root = quarantine / "supervised-staging"
     tool = tmp_path / "UnRAR.exe"
     tool.write_bytes(b"ferramenta-ficticia")
     output: list[str] = []
     audit = audit_logger or AuditLogger(correlation_id="correlation-supervised-0001")
     importer = SupervisedRadiologyImporter(
-        patients_root=patients_root,
         quarantine_root=quarantine,
         archive_tool_path=tool,
+        onedrive_client=FakeOneDriveClient(),
+        onedrive_root="Pacientes",
         patient_repository=InMemoryPatientRepository(
             patients
             if patients is not None
@@ -153,9 +282,121 @@ def test_local_zip_runs_complete_supervised_copy_and_manifest(tmp_path: Path) ->
     assert manifest["source"] == "local"
     assert manifest["status"] == "COMPLETED"
     assert manifest["destination"] == str(result.destination)
+    assert manifest["onedrive_destination"] == result.onedrive_destination
+    assert result.onedrive_destination.endswith(
+        f"/{PATIENT_NAME}/Radiologia/2099-12-31 - Radiologia"
+    )
+    uploaded_names = [name for _, name, _ in importer.onedrive_client.uploads]
+    assert uploaded_names.count("image-1.dcm") == 1
+    assert uploaded_names.count("report.txt") == 1
+    assert uploaded_names.count("manifest.json") >= 2
     assert any(line.startswith("Arquivo de origem:") for line in output)
     assert "Quantidade de arquivos: 2" in output
-    assert "Possíveis duplicados: 0" in output
+    assert any(
+        "Coincidências locais por nome e tamanho (apenas diagnóstico): 0" in line
+        for line in output
+    )
+
+
+def test_extracts_clinical_date_and_time_from_compound_archive_name() -> None:
+    exam_date, exam_time = SupervisedRadiologyImporter._date_time_from_archive_name(
+        "ANTONIO CUSTODIO DE SOUZA PRADO_20260310111013.SL.rar"
+    )
+    assert exam_date == date(2026, 3, 10)
+    assert exam_time is not None and exam_time.isoformat() == "11:10:13"
+
+
+def test_archive_date_drives_destination_and_manifest(tmp_path: Path) -> None:
+    archive = create_zip(
+        tmp_path / f"{PATIENT_NAME}_20260310111013.zip",
+        {"viewer/data.bin": b"proprietary"},
+    )
+    importer, _, _, _ = build_importer(tmp_path)
+
+    result = importer.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+
+    assert result.destination.name == "2026-03-10 - Radiologia"
+    assert manifest["exam_date"] == "2026-03-10"
+    assert manifest["exam_time"] == "11:10:13"
+    assert manifest["exam_date_source"] == "ARCHIVE_FILENAME"
+    assert manifest["import_started_at"]
+    assert manifest["import_completed_at"]
+
+
+def test_consistent_dicom_study_date_precedes_archive_name(tmp_path: Path) -> None:
+    archive = create_dicom_zip(
+        tmp_path / f"{PATIENT_NAME}_20260310111013.zip",
+        tmp_path,
+        study_date="20260201",
+        study_time="081500",
+    )
+    importer, _, _, _ = build_importer(tmp_path)
+
+    result = importer.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+
+    assert result.destination.name == "2026-02-01 - Radiologia"
+    assert manifest["exam_date_source"] == "DICOM_STUDY_DATE"
+    assert manifest["exam_time"] == "08:15:00"
+
+
+def test_different_clinical_dates_imported_on_same_day_use_distinct_destinations(
+    tmp_path: Path,
+) -> None:
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_root.mkdir(); second_root.mkdir()
+    first_archive = create_zip(
+        first_root / f"{PATIENT_NAME}_20260310111013.zip", {"a.bin": b"first"}
+    )
+    second_archive = create_zip(
+        second_root / f"{PATIENT_NAME}_20260411121013.zip", {"b.bin": b"second"}
+    )
+    first, _, _, _ = build_importer(first_root)
+    second, _, _, _ = build_importer(second_root)
+    second.onedrive_client = first.onedrive_client
+
+    first_result = first.run(archive_path=first_archive)
+    second_result = second.run(archive_path=second_archive)
+
+    assert first_result.onedrive_destination.endswith("/2026-03-10 - Radiologia")
+    assert second_result.onedrive_destination.endswith("/2026-04-11 - Radiologia")
+
+
+def test_two_different_exams_same_patient_and_day_are_distinguished_by_time(
+    tmp_path: Path,
+) -> None:
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_root.mkdir(); second_root.mkdir()
+    first_archive = create_zip(
+        first_root / f"{PATIENT_NAME}_20260310111013.zip", {"scan.bin": b"first"}
+    )
+    second_archive = create_zip(
+        second_root / f"{PATIENT_NAME}_20260310124559.zip", {"scan.bin": b"second"}
+    )
+    first, _, _, _ = build_importer(first_root)
+    second, _, _, _ = build_importer(second_root)
+    second.onedrive_client = first.onedrive_client
+
+    first_result = first.run(archive_path=first_archive)
+    second_result = second.run(archive_path=second_archive)
+
+    assert first_result.onedrive_destination.endswith("/2026-03-10 - Radiologia")
+    assert second_result.onedrive_destination.endswith(
+        "/2026-03-10 12-45 - Radiologia"
+    )
+    assert "(2)" not in second_result.onedrive_destination
+
+
+def test_missing_clinical_date_uses_explicit_import_date_fallback(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}.zip", {"scan.bin": b"unknown"})
+    importer, _, _, _ = build_importer(tmp_path)
+
+    result = importer.run(archive_path=archive)
+    manifest = json.loads(result.manifest_path.read_text("utf-8"))
+
+    assert result.destination.name == "2099-12-31 - Radiologia"
+    assert manifest["exam_date_source"] == "IMPORT_DATE_FALLBACK"
 
 
 def test_checksums_match_every_copied_file(tmp_path: Path) -> None:
@@ -174,6 +415,123 @@ def test_checksums_match_every_copied_file(tmp_path: Path) -> None:
     assert manifest["checksums"] == {"nested/scan.bin": expected}
 
 
+def test_dicom_intelligence_reports_manifest_and_onedrive_publication(
+    tmp_path: Path,
+) -> None:
+    archive = create_dicom_zip(
+        tmp_path / f"{PATIENT_NAME}_20991231.zip", tmp_path
+    )
+    importer, _, _, output = build_importer(tmp_path)
+
+    result = importer.run(archive_path=archive)
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    intelligence = manifest["dicom_intelligence"]
+    assert result.file_count == 1
+    assert intelligence["valid_dicom_count"] == 1
+    assert intelligence["study_count"] == 1
+    assert intelligence["series_count"] == 1
+    assert intelligence["patient_count"] == 1
+    assert intelligence["probable_classification"] == "CBCT odontológica"
+    assert (result.destination / "dicom_summary.json").is_file()
+    assert (result.destination / "resumo_do_exame.txt").is_file()
+    uploaded_names = [name for _, name, _ in importer.onedrive_client.uploads]
+    assert "dicom_summary.json" in uploaded_names
+    assert "resumo_do_exame.txt" in uploaded_names
+    assert any("DICOM válidos: 1" in line for line in output)
+    assert any("Estudos: 1" in line for line in output)
+    assert any("Séries: 1" in line for line in output)
+    assert any("Classificação provável: CBCT odontológica" in line for line in output)
+
+
+def test_completed_publication_is_incrementally_indexed(tmp_path: Path) -> None:
+    archive = create_dicom_zip(
+        tmp_path / f"{PATIENT_NAME}_20260310111013.zip", tmp_path,
+        study_date="20260310", study_time="111013",
+    )
+    importer, _, _, output = build_importer(tmp_path)
+    index = ExamIndexService(tmp_path / "radiology-index.db")
+    importer.exam_index_service = index
+
+    result = importer.run(archive_path=archive)
+    exam_id = json.loads(result.manifest_path.read_text("utf-8"))["publication"]["exam_id"]
+
+    indexed = index.get_by_exam_id(exam_id)
+    assert indexed is not None
+    assert indexed.exam_date == "2026-03-10"
+    assert indexed.modality == "CT"
+    assert "Indexação............. OK" in output
+
+
+def test_cfaz_metadata_uses_existing_pipeline_manifest_index_and_dashboard(
+    tmp_path: Path,
+) -> None:
+    archive = create_zip(
+        tmp_path / f"{PATIENT_NAME}_20260310111013_CFAZ-307471.zip",
+        {
+            "panoramica.jpg": b"pan",
+            "telerradiografia.png": b"tele",
+            "laudo.pdf": b"report",
+        },
+    )
+    importer, _, _, _ = build_importer(tmp_path)
+    index = ExamIndexService(tmp_path / "cfaz-index.db")
+    importer.exam_index_service = index
+    metadata = {
+        "provider_id": "cfaz",
+        "request_id": "307471",
+        "provider_exam_id": "reports:99",
+        "request_date": "2026-03-10T11:00:00-03:00",
+        "exam_date": "2026-03-10T11:10:13-03:00",
+        "patient_name": PATIENT_NAME,
+        "radiology_clinic": "Radiologia Exemplo",
+        "professional": "Dra. Solicitante",
+        "source_url": "https://max.cfaz.net/requests/307471",
+        "classifications": ["Laudo", "Panorâmica", "Telerradiografia"],
+        "asset_count": 3,
+    }
+
+    result = importer.run(
+        archive_path=archive,
+        archive_sha256="b" * 64,
+        acquisition_metadata=metadata,
+        acquisition_exam_id="a" * 64,
+        source_provider="cfaz",
+        sender_exam_date="2026-03-10",
+    )
+    stored = json.loads(result.manifest_path.read_text("utf-8"))
+
+    assert result.destination.name == "2026-03-10 - Documentação Radiológica"
+    assert stored["source"] == "cfaz"
+    assert stored["acquisition"] == metadata
+    assert stored["publication"]["exam_id"] == "a" * 64
+    assert stored["publication"]["source_archive_sha256"] == "b" * 64
+    indexed = index.get_by_exam_id("a" * 64)
+    assert indexed is not None
+    assert indexed.modality == "Laudo,Panorâmica,Telerradiografia"
+    dashboard = index.dashboard()
+    assert dashboard["exams"] == 1
+    assert dashboard["modalities"][0]["modality"] == indexed.modality
+
+
+def test_multiple_dicom_patients_block_publication_before_onedrive(
+    tmp_path: Path,
+) -> None:
+    archive = create_dicom_zip(
+        tmp_path / f"{PATIENT_NAME}_20991231.zip",
+        tmp_path,
+        patient_names=(PATIENT_NAME, "OUTRO PACIENTE"),
+    )
+    importer, _, _, output = build_importer(tmp_path, answers=("1",))
+
+    with pytest.raises(SupervisedImportError, match="múltiplos pacientes DICOM"):
+        importer.run(archive_path=archive)
+
+    assert importer.onedrive_client.list_children(importer.onedrive_client.root) == []
+    assert any("Pacientes encontrados: 2" in line for line in output)
+    assert any("múltiplos pacientes" in line for line in output)
+
+
 def test_local_rar_uses_unrar_without_shell_and_keeps_inputs(
     tmp_path: Path,
     monkeypatch,
@@ -188,7 +546,7 @@ def test_local_rar_uses_unrar_without_shell_and_keeps_inputs(
         if command[1] == "lb":
             listing = "scan/image.dcm\n"
             return subprocess.CompletedProcess(command, 0, listing, "")
-        destination = Path(command[-1].rstrip("\\"))
+        destination = Path(command[-1].rstrip("\\/"))
         (destination / "scan").mkdir(parents=True, exist_ok=True)
         (destination / "scan" / "image.dcm").write_bytes(b"rar-extraido")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -205,7 +563,7 @@ def test_local_rar_uses_unrar_without_shell_and_keeps_inputs(
     assert calls[1][0][0].endswith("UnRAR.exe")
     assert calls[1][0][1:3] == ["x", "-o-"]
     assert calls[1][0][-2] == str(archive.resolve())
-    assert calls[1][0][-1].endswith("\\")
+    assert calls[1][0][-1].endswith(os.sep)
     assert all("WinRAR.exe" not in argument for call, _ in calls for argument in call)
     assert all(call_kwargs["shell"] is False for _, call_kwargs in calls)
     assert all(call_kwargs["timeout"] == 1800 for _, call_kwargs in calls)
@@ -345,7 +703,7 @@ def test_offline_source_requires_manual_patient_confirmation(tmp_path: Path) -> 
     assert result.destination.is_dir()
 
 
-def test_multiple_onedrive_folders_require_human_selection(tmp_path: Path) -> None:
+def test_remote_destination_uses_confirmed_patient_name(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     folders = (
         f"001 - {PATIENT_NAME}",
@@ -353,29 +711,277 @@ def test_multiple_onedrive_folders_require_human_selection(tmp_path: Path) -> No
     )
     importer, patients_root, _, output = build_importer(
         tmp_path,
-        answers=("1", "2", "CONFIRMAR"),
+        answers=("1", "1", "CONFIRMAR"),
         patient_folders=folders,
     )
 
     result = importer.run(archive_path=archive)
 
-    assert result.destination.is_relative_to(patients_root / folders[1])
-    assert any(folders[0] in line for line in output)
-    assert any(folders[1] in line for line in output)
+    assert result.destination.is_relative_to(patients_root / PATIENT_NAME)
+    assert any("Pacientes/" + PATIENT_NAME + "/Radiologia" in line for line in output)
+    assert any(name == "manifest.json" for _, name, _ in importer.onedrive_client.uploads)
 
 
-def test_no_onedrive_folder_stops_before_destination_creation(tmp_path: Path) -> None:
+def test_missing_remote_patient_folder_is_created_via_graph(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     importer, patients_root, _, _ = build_importer(
         tmp_path,
-        answers=("1",),
+        answers=("1", "1", "CONFIRMAR"),
         patient_folders=(),
     )
 
-    with pytest.raises(SupervisedImportError, match="Nenhuma pasta"):
+    result = importer.run(archive_path=archive)
+
+    assert result.destination.is_relative_to(patients_root)
+    assert ("root", PATIENT_NAME.casefold()) in importer.onedrive_client.folders
+
+
+def test_existing_remote_destination_is_never_overwritten(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(tmp_path)
+    client = importer.onedrive_client
+    patient = client.ensure_folder(client.root, PATIENT_NAME)
+    radiology = client.ensure_folder(patient, "Radiologia")
+    client.create_folder(radiology, "2099-12-31 - Radiologia")
+
+    with pytest.raises(SupervisedImportError, match="sem manifesto de estado"):
         importer.run(archive_path=archive)
 
-    assert list(patients_root.iterdir()) == []
+    assert client.uploads == []
+
+
+def seed_remote_manifest(
+    tmp_path: Path,
+    client: FakeOneDriveClient,
+    destination: GraphFolder,
+    *,
+    archive_sha256: str,
+    state: str,
+    uploaded_files: dict[str, dict[str, object]] | None = None,
+) -> None:
+    path = tmp_path / f"manifest-{destination.item_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "publication": {
+                    "state": state,
+                    "exam_id": archive_sha256,
+                    "source_archive_sha256": archive_sha256,
+                    "total_files": len(uploaded_files or {}),
+                    "total_bytes": sum(
+                        int(item["size"]) for item in (uploaded_files or {}).values()
+                    ),
+                    "uploaded_files_count": len(uploaded_files or {}),
+                    "uploaded_bytes": sum(
+                        int(item["size"]) for item in (uploaded_files or {}).values()
+                    ),
+                    "uploaded_files": uploaded_files or {},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    client.upload_small_file(destination, path, remote_filename="manifest.json")
+
+
+def test_normalized_patient_name_reuses_original_onedrive_name(tmp_path: Path) -> None:
+    remote_name = "Antônio  Custódio de Souza Prado"
+    requested_name = "antonio custodio de souza prado"
+    archive = create_zip(tmp_path / f"{requested_name}_20991231.zip")
+    importer, _, _, _ = build_importer(
+        tmp_path,
+        patients=[Patient(id=990000010, nome=requested_name)],
+    )
+    client = importer.onedrive_client
+    original = client.create_folder(client.root, remote_name)
+
+    result = importer.run(archive_path=archive)
+
+    patient_children = [
+        item for item in client.list_children(client.root) if isinstance(item.get("folder"), dict)
+    ]
+    assert len(patient_children) == 1
+    assert patient_children[0]["id"] == original.item_id
+    assert patient_children[0]["name"] == remote_name
+    assert f"/{remote_name}/Radiologia/" in result.onedrive_destination
+
+
+def test_complete_remote_import_blocks_reimport_without_new_folder(tmp_path: Path) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(tmp_path)
+    client = importer.onedrive_client
+    patient = client.create_folder(client.root, PATIENT_NAME)
+    radiology = client.create_folder(patient, "Radiologia")
+    destination = client.create_folder(radiology, "2099-12-31 - Radiologia")
+    seed_remote_manifest(
+        tmp_path,
+        client,
+        destination,
+        archive_sha256=importer._file_sha256(archive),
+        state="COMPLETE",
+    )
+    client.uploads.clear()
+
+    with pytest.raises(SupervisedImportError, match="já está COMPLETE"):
+        importer.run(archive_path=archive)
+
+    assert client.uploads == []
+    assert [item["name"] for item in client.list_children(radiology)] == [
+        "2099-12-31 - Radiologia"
+    ]
+
+
+def test_failed_remote_import_resumes_only_missing_files(tmp_path: Path) -> None:
+    archive = create_zip(
+        tmp_path / f"{PATIENT_NAME}_20991231.zip",
+        {"already.bin": b"already", "missing.bin": b"missing"},
+    )
+    importer, _, _, _ = build_importer(tmp_path)
+    client = importer.onedrive_client
+    patient = client.create_folder(client.root, PATIENT_NAME)
+    radiology = client.create_folder(patient, "Radiologia")
+    destination = client.create_folder(radiology, "2099-12-31 - Radiologia")
+    already = tmp_path / "already.bin"
+    already.write_bytes(b"already")
+    client.upload_small_file(destination, already)
+    uploaded_record = {
+        "already.bin": {
+            "sha256": hashlib.sha256(b"already").hexdigest(),
+            "size": len(b"already"),
+        }
+    }
+    seed_remote_manifest(
+        tmp_path,
+        client,
+        destination,
+        archive_sha256=importer._file_sha256(archive),
+        state="FAILED",
+        uploaded_files=uploaded_record,
+    )
+    client.uploads.clear()
+
+    result = importer.run(archive_path=archive)
+
+    data_uploads = [name for _, name, _ in client.uploads if name != "manifest.json"]
+    assert "already.bin" not in data_uploads
+    assert set(data_uploads) == {
+        "dicom_summary.json",
+        "missing.bin",
+        "resumo_do_exame.txt",
+    }
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["publication"]["state"] == "COMPLETE"
+    assert manifest["publication"]["uploaded_files_count"] == 4
+
+
+def test_multiple_legacy_destinations_are_diagnosed_without_consolidation(
+    tmp_path: Path,
+) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(tmp_path)
+    client = importer.onedrive_client
+    patient = client.create_folder(client.root, PATIENT_NAME)
+    radiology = client.create_folder(patient, "Radiologia")
+    states = ("IN_PROGRESS", "FAILED", "COMPLETE")
+    for index, state in enumerate(states, start=1):
+        suffix = "" if index == 1 else f" ({index})"
+        destination = client.create_folder(
+            radiology, f"2099-12-31 - Radiologia{suffix}"
+        )
+        seed_remote_manifest(
+            tmp_path,
+            client,
+            destination,
+            archive_sha256=importer._file_sha256(archive),
+            state=state,
+        )
+    before = list(client.list_children(radiology))
+    client.uploads.clear()
+
+    with pytest.raises(SupervisedImportError) as captured:
+        importer.run(archive_path=archive)
+
+    message = str(captured.value)
+    assert "estado=IN_PROGRESS" in message
+    assert "estado=FAILED" in message
+    assert "estado=COMPLETE" in message
+    assert "Nenhuma pasta foi movida, mesclada ou apagada" in message
+    assert client.list_children(radiology) == before
+    assert client.uploads == []
+
+
+def test_small_file_progress_and_final_success_are_visible(tmp_path: Path) -> None:
+    archive = create_zip(
+        tmp_path / f"{PATIENT_NAME}_20991231.zip",
+        {"one.bin": b"1", "two.bin": b"22"},
+    )
+    importer, _, _, output = build_importer(tmp_path)
+
+    importer.run(archive_path=archive)
+
+    assert any("Upload: 1/4 arquivos" in line for line in output)
+    assert any("Upload: 4/4 arquivos" in line for line in output)
+    assert any("Progresso: 100.0%" in line for line in output)
+    assert any("Velocidade média:" in line and "ETA:" in line for line in output)
+    assert any("Upload concluído: 4/4 arquivos" in line for line in output)
+
+
+def test_upload_failure_records_failed_state_and_final_line(tmp_path: Path) -> None:
+    archive = create_zip(
+        tmp_path / f"{PATIENT_NAME}_20991231.zip", {"fail.bin": b"failure"}
+    )
+    importer, _, _, output = build_importer(tmp_path)
+    importer.onedrive_client.fail_once_names.add("fail.bin")
+
+    with pytest.raises(SupervisedImportError, match="falha transitória simulada"):
+        importer.run(archive_path=archive)
+
+    manifest_path = (
+        importer.staging_root
+        / PATIENT_NAME
+        / "Exames de imagem"
+        / "2099-12-31 - Radiologia"
+        / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["publication"]["state"] == "FAILED"
+    assert manifest["status"] == "FAILED"
+    assert any("Upload falhou" in line for line in output)
+
+
+def test_graph_error_is_propagated_and_logged_with_stack_trace(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
+    importer, _, _, _ = build_importer(tmp_path)
+    original = OneDriveGraphError(
+        "Mensagem completa do Microsoft Graph.",
+        http_status=403,
+        graph_code="accessDenied",
+        graph_message="Mensagem completa do Microsoft Graph.",
+        request_id="request-id-fixture",
+        client_request_id="client-request-id-fixture",
+        endpoint="https://graph.microsoft.com/v1.0/me/drive/root:/Pacientes",
+    )
+
+    def fail_root(configured_root: str) -> GraphFolder:
+        raise original
+
+    importer.onedrive_client.find_root_folder = fail_root
+
+    with caplog.at_level(logging.ERROR), pytest.raises(
+        SupervisedImportError, match="Mensagem completa do Microsoft Graph"
+    ) as captured:
+        importer.run(archive_path=archive)
+
+    assert captured.value.__cause__ is original
+    assert "HTTP status=403" in str(captured.value)
+    assert "Graph code=accessDenied" in caplog.text
+    assert "request-id=request-id-fixture" in caplog.text
+    assert "client-request-id=client-request-id-fixture" in caplog.text
+    assert "endpoint=https://graph.microsoft.com/v1.0/me/drive/root:/Pacientes" in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
 
 
 def test_zip_path_traversal_is_rejected_without_external_write(tmp_path: Path) -> None:
@@ -395,15 +1001,13 @@ def test_zip_path_traversal_is_rejected_without_external_write(tmp_path: Path) -
     assert archive.exists()
 
 
-def test_folder_outside_configured_root_is_rejected(tmp_path: Path) -> None:
-    root = tmp_path / "patients"
-    root.mkdir()
+def test_staging_destination_outside_quarantine_is_rejected(tmp_path: Path) -> None:
+    importer, _, _, _ = build_importer(tmp_path)
     outside = tmp_path / "outside-patient"
     outside.mkdir()
-    locator = PatientFolderLocator(root)
 
-    with pytest.raises(PatientFolderError, match="fora da raiz"):
-        locator.validate_selection(outside)
+    with pytest.raises(SupervisedImportError, match="fora da área temporária"):
+        importer._next_destination(outside)
 
 
 def test_copy_destination_outside_root_is_rejected_before_creation(
@@ -430,7 +1034,7 @@ def test_copy_destination_outside_root_is_rejected_before_creation(
     assert not outside.exists()
 
 
-def test_existing_destination_gets_incremental_suffix(tmp_path: Path) -> None:
+def test_existing_local_staging_is_reused_without_incremental_suffix(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     importer, patients_root, _, _ = build_importer(tmp_path)
     existing = (
@@ -445,7 +1049,7 @@ def test_existing_destination_gets_incremental_suffix(tmp_path: Path) -> None:
 
     result = importer.run(archive_path=archive)
 
-    assert result.destination.name == "2099-12-31 - Radiologia (2)"
+    assert result.destination.name == "2099-12-31 - Radiologia"
     assert marker.read_text(encoding="utf-8") == "não sobrescrever"
 
 
@@ -466,7 +1070,10 @@ def test_preview_reports_possible_duplicate_before_copy(tmp_path: Path) -> None:
 
     importer.run(archive_path=archive)
 
-    assert "Possíveis duplicados: 1" in output
+    assert any(
+        "Coincidências locais por nome e tamanho (apenas diagnóstico): 1" in line
+        for line in output
+    )
 
 
 def test_copy_confirmation_is_case_insensitive_and_ignores_spaces(
@@ -483,22 +1090,18 @@ def test_copy_confirmation_is_case_insensitive_and_ignores_spaces(
     assert result.destination.is_dir()
 
 
-def test_enter_cancels_copy_with_friendly_prompt(tmp_path: Path) -> None:
+def test_pipeline_finishes_without_mechanical_confirmation(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     prompts: list[str] = []
-    answers = iter(("1", "1", ""))
     importer, patients_root, quarantine, _ = build_importer(tmp_path)
-    importer.input = lambda prompt: (prompts.append(prompt), next(answers))[1]
+    importer.input = lambda prompt: (prompts.append(prompt), pytest.fail(prompt))[1]
 
-    with pytest.raises(SupervisedImportCancelled, match="confirmação explícita"):
-        importer.run(archive_path=archive)
+    result = importer.run(archive_path=archive)
 
-    assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
+    assert result.destination.is_relative_to(patients_root / PATIENT_NAME / "Exames de imagem")
     assert archive.exists()
     assert any(path.is_dir() for path in quarantine.iterdir())
-    assert "Digite CONFIRMAR (não diferencia maiúsculas/minúsculas)" in prompts[-1]
-    assert "[ENTER] = cancelar" in prompts[-1]
-    assert "CONFIRMAR = copiar" in prompts[-1]
+    assert prompts == []
 
 
 def test_copy_refuses_destination_created_after_preview(tmp_path: Path) -> None:
@@ -508,7 +1111,7 @@ def test_copy_refuses_destination_created_after_preview(tmp_path: Path) -> None:
     source_file = extracted / "scan.bin"
     source_file.write_bytes(b"novo")
     destination = patients_root / PATIENT_NAME / "existing-destination"
-    destination.mkdir()
+    destination.mkdir(parents=True)
     existing = destination / "scan.bin"
     existing.write_bytes(b"antigo")
 
@@ -567,6 +1170,7 @@ def test_email_mode_uses_readonly_message_and_injected_download(tmp_path: Path) 
     assert gmail.ids == ["fixture-message-id"]
     assert len(downloads) == 1
     assert manifest["source"] == "gmail"
+    assert manifest["email_received_at"] == "2099-12-31T00:00:00Z"
     assert "secret-fixture-token" not in result.manifest_path.read_text(
         encoding="utf-8"
     )
@@ -680,6 +1284,7 @@ def test_cli_dispatches_supervised_archive_mode_offline(
             return SimpleNamespace(
                 destination=tmp_path / "destination",
                 manifest_path=tmp_path / "destination" / "manifest.json",
+                onedrive_destination="Pacientes/PACIENTE/Radiologia/exame",
             )
 
     monkeypatch.setattr(
@@ -687,6 +1292,7 @@ def test_cli_dispatches_supervised_archive_mode_offline(
         "SupervisedRadiologyImporter",
         FakeImporter,
     )
+    monkeypatch.setattr(main, "build_onedrive_graph_client", lambda: object())
 
     result = main.main(
         [
@@ -743,14 +1349,14 @@ def resolved_fixture(
     )
 
 
-def test_auto_selection_flag_false_preserves_manual_flow(tmp_path: Path) -> None:
+def test_unambiguous_selection_is_hands_off_even_with_legacy_flag_false(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     importer, _, _, output = build_importer(tmp_path)
 
     manifest = json.loads(importer.run(archive_path=archive).manifest_path.read_text("utf-8"))
 
-    assert manifest["selection_mode"] == {"patient": "manual", "folder": "manual"}
-    assert any("Candidatos de paciente" in line for line in output)
+    assert manifest["selection_mode"] == {"patient": "auto", "folder": "auto"}
+    assert not any("Candidatos de paciente" in line for line in output)
 
 
 def test_exact_patient_and_single_folder_are_auto_selected(tmp_path: Path) -> None:
@@ -763,10 +1369,10 @@ def test_exact_patient_and_single_folder_are_auto_selected(tmp_path: Path) -> No
 
     assert manifest["selection_mode"] == {"patient": "auto", "folder": "auto"}
     assert manifest["auto_selection_reason"] == {
-        "patient": "EXACT_NAME", "folder": "SINGLE_COMPATIBLE_FOLDER"
+            "patient": "EXACT_NAME", "folder": "CONFIRMED_PATIENT_FOLDER"
     }
     assert any("Paciente selecionado automaticamente" in line for line in output)
-    assert any("Pasta selecionada automaticamente" in line for line in output)
+    assert any("Destino remoto selecionado automaticamente" in line for line in output)
 
 
 @pytest.mark.parametrize("score, expected", [(0.94, False), (0.95, True)])
@@ -811,56 +1417,52 @@ def test_patient_source_unavailable_stops_safely(tmp_path: Path) -> None:
     assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
 
 
-def test_auto_folder_outside_root_is_rejected(tmp_path: Path) -> None:
+def test_invalid_patient_name_never_creates_staging_outside_root(tmp_path: Path) -> None:
     importer, _, _, _ = build_importer(tmp_path, auto_select_unambiguous=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    importer.folder_locator.find_compatible = lambda name: [outside]
 
-    with pytest.raises(PatientFolderError, match="fora da raiz"):
-        importer._choose_patient_folder(PATIENT_NAME, allow_auto=True)
+    with pytest.raises(SupervisedImportError, match="inválido"):
+        importer._choose_patient_folder("...", allow_auto=True)
 
 
-def test_two_folders_remain_manual_when_feature_is_active(tmp_path: Path) -> None:
+def test_confirmed_patient_is_auto_selected_even_without_local_folders(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     folders = (f"001 - {PATIENT_NAME}", f"002 - {PATIENT_NAME}")
     importer, patients_root, _, _ = build_importer(
-        tmp_path, answers=("2", "CONFIRMAR"), patient_folders=folders,
+        tmp_path, answers=("CONFIRMAR",), patient_folders=folders,
         auto_select_unambiguous=True,
     )
 
     result = importer.run(archive_path=archive)
     manifest = json.loads(result.manifest_path.read_text("utf-8"))
-    assert result.destination.is_relative_to(patients_root / folders[1])
-    assert manifest["selection_mode"] == {"patient": "auto", "folder": "manual"}
+    assert result.destination.is_relative_to(patients_root / PATIENT_NAME)
+    assert manifest["selection_mode"] == {"patient": "auto", "folder": "auto"}
 
 
-def test_incoherent_folder_name_is_not_selected(tmp_path: Path) -> None:
+def test_legacy_local_folder_names_do_not_affect_remote_selection(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     importer, _, _, _ = build_importer(
-        tmp_path, patient_folders=("OUTRO PACIENTE",), auto_select_unambiguous=True,
+        tmp_path, answers=("CONFIRMAR",),
+        patient_folders=("OUTRO PACIENTE",), auto_select_unambiguous=True,
     )
-    with pytest.raises(SupervisedImportError, match="Nenhuma pasta"):
-        importer.run(archive_path=archive)
+    result = importer.run(archive_path=archive)
+    assert result.destination.parents[1].name == PATIENT_NAME
 
 
-def test_force_manual_override_disables_both_auto_selections(tmp_path: Path) -> None:
+def test_force_manual_override_only_prompts_for_patient_decision(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
     importer, _, _, _ = build_importer(
         tmp_path, auto_select_unambiguous=True, force_manual_selection=True,
     )
     manifest = json.loads(importer.run(archive_path=archive).manifest_path.read_text("utf-8"))
-    assert manifest["selection_mode"] == {"patient": "manual", "folder": "manual"}
+    assert manifest["selection_mode"] == {"patient": "manual", "folder": "auto"}
 
 
-def test_auto_selection_still_requires_final_confirmation(tmp_path: Path) -> None:
+def test_auto_selection_does_not_require_final_confirmation(tmp_path: Path) -> None:
     archive = create_zip(tmp_path / f"{PATIENT_NAME}_20991231.zip")
-    importer, patients_root, _, _ = build_importer(
-        tmp_path, answers=("",), auto_select_unambiguous=True,
-    )
-    with pytest.raises(SupervisedImportCancelled, match="confirmação explícita"):
-        importer.run(archive_path=archive)
-    assert not (patients_root / PATIENT_NAME / "Exames de imagem").exists()
+    importer, patients_root, _, _ = build_importer(tmp_path, auto_select_unambiguous=True)
+    importer.input = lambda prompt: pytest.fail(f"prompt inesperado: {prompt}")
+    result = importer.run(archive_path=archive)
+    assert result.destination.is_relative_to(patients_root / PATIENT_NAME / "Exames de imagem")
 
 
 def test_selection_audit_is_sanitized(tmp_path: Path) -> None:
@@ -907,9 +1509,11 @@ def test_cli_force_manual_option_reaches_importer(tmp_path: Path, monkeypatch) -
             return SimpleNamespace(
                 destination=tmp_path / "destination",
                 manifest_path=tmp_path / "destination" / "manifest.json",
+                onedrive_destination="Pacientes/PACIENTE/Radiologia/exame",
             )
 
     monkeypatch.setattr(supervised_import, "SupervisedRadiologyImporter", FakeImporter)
+    monkeypatch.setattr(main, "build_onedrive_graph_client", lambda: object())
     result = main.main([
         "radiology-import-supervised", "--archive-path", "fixture.zip",
         "--patient-source", "offline", "--force-manual-selection",

@@ -89,6 +89,58 @@ class GmailConnector:
 
         return messages
 
+    def list_provider_notifications(
+        self, *, query: str, max_results: int = 100
+    ) -> list[EmailMessage]:
+        """Pagina notificações de provider sem alterar o limite do piloto legado."""
+        safe_limit = min(max(int(max_results), 1), 500)
+        service = self._get_service()
+        references: list[dict[str, Any]] = []
+        page_token: str | None = None
+        try:
+            while len(references) < safe_limit:
+                arguments: dict[str, Any] = {
+                    "userId": "me", "q": query,
+                    "maxResults": min(100, safe_limit - len(references)),
+                }
+                if page_token:
+                    arguments["pageToken"] = page_token
+                response = service.users().messages().list(**arguments).execute()
+                references.extend(
+                    item for item in response.get("messages", [])
+                    if isinstance(item, dict)
+                )
+                page_token = str(response.get("nextPageToken") or "").strip() or None
+                if not page_token:
+                    break
+        except Exception:
+            raise GmailConnectorError(
+                "A consulta paginada de notificações falhou."
+            ) from None
+        messages = []
+        for reference in references[:safe_limit]:
+            message_id = str(reference.get("id") or "").strip()
+            if not message_id:
+                continue
+            messages.append(self.get_message(message_id))
+        return messages
+
+    def authenticated_account(self) -> str:
+        """Retorna somente o endereço da conta OAuth autenticada."""
+        try:
+            profile = self._get_service().users().getProfile(userId="me").execute()
+            address = str(profile.get("emailAddress") or "").strip()
+        except Exception:
+            raise GmailConnectorError(
+                "Não foi possível identificar a conta Gmail autenticada."
+            ) from None
+        _, parsed = getaddresses([address])[0] if address else ("", "")
+        if not parsed or "@" not in parsed:
+            raise GmailConnectorError(
+                "A conta Gmail autenticada retornou um endereço inválido."
+            )
+        return parsed
+
     def get_message(self, message_id: str) -> EmailMessage:
         """Lê uma mensagem específica em formato completo, sem alterá-la."""
 

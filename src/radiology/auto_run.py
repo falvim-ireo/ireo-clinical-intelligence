@@ -316,22 +316,58 @@ class RadiologyAutoRunner:
             extracted = self.importer.extractor.extract(downloaded.path)
             self.history.update(record_id, "EXTRACTED")
             patient = self._resolve_patient(transfer.patient_name_candidate)
+            payload_files = self.importer._source_files(extracted)
+            dicom_analysis = None
+            if getattr(self.importer, "dicom_reader", None) is not None:
+                dicom_analysis = self.importer.dicom_reader.analyze(
+                    extracted,
+                    confirmed_patient_name=patient.name,
+                    confirmed_patient_id=patient.patient_id,
+                )
+                self.importer.dicom_reader.write_reports(dicom_analysis, extracted)
+                if dicom_analysis.requires_manual_review:
+                    return self._review(
+                        record_id,
+                        summary,
+                        "MULTIPLE_DICOM_PATIENTS",
+                        "DICOM_VALIDATION",
+                    )
             folder = self._resolve_folder(patient)
             files = self.importer._source_files(extracted)
-            destination = self.importer._next_destination(folder)
+            clinical_date = None
+            if dicom_analysis is not None and hasattr(
+                self.importer, "_resolve_clinical_exam_date"
+            ):
+                clinical_date = self.importer._resolve_clinical_exam_date(
+                    dicom_analysis=dicom_analysis,
+                    archive_name=downloaded.path.name,
+                    sender_exam_date=None,
+                    sender_exam_time=None,
+                    email_received_at=message.received_at,
+                    import_started_at=self.importer._utc_datetime(
+                        self.importer.now_provider()
+                    ),
+                )
+            destination = (
+                self.importer._next_destination(folder, clinical_date.exam_date)
+                if clinical_date is not None
+                else self.importer._next_destination(folder)
+            )
             possible = self.history.find_duplicate(archive_filename=downloaded.path.name,
                                                    archive_size=downloaded.size_bytes,
                                                    patient_id=patient.patient_id, destination=destination)
             if possible:
                 return self._review(record_id, summary, "DUPLICATE_POSSIBLE", "DUPLICATE")
             self.history.update(record_id, "READY_FOR_CONFIRMATION", patient_id_hash=fingerprint(patient.patient_id),
-                                destination_fingerprint=fingerprint(destination), file_count=len(files),
-                                total_size=sum(x.stat().st_size for x in files))
+                                destination_fingerprint=fingerprint(destination), file_count=len(payload_files),
+                                total_size=sum(x.stat().st_size for x in payload_files))
             if not self.allow_copy:
                 return self._review(record_id, summary, "AUTO_COPY_DISABLED", "COPY")
             result = self.importer._copy_and_manifest(archive=downloaded.path, extracted=extracted, destination=destination,
-                patient=patient, files=files, total_size=sum(x.stat().st_size for x in files), source="gmail-auto",
+                patient=patient, files=files, total_size=sum(x.stat().st_size for x in payload_files), source="gmail-auto",
                 folder_selection_mode="auto", folder_selection_reason="SINGLE_COMPATIBLE_FOLDER",
+                dicom_analysis=dicom_analysis, clinical_date=clinical_date,
+                payload_file_count=len(payload_files),
                 intake_record={"correlation_id": correlation_id, "archive_sha256": downloaded.sha256,
                                "duplicate_check": "clear", "reimport": False, "previous_record_reference": None})
             self.history.update(record_id, "COMPLETED", manifest_path_fingerprint=fingerprint(result.manifest_path),
@@ -363,10 +399,12 @@ class RadiologyAutoRunner:
                                 resolved.confidence_score, resolved.candidate_count)
 
     def _resolve_folder(self, patient: ConfirmedPatient):
-        matches = self.importer.folder_locator.find_compatible(patient.name)
-        if len(matches) != 1 or self.importer._similar_folder_count(patient.name) != 1:
+        folder, mode, _ = self.importer._choose_patient_folder(
+            patient.name, allow_auto=True
+        )
+        if mode != "auto":
             raise ValueError("FOLDER_REVIEW_REQUIRED")
-        return self.importer.folder_locator.validate_selection(matches[0])
+        return folder
 
     def _review(self, record_id, summary, reason, stage, gmail_message_id=None, correlation_id=None):
         if record_id is None and gmail_message_id and correlation_id:

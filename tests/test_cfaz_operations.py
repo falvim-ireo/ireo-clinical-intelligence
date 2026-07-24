@@ -1,0 +1,472 @@
+"""Cobertura da interface operacional Cfaz da Sprint 15.1."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import main
+import pytest
+
+from acquisition.cfaz_operations import (
+    CfazHistoryRepository, CfazNotificationCatalog,
+)
+from acquisition.service import ProviderAcquisitionService
+from acquisition.cfaz_provider import CfazAmbiguousRequestError
+from core.config import Config
+from models.email_message import EmailMessage
+from radiology.exam_index_service import ExamIndexService
+
+
+def message(request_id: str, patient: str, *, hour: int = 9) -> EmailMessage:
+    return EmailMessage(
+        message_id=f"internal-{request_id}",
+        subject=f"CfazPost - {patient}",
+        sender="SORRIMAGEM <noreply@cfaz.net>", reply_to=None,
+        received_at=datetime(2026, 7, 20, hour, 31, tzinfo=timezone.utc),
+        text_body=(
+            f"Paciente: {patient}\n"
+            f"https://max.cfaz.net/requests/{request_id}"
+        ),
+    )
+
+
+class Gmail:
+    def __init__(self, values): self.values = values; self.calls = []
+    def authenticated_account(self): return "ireoaju.cmj@gmail.com"
+    def list_provider_notifications(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.values
+
+
+def test_catalog_extracts_request_patient_date_deduplicates_and_marks_imported(tmp_path):
+    history = CfazHistoryRepository(tmp_path / "index.db")
+    history.mark_started(
+        request_id="82679", message_id="secret", patient_name="Maria Souza"
+    )
+    history.mark_complete(
+        request_id="82679", patient_name="Maria Souza", duration_seconds=12.5,
+        onedrive_destination="Pacientes/Maria/Radiologia/2026-07-20 - Panorâmica",
+    )
+    gmail = Gmail([
+        message("82678", "João da Silva"),
+        message("82679", "Maria Souza", hour=10),
+        message("82678", "João da Silva", hour=11),
+    ])
+    catalog = CfazNotificationCatalog(
+        gmail=gmail, history=history, query="cfaz-query", limit=100
+    )
+
+    values = catalog.list()
+
+    assert [item.request_id for item in values] == ["82678", "82679"]
+    assert [item.patient_name for item in values] == ["João da Silva", "Maria Souza"]
+    assert [item.imported for item in values] == [False, True]
+    assert [item.request_id for item in catalog.pending(values)] == ["82678"]
+    assert gmail.calls == [{"query": "cfaz-query", "max_results": 100}]
+
+
+def test_catalog_accepts_real_cfazpost_html_and_encoded_redirect(tmp_path):
+    real = EmailMessage(
+        message_id="must-not-be-shown",
+        sender="SORRIMAGEM <noreply@cfaz.net>", reply_to=None,
+        subject="CfazPost - JULIANO GENYSON DE OLIVEIRA",
+        received_at=datetime(2026, 7, 20, 9, 31, tzinfo=timezone.utc),
+        html_body=(
+            '<a href="https://tracker.example/redirect?target='
+            'https%3A%2F%2Fmax.cfaz.net%2Frequests%2F82678%3Fsource%3Demail">'
+            "Abrir pedido</a>"
+        ),
+    )
+    catalog = CfazNotificationCatalog(
+        gmail=Gmail([real]), history=CfazHistoryRepository(tmp_path / "index.db"),
+        query="from:cfaz.net newer_than:365d", limit=100,
+    )
+
+    values = catalog.list()
+
+    assert len(values) == 1
+    assert values[0].request_id == "82678"
+    assert values[0].patient_name == "JULIANO GENYSON DE OLIVEIRA"
+    assert values[0].accepted is True
+    assert catalog.counters.gmail_messages == 1
+    assert catalog.counters.cfazpost_subjects == 1
+    assert catalog.counters.recognized_links == 1
+    assert catalog.counters.operational_notifications == 1
+
+
+def test_recognized_notification_without_request_is_visible_but_not_pending(tmp_path):
+    value = EmailMessage(
+        message_id="hidden", sender="SORRIMAGEM <noreply@cfaz.net>",
+        reply_to=None, subject="cfazpost - FABIANO ALVIM PEREIRA",
+        received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        html_body="<p>Seu pedido está disponível.</p>",
+    )
+    catalog = CfazNotificationCatalog(
+        gmail=Gmail([value]), history=CfazHistoryRepository(tmp_path / "index.db"),
+        query="query", limit=100,
+    )
+
+    listed = catalog.list()
+
+    assert len(listed) == 1
+    assert listed[0].request_id is None
+    assert listed[0].accepted is False
+    assert listed[0].rejection_reason == "link de pedido não encontrado"
+    assert catalog.pending(listed) == []
+
+
+def test_history_persists_success_failure_duration_and_destination(tmp_path):
+    database = tmp_path / "index.db"
+    history = CfazHistoryRepository(database)
+    history.mark_started(request_id="1", message_id="gmail-1", patient_name="Um")
+    history.mark_complete(
+        request_id="1", patient_name="Um", duration_seconds=5.25,
+        onedrive_destination="Pacientes/Um/Radiologia/Exame",
+    )
+    history.mark_started(request_id="2", message_id="gmail-2", patient_name="Dois")
+    history.mark_failed(
+        request_id="2", patient_name="Dois", duration_seconds=2.0,
+        error_code="TimeoutError",
+    )
+
+    reopened = CfazHistoryRepository(database)
+    records = {record.request_id: record for record in reopened.list_records()}
+    assert records["1"].status == "COMPLETE"
+    assert records["1"].duration_seconds == 5.25
+    assert records["1"].onedrive_destination.endswith("/Exame")
+    assert records["2"].status == "FAILED"
+    assert reopened.is_imported("1") is True
+    assert reopened.is_imported("2") is False
+
+
+def test_manual_archive_is_distinct_from_empty_cfaz_acquisition_history(tmp_path):
+    database = tmp_path / "index.db"
+    ExamIndexService(database).index_manifest({
+        "onedrive_destination": "Pacientes/Legado/Radiologia/2020-01-01 - Radiologia",
+        "publication": {
+            "exam_id": "a" * 64,
+            "source_archive_sha256": "b" * 64,
+            "state": "COMPLETE",
+        },
+        "dicom_intelligence": {"studies": [], "alerts": []},
+    }, patient_name="Paciente do acervo manual", source="rebuild")
+    history = CfazHistoryRepository(database)
+
+    # Acervo, timeline e dashboard existentes não constituem aquisição Cfaz.
+    assert history.is_imported("82678") is False
+    with history._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM exams").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM cfaz_import_history").fetchone()[0] == 0
+
+    # IN_PROGRESS ainda pode ser retomado e somente COMPLETE torna o pedido importado.
+    history.mark_started(
+        request_id="82678", message_id="internal", patient_name="Paciente",
+        provider_exam_id="exam-provider-1",
+        provider_request_id="23254315", sequential_id="85871",
+        clinic_number="30510",
+    )
+    assert history.is_imported("82678") is False
+    history.mark_complete(
+        request_id="82678", patient_name="Paciente", duration_seconds=5,
+        onedrive_destination="Pacientes/Paciente/Radiologia/Exame",
+        provider_exam_id="exam-provider-1", acquisition_sha="c" * 64,
+        provider_request_id="23254315", sequential_id="85871",
+        clinic_number="30510",
+    )
+    assert CfazHistoryRepository(database).is_imported("82678") is True
+    record = history.list_records()[0]
+    assert record.provider_exam_id == "exam-provider-1"
+    assert record.acquisition_sha == "c" * 64
+    assert record.import_timestamp
+    assert record.provider_request_id == "23254315"
+    assert record.sequential_id == "85871"
+    assert record.clinic_number == "30510"
+    assert history.is_imported("23254315") is True
+    assert history.is_imported("85871") is True
+    second_run = CfazNotificationCatalog(
+        gmail=Gmail([message("82678", "Paciente")]), history=history,
+        query="query", limit=100,
+    )
+    listed = second_run.list()
+    assert listed[0].imported is True
+    assert second_run.pending(listed) == []
+
+
+def test_provider_service_records_complete_operational_history(tmp_path):
+    request = SimpleNamespace(
+        request_id="82678", patient_name="João", provider_id="cfaz",
+        provider_exam_id=None, exam_date=None,
+        manifest_metadata=lambda: {"provider_id": "cfaz", "request_id": "82678"},
+    )
+    package = SimpleNamespace(
+        request=request, archive_path=tmp_path / "package.zip", sha256="a" * 64,
+    )
+    package.archive_path.write_bytes(b"zip")
+
+    class Provider:
+        def authenticate(self): pass
+        def discover(self, notification): return (request,)
+        def download(self, *args): return package
+        def finalize(self, *args, **kwargs): pass
+
+    class Importer:
+        def run(self, **kwargs):
+            return SimpleNamespace(onedrive_destination="Pacientes/João/Radiologia/Exame")
+
+    clock = iter((10.0, 14.5))
+    history = CfazHistoryRepository(tmp_path / "history.db")
+    ProviderAcquisitionService(
+        provider=Provider(), importer=Importer(), quarantine_root=tmp_path,
+        correlation_id="correlation", history=history,
+        monotonic_provider=lambda: next(clock), output=lambda _: None,
+    ).run(message("82678", "João"))
+
+    record = history.list_records()[0]
+    assert record.status == "COMPLETE"
+    assert record.duration_seconds == 4.5
+    assert record.onedrive_destination.endswith("/Exame")
+
+
+def test_ambiguous_visible_number_is_recorded_without_import(tmp_path):
+    class Provider:
+        def authenticate(self): pass
+        def discover_request(self, value):
+            raise CfazAmbiguousRequestError("ambíguo")
+
+    history = CfazHistoryRepository(tmp_path / "history.db")
+    service = ProviderAcquisitionService(
+        provider=Provider(), importer=object(), quarantine_root=tmp_path,
+        correlation_id="correlation", history=history, output=lambda _: None,
+    )
+
+    with pytest.raises(CfazAmbiguousRequestError):
+        service.run_request_id("85871")
+
+    record = history.list_records()[0]
+    assert record.status == "AMBIGUOUS"
+    assert record.sequential_id == "85871"
+    assert record.provider_request_id is None
+
+
+def test_list_and_history_commands_hide_message_id(tmp_path, monkeypatch, capsys):
+    values = [message("82678", "João da Silva")]
+    database = tmp_path / "index.db"
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
+    monkeypatch.setattr(Config, "CFAZ_GMAIL_QUERY", "query")
+    monkeypatch.setattr(Config, "CFAZ_GMAIL_MAX_MESSAGES", 100)
+    import integrations.gmail_connector as gmail_module
+    monkeypatch.setattr(gmail_module, "GmailConnector", lambda: Gmail(values))
+
+    assert main.main(["cfaz-list-notifications"]) == 0
+    output = capsys.readouterr().out
+    assert "Paciente: João da Silva" in output
+    assert "Pedido: 82678" in output
+    assert "Status: NÃO IMPORTADO" in output
+    assert "internal-82678" not in output
+
+    history = CfazHistoryRepository(database)
+    history.mark_started(request_id="82678", message_id="internal-82678", patient_name="João")
+    history.mark_complete(
+        request_id="82678", patient_name="João", duration_seconds=3.0,
+        onedrive_destination="Pacientes/João/Radiologia/Exame",
+    )
+    assert main.main(["cfaz-history"]) == 0
+    output = capsys.readouterr().out
+    assert "pedido=82678" in output and "status=COMPLETE" in output
+    assert "internal-82678" not in output
+
+
+def test_list_debug_reports_safe_diagnostics_and_effective_query(
+    tmp_path, monkeypatch, capsys,
+):
+    valid = message("82678", "JULIANO GENYSON DE OLIVEIRA")
+    missing = EmailMessage(
+        message_id="raw-secret-id", sender="SORRIMAGEM <noreply@cfaz.net>",
+        reply_to=None, subject="CfazPost - FABIANO ALVIM PEREIRA",
+        received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        html_body="<p>sem link</p>",
+    )
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH",
+                        str(tmp_path / "index.db"))
+    monkeypatch.setattr(Config, "CFAZ_GMAIL_QUERY",
+                        "from:cfaz.net newer_than:365d")
+    import integrations.gmail_connector as gmail_module
+    monkeypatch.setattr(gmail_module, "GmailConnector", lambda: Gmail([valid, missing]))
+
+    assert main.main(["cfaz-list-notifications", "--debug"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Conta Gmail autenticada: ireoaju.cmj@gmail.com" in output
+    assert "Consulta Gmail: from:cfaz.net newer_than:365d" in output
+    assert "Mensagens retornadas pelo Gmail: 2" in output
+    assert "Mensagens com assunto CfazPost: 2" in output
+    assert "Mensagens com link reconhecido: 1" in output
+    assert "Notificações operacionais: 1" in output
+    assert "Request ID encontrado: não" in output
+    assert "Motivo da rejeição: link de pedido não encontrado" in output
+    assert "Status: notificação reconhecida, pedido não identificado" in output
+    assert "raw-secret-id" not in output
+    assert "https://" not in output
+
+def _patch_import_runtime(monkeypatch, values, selected_ids):
+    import acquisition.cfaz_provider as provider_module
+    import acquisition.service as service_module
+    import integrations.gmail_connector as gmail_module
+    import radiology.exam_index_service as index_module
+    import radiology.intake_history as intake_module
+    import radiology.supervised_import as importer_module
+    import repositories.clinicorp_patient_repository as patient_module
+
+    monkeypatch.setattr(gmail_module, "GmailConnector", lambda: Gmail(values))
+    monkeypatch.setattr(provider_module, "CfazProvider", lambda **kwargs: object())
+    monkeypatch.setattr(importer_module, "SupervisedRadiologyImporter",
+                        lambda **kwargs: object())
+    monkeypatch.setattr(index_module, "ExamIndexService", lambda *args: object())
+    monkeypatch.setattr(intake_module, "IntakeHistoryRepository",
+                        lambda *args: object())
+    monkeypatch.setattr(patient_module, "ClinicorpPatientRepository",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(main, "build_onedrive_graph_client", lambda: object())
+    monkeypatch.setattr(main, "ClinicorpAPI", lambda: object())
+
+    class Service:
+        def __init__(self, **kwargs): pass
+        def run(self, notification):
+            request_id = notification.text_body.rsplit("/", 1)[-1]
+            selected_ids.append(request_id)
+            return (SimpleNamespace(onedrive_destination="OneDrive/exame"),)
+        def run_request_id(self, request_id):
+            selected_ids.append(request_id)
+            return (SimpleNamespace(onedrive_destination="OneDrive/exame"),)
+
+    monkeypatch.setattr(service_module, "ProviderAcquisitionService", Service)
+
+
+def test_import_by_request_id_does_not_require_gmail_message_id(
+    tmp_path, monkeypatch, capsys,
+):
+    selected = []
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH",
+                        str(tmp_path / "index.db"))
+    _patch_import_runtime(
+        monkeypatch,
+        [message("82678", "João"), message("82679", "Maria")], selected,
+    )
+    import integrations.gmail_connector as gmail_module
+    import acquisition.cfaz_provider as provider_module
+    provider_options = {}
+    monkeypatch.setattr(
+        provider_module, "CfazProvider",
+        lambda **kwargs: provider_options.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        gmail_module, "GmailConnector",
+        lambda: (_ for _ in ()).throw(AssertionError("Gmail não deve ser acessado")),
+    )
+
+    assert main.main([
+        "radiology-import-from-cfaz", "--request-id", "82679", "--debug-auth",
+        "--debug-payload",
+    ]) == 0
+
+    assert selected == ["82679"]
+    assert provider_options["auth_diagnostics"] is True
+    assert provider_options["payload_diagnostics"] is True
+    assert "internal-82679" not in capsys.readouterr().out
+
+
+def test_explicit_completed_request_stops_before_gmail_or_provider(
+    tmp_path, monkeypatch, capsys,
+):
+    database = tmp_path / "index.db"
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
+    history = CfazHistoryRepository(database)
+    history.mark_complete(
+        request_id="23254315", patient_name="Paciente", duration_seconds=1,
+        onedrive_destination="OneDrive/exame", provider_exam_id="exam-1",
+        acquisition_sha="a" * 64,
+        provider_request_id="23254315", sequential_id="85871",
+        clinic_number="30510",
+    )
+    import integrations.gmail_connector as gmail_module
+    import acquisition.cfaz_provider as provider_module
+    monkeypatch.setattr(
+        gmail_module, "GmailConnector",
+        lambda: (_ for _ in ()).throw(AssertionError("Gmail não deve ser acessado")),
+    )
+    monkeypatch.setattr(
+        provider_module, "CfazProvider",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("API não deve ser acessada")),
+    )
+
+    assert main.main([
+        "radiology-import-from-cfaz", "--request-id", "85871"
+    ]) == 0
+
+    assert "já foi importado" in capsys.readouterr().out
+
+
+def test_select_imports_chosen_pending_notification(tmp_path, monkeypatch):
+    selected = []
+    database = tmp_path / "index.db"
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
+    history = CfazHistoryRepository(database)
+    history.mark_started(request_id="82678", message_id="hidden", patient_name="João")
+    history.mark_complete(
+        request_id="82678", patient_name="João", duration_seconds=1,
+        onedrive_destination="OneDrive/João",
+    )
+    _patch_import_runtime(
+        monkeypatch,
+        [message("82678", "João"), message("82679", "Maria"),
+         message("82680", "José")], selected,
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "2")
+
+    assert main.main(["radiology-import-from-cfaz", "--select"]) == 0
+
+    assert selected == ["82680"]
+
+
+def test_default_imports_all_and_only_pending_notifications(tmp_path, monkeypatch):
+    selected = []
+    database = tmp_path / "index.db"
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
+    history = CfazHistoryRepository(database)
+    history.mark_started(request_id="82679", message_id="hidden", patient_name="Maria")
+    history.mark_complete(
+        request_id="82679", patient_name="Maria", duration_seconds=1,
+        onedrive_destination="OneDrive/Maria",
+    )
+    _patch_import_runtime(
+        monkeypatch,
+        [message("82678", "João"), message("82679", "Maria"),
+         message("82680", "José")], selected,
+    )
+
+    assert main.main(["radiology-import-from-cfaz"]) == 0
+
+    assert selected == ["82678", "82680"]
+
+
+def test_unidentified_notifications_are_not_counted_as_imported(
+    tmp_path, monkeypatch, capsys,
+):
+    unidentified = EmailMessage(
+        message_id="hidden", sender="SORRIMAGEM <noreply@cfaz.net>",
+        reply_to=None, subject="CfazPost - PACIENTE LEGADO",
+        received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        html_body="<p>sem link reconhecível</p>",
+    )
+    monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH",
+                        str(tmp_path / "index.db"))
+    import integrations.gmail_connector as gmail_module
+    monkeypatch.setattr(gmail_module, "GmailConnector", lambda: Gmail([unidentified]))
+
+    assert main.main(["radiology-import-from-cfaz"]) == 0
+
+    output = capsys.readouterr().out
+    assert "0 já importadas" in output
+    assert "1 com pedido não identificado" in output
+    assert "0 novas" in output
