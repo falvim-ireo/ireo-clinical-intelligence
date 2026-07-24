@@ -103,17 +103,17 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
     first_result = repair.repair("85871")
 
     assert first_result.renamed_files == 2
-    clinical_folder = staging / "06 - Documentação"
+    clinical_folder = staging / "06 - Documentos"
     assert (clinical_folder / "documentacao_001.jpg").read_bytes() == first
     assert (clinical_folder / "documentacao_002.jpg").read_bytes() == second
     updated = json.loads(manifest_path.read_text("utf-8"))
     assert sorted(updated["checksums"]) == [
-        "06 - Documentação/documentacao_001.jpg",
-        "06 - Documentação/documentacao_002.jpg",
+        "06 - Documentos/documentacao_001.jpg",
+        "06 - Documentos/documentacao_002.jpg",
     ]
     files = updated["acquisition"]["files"]
     assert files[0]["stored_name"] == "documentacao_001.jpg"
-    assert files[0]["relative_folder"] == "06 - Documentação"
+    assert files[0]["relative_folder"] == "06 - Documentos"
     assert files[0]["clinical_category"] == "DOCUMENTATION"
     assert files[0]["detected_mime"] == "image/jpeg"
     assert files[0]["sha256"] == hashlib.sha256(first).hexdigest()

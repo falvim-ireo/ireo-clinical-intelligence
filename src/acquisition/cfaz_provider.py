@@ -357,6 +357,12 @@ class CfazProvider(AcquisitionProvider):
             file_metadata = {
                 "original_source": asset.source_field or "campo não informado",
                 "source_collection": collection,
+                "provider_section": asset.source_field,
+                "provider_display_name": refined_asset.classification.value,
+                "provider_metadata": {
+                    "provider": request.provider_id,
+                    "provider_request_id": request.provider_request_id or request.request_id,
+                },
                 "source_name": asset.filename,
                 "source_url_hash": hashlib.sha256(
                     asset.download_url.encode("utf-8")

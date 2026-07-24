@@ -7,6 +7,7 @@ from time import monotonic
 
 from acquisition.base import AcquisitionProvider
 from acquisition.cfaz_provider import CfazAmbiguousRequestError
+from acquisition.clinical_normalizer import ClinicalAssetNormalizer
 
 
 class ProviderAcquisitionService:
@@ -78,9 +79,13 @@ class ProviderAcquisitionService:
                     request, self.quarantine_root, self.correlation_id
                 )
                 self.output("Quarentena................... OK")
+                normalizer = ClinicalAssetNormalizer()
+                acquired = normalizer.normalize(acquired)
                 metadata = acquired.request.manifest_metadata()
                 file_metadata = getattr(acquired, "file_metadata", ())
                 metadata["files"] = [dict(item) for item in file_metadata]
+                clinical_package = normalizer.to_clinical_package(acquired)
+                metadata["clinical_package"] = clinical_package.to_manifest()
                 exam_date = request.exam_date.date() if request.exam_date else None
                 result = self.importer.run(
                     archive_path=acquired.archive_path,

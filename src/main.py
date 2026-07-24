@@ -446,6 +446,64 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             print("Nenhuma execução automática registrada.")
             return 1
 
+    if arguments and arguments[0] == "clinical-assets":
+        import json
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence clinical-assets")
+        parser.add_argument("--patient")
+        parser.add_argument("--provider")
+        parser.add_argument("--category")
+        try:
+            options = parser.parse_args(arguments[1:])
+            index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            for asset in index.clinical_assets(
+                patient_id=options.patient, provider=options.provider,
+                clinical_category=options.category,
+            ):
+                print(json.dumps(asset, ensure_ascii=False, default=str))
+            return 0
+        except (SystemExit, ValueError) as exc:
+            return int(exc.code or 0) if isinstance(exc, SystemExit) else 1
+
+    if arguments and arguments[0] == "clinical-assets-rebuild":
+        import json
+        from pathlib import Path
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexError, ExamIndexService
+        try:
+            index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            staging = Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH).expanduser() / "supervised-staging"
+            indexed = 0
+            for manifest_path in staging.rglob("manifest.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                publication = manifest.get("publication")
+                if not isinstance(publication, dict) or str(publication.get("state", "")).upper() != "COMPLETE":
+                    continue
+                # Somente manifestos locais; nenhum provider ou rede é consultado.
+                index.index_manifest(manifest, source="clinical-assets-rebuild")
+                indexed += len(
+                    (manifest.get("clinical_package") or {}).get("assets", [])
+                    if isinstance(manifest.get("clinical_package"), dict)
+                    else manifest.get("assets", [])
+                )
+            print(f"Banco: {index.database_path}")
+            print(f"Assets indexados: {indexed}")
+            with index._connect() as db:
+                patients = db.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+                exams = db.execute("SELECT COUNT(*) FROM exams").fetchone()[0]
+                assets = db.execute("SELECT COUNT(*) FROM clinical_assets").fetchone()[0]
+            print(f"Pacientes: {patients}")
+            print(f"Pedidos: {exams}")
+            print(f"Assets: {assets}")
+            return 0
+        except (ExamIndexError, OSError) as exc:
+            print(f"Rebuild de clinical_assets não concluído: {exc}")
+            return 1
+
     if arguments and arguments[0] == "rebuild-radiology-index":
         from core.config import Config
         from integrations.onedrive_graph import OneDriveGraphError

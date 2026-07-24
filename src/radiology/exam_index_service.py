@@ -164,6 +164,20 @@ class ExamIndexService:
                     normalized_at TEXT,
                     PRIMARY KEY(exam_id, asset_index)
                 );
+                CREATE TABLE IF NOT EXISTS clinical_assets (
+                    asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exam_id TEXT NOT NULL REFERENCES exams(exam_id) ON DELETE CASCADE,
+                    provider TEXT, provider_request_id TEXT, sequential_id TEXT,
+                    patient_id TEXT NOT NULL REFERENCES patients(patient_key),
+                    clinical_category TEXT NOT NULL, provider_collection TEXT,
+                    provider_section TEXT, provider_display_name TEXT,
+                    stored_name TEXT NOT NULL, relative_path TEXT NOT NULL,
+                    mime_type TEXT, extension TEXT, size_bytes INTEGER,
+                    sha256 TEXT, width INTEGER, height INTEGER,
+                    is_thumbnail INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, normalized_at TEXT,
+                    UNIQUE(exam_id, sha256, relative_path)
+                );
                 CREATE TABLE IF NOT EXISTS consistency_issues (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     exam_id TEXT NOT NULL REFERENCES exams(exam_id) ON DELETE CASCADE,
@@ -183,6 +197,11 @@ class ExamIndexService:
                 CREATE INDEX IF NOT EXISTS idx_studies_uid ON studies(study_instance_uid);
                 CREATE INDEX IF NOT EXISTS idx_series_uid ON series(series_instance_uid);
                 CREATE INDEX IF NOT EXISTS idx_history_state ON import_history(state, indexed_at);
+                CREATE INDEX IF NOT EXISTS idx_clinical_assets_patient ON clinical_assets(patient_id);
+                CREATE INDEX IF NOT EXISTS idx_clinical_assets_request ON clinical_assets(provider_request_id);
+                CREATE INDEX IF NOT EXISTS idx_clinical_assets_category ON clinical_assets(clinical_category);
+                CREATE INDEX IF NOT EXISTS idx_clinical_assets_provider ON clinical_assets(provider);
+                CREATE INDEX IF NOT EXISTS idx_clinical_assets_sha ON clinical_assets(sha256);
                 """
             )
             db.execute(
@@ -306,6 +325,45 @@ class ExamIndexService:
                             _text(asset.get("duplicate_of")),
                             _text(asset.get("normalized_at")),
                         ),
+                    )
+                package = manifest.get("clinical_package")
+                package_assets = package.get("assets") if isinstance(package, dict) else None
+                clinical_assets = package_assets if isinstance(package_assets, list) else manifest.get("assets", [])
+                db.execute("DELETE FROM clinical_assets WHERE exam_id=?", (exam_id,))
+                request_meta = manifest.get("request") if isinstance(manifest.get("request"), dict) else {}
+                acquisition_meta = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+                provider = _text(manifest.get("provider") or acquisition_meta.get("provider_id"))
+                provider_request_id = _text(request_meta.get("provider_request_id") or acquisition_meta.get("provider_request_id"))
+                sequential_id = _text(request_meta.get("sequential_id") or acquisition_meta.get("sequential_id"))
+                for asset in clinical_assets:
+                    if not isinstance(asset, dict):
+                        continue
+                    stored = _text(asset.get("stored_name") or asset.get("normalized_filename")) or "asset"
+                    folder = _text(asset.get("relative_folder")) or ""
+                    relative_path = f"{folder}/{stored}" if folder else stored
+                    db.execute(
+                        """INSERT INTO clinical_assets(
+                        exam_id,provider,provider_request_id,sequential_id,patient_id,
+                        clinical_category,provider_collection,provider_section,provider_display_name,
+                        stored_name,relative_path,mime_type,extension,size_bytes,sha256,width,height,
+                        is_thumbnail,created_at,normalized_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(exam_id,sha256,relative_path) DO UPDATE SET
+                        clinical_category=excluded.clinical_category,provider_collection=excluded.provider_collection,
+                        provider_section=excluded.provider_section,provider_display_name=excluded.provider_display_name,
+                        stored_name=excluded.stored_name,mime_type=excluded.mime_type,extension=excluded.extension,
+                        size_bytes=excluded.size_bytes,width=excluded.width,height=excluded.height,
+                        is_thumbnail=excluded.is_thumbnail,normalized_at=excluded.normalized_at""",
+                        (exam_id, provider, provider_request_id, sequential_id, patient_key,
+                         _text(asset.get("clinical_category")) or "UNKNOWN",
+                         _text(asset.get("provider_collection") or asset.get("source_collection")),
+                         _text(asset.get("provider_section")), _text(asset.get("provider_display_name")),
+                         stored, relative_path,
+                         _text(asset.get("mime_type") or asset.get("detected_mime")),
+                         _text(asset.get("extension") or asset.get("detected_extension")),
+                         asset.get("size") or asset.get("size_bytes"), _text(asset.get("sha256")),
+                         asset.get("width"), asset.get("height"),
+                         int(bool(asset.get("thumbnail", asset.get("is_thumbnail")))), now,
+                         _text(asset.get("normalized_at"))),
                     )
                 for study_index, study in enumerate(studies, 1):
                     study_uid = _text(study.get("study_instance_uid")) or f"MISSING-STUDY-{study_index}"
@@ -449,6 +507,29 @@ class ExamIndexService:
 
     def find_by_series_uid(self, uid: str) -> list[IndexedExam]:
         return self._query("EXISTS(SELECT 1 FROM series s WHERE s.exam_id=e.exam_id AND s.series_instance_uid=?)", (uid,))
+
+    def clinical_assets(self, *, patient_id: str | None = None,
+                        provider_request_id: str | None = None,
+                        clinical_category: str | None = None,
+                        provider: str | None = None,
+                        sha256: str | None = None) -> list[dict[str, Any]]:
+        clauses, values = ["1=1"], []
+        if patient_id and len(patient_id) != 64:
+            patient_id = hashlib.sha256(
+                PatientNormalizer.compare_ready(patient_id).encode("utf-8")
+            ).hexdigest()
+        for column, value in (("patient_id", patient_id),
+                              ("provider_request_id", provider_request_id),
+                              ("clinical_category", clinical_category),
+                              ("provider", provider), ("sha256", sha256)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM clinical_assets WHERE " + " AND ".join(clauses)
+                + " ORDER BY exam_id,asset_id", values
+            )]
 
     def timeline(self, patient_name: str) -> list[IndexedExam]:
         return self.find_by_patient(patient_name)

@@ -14,6 +14,10 @@ from typing import Any, Callable
 import zipfile
 
 from acquisition.base import AcquiredPackage, AcquisitionError
+from acquisition.models.clinical_package import (
+    ClinicalAsset as ContractClinicalAsset,
+    ClinicalPackage as ContractClinicalPackage,
+)
 
 
 class ClinicalCategory(StrEnum):
@@ -33,7 +37,7 @@ CLINICAL_FOLDERS = {
     ClinicalCategory.TOMOGRAPHY: "03 - Tomografia",
     ClinicalCategory.DIGITAL_MODEL: "04 - Modelos Digitais",
     ClinicalCategory.REPORT: "05 - Laudos",
-    ClinicalCategory.DOCUMENTATION: "06 - Documentação",
+    ClinicalCategory.DOCUMENTATION: "06 - Documentos",
     ClinicalCategory.AUXILIARY: "07 - Arquivos Auxiliares",
     ClinicalCategory.UNKNOWN: "07 - Arquivos Auxiliares",
 }
@@ -118,6 +122,53 @@ class ClinicalAssetNormalizer:
             file_metadata=metadata,
         )
 
+    def to_clinical_package(self, acquired: AcquiredPackage) -> ContractClinicalPackage:
+        """Expõe o contrato provider-neutral sem descartar metadados do provider."""
+        request = acquired.request
+        assets = tuple(
+            ContractClinicalAsset.from_mapping(dict(item), provider=request.provider_id)
+            for item in getattr(acquired, "file_metadata", ())
+            if isinstance(item, dict)
+        )
+        # O contrato oficial conserva a coleção e aplica o mapeamento único;
+        # MIME nunca é usado como categoria clínica isoladamente.
+        enriched = []
+        for asset in assets:
+            category, _ = self._category(
+                asset.provider_collection,
+                DetectedFormat(asset.mime_type, asset.extension,
+                               "IMAGE" if asset.mime_type.startswith("image/") else
+                               "DICOM" if asset.mime_type == "application/dicom" else
+                               "DIGITAL_MODEL" if asset.mime_type.startswith("model/") else
+                               "DOCUMENT",
+                               asset.width, asset.height),
+                asset.original_filename or asset.normalized_filename,
+            )
+            if category.value != asset.clinical_category:
+                asset = replace(asset, clinical_category=category.value)
+            enriched.append(asset)
+        metadata = request.manifest_metadata()
+        metadata.update({
+            "provider_name": request.provider_id,
+            "provider_internal_id": (
+                getattr(request, "provider_request_id", None)
+                or request.request_id
+            ),
+        })
+        return ContractClinicalPackage(
+            provider=request.provider_id,
+            provider_request_id=(getattr(request, "provider_request_id", None) or request.request_id),
+            provider_internal_id=getattr(request, "provider_request_id", None),
+            sequential_id=getattr(request, "sequential_id", None),
+            clinic_number=getattr(request, "clinic_number", None),
+            patient=request.patient_name,
+            exam_date=request.exam_date.isoformat() if request.exam_date else None,
+            provider_name=request.provider_id,
+            assets=tuple(enriched),
+            manifest={"normalizer_version": self.VERSION},
+            metadata=metadata,
+        )
+
     def _normalize_zip(self, acquired: AcquiredPackage) -> ClinicalPackage:
         archive = Path(acquired.archive_path)
         work = archive.parent / f".{archive.stem}-clinical-v16"
@@ -135,7 +186,9 @@ class ClinicalAssetNormalizer:
         try:
             with zipfile.ZipFile(archive) as source:
                 entries = [item for item in source.infolist() if not item.is_dir()]
-                for entry in sorted(entries, key=lambda item: item.filename.casefold()):
+                # A ordem do ZIP é a ordem fornecida pelo provider; ela é
+                # significativa para nomes determinísticos e auditoria.
+                for entry in entries:
                     relative = PurePosixPath(entry.filename)
                     if (
                         relative.is_absolute()
@@ -172,6 +225,12 @@ class ClinicalAssetNormalizer:
                         source_collection, detected, relative.name
                     )
                     folder = CLINICAL_FOLDERS[category]
+                    if category == ClinicalCategory.TOMOGRAPHY and detected.asset_type == "DICOM":
+                        folder += "/DICOM"
+                    elif category == ClinicalCategory.TOMOGRAPHY and self._thumbnail_hint(
+                        source_collection, relative.name
+                    ):
+                        folder += "/Preview"
                     if category == ClinicalCategory.REPORT and (
                         "associated_images" in source_collection
                         or "associated_images_download_links" in source_collection
@@ -347,9 +406,15 @@ class ClinicalAssetNormalizer:
         source: str, detected: DetectedFormat, name: str
     ) -> tuple[ClinicalCategory, str]:
         value = f"{source} {name}".casefold()
-        if "associated_images" in value or "reports" in value or "laudo" in value:
+        if "associated_images_download_links" in value:
             return ClinicalCategory.REPORT, "REPORT_ASSOCIATED_IMAGE"
-        if "tomograph" in value or detected.asset_type == "DICOM":
+        if value.strip().startswith("reports") or "laudo" in value or detected.mime == "application/pdf":
+            return ClinicalCategory.REPORT, "REPORT"
+        if any(term in value for term in ("frontal_facials", "lateral_facials", "fotograf", "intraoral", "extraoral")):
+            return ClinicalCategory.PHOTOGRAPH, "FACIAL_PROFILE" if "lateral" in value else "FACIAL_FRONTAL"
+        if any(term in value for term in ("frontals", "teleradiograph", "carpal", "periap", "panoramic", "bitewing")):
+            return ClinicalCategory.RADIOGRAPH, "CEPHALOMETRIC" if "teleradiograph" in value else "RADIOGRAPH"
+        if any(term in value for term in ("tomograph", "tomographies")) or detected.asset_type == "DICOM":
             return ClinicalCategory.TOMOGRAPHY, "DICOM_SERIES"
         if any(term in value for term in ("dental_models", "digital_models")) or (
             detected.asset_type == "DIGITAL_MODEL"
@@ -370,8 +435,6 @@ class ClinicalAssetNormalizer:
             )
             return ClinicalCategory.RADIOGRAPH, subtype
         if "implant" in value:
-            return ClinicalCategory.DOCUMENTATION, "DOCUMENTATION"
-        if detected.mime == "application/pdf":
             return ClinicalCategory.DOCUMENTATION, "DOCUMENTATION"
         if detected.asset_type in {"IMAGE", "DOCUMENT"}:
             return ClinicalCategory.DOCUMENTATION, "DOCUMENTATION"
