@@ -47,5 +47,16 @@ data/radiology_auto_run.lock
 # Microsoft Graph token cache
 .ms_graph_token_cache.json
 
+# macOS
+.DS_Store
+
+# Gmail OAuth
+gmail_credentials*.json
+gmail_token*.json
+
+# local credentials
+*.credentials.json
+*.token.json
+
 # Microsoft Graph token cache
 .ms_graph_token_cache.json
