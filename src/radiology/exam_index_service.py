@@ -531,8 +531,130 @@ class ExamIndexService:
                 + " ORDER BY exam_id,asset_id", values
             )]
 
+    def search_assets(self, *, patient: str | None = None,
+                      category: str | None = None, provider: str | None = None,
+                      after: str | None = None, before: str | None = None) -> list[dict[str, Any]]:
+        clauses, values = ["1=1"], []
+        if patient:
+            clauses.append("p.normalized_name LIKE ?")
+            values.append(f"%{PatientNormalizer.compare_ready(patient)}%")
+        if category:
+            clauses.append("LOWER(c.clinical_category) LIKE ?")
+            values.append(f"%{category.strip().casefold()}%")
+        if provider:
+            clauses.append("LOWER(COALESCE(c.provider,''))=?")
+            values.append(provider.strip().casefold())
+        if after:
+            clauses.append("e.exam_date>=?"); values.append(after)
+        if before:
+            clauses.append("e.exam_date<=?"); values.append(before)
+        sql = """SELECT p.display_name patient, e.exam_date date,
+                 c.clinical_category category, c.provider provider,
+                 COUNT(*) quantity, e.onedrive_destination onedrive
+                 FROM clinical_assets c JOIN exams e ON e.exam_id=c.exam_id
+                 JOIN patients p ON p.patient_key=c.patient_id
+                 WHERE """ + " AND ".join(clauses) + \
+              " GROUP BY p.display_name,e.exam_date,c.clinical_category,c.provider,e.onedrive_destination ORDER BY e.exam_date,p.display_name"
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(sql, values)]
+
+    def patient_summary(self, patient_name: str) -> dict[str, Any]:
+        patient_key = hashlib.sha256(
+            PatientNormalizer.compare_ready(patient_name).encode("utf-8")
+        ).hexdigest()
+        with self._connect() as db:
+            exams = db.execute(
+                "SELECT COUNT(*) total, MIN(exam_date) first_date, MAX(exam_date) last_date "
+                "FROM exams WHERE patient_key=?", (patient_key,)
+            ).fetchone()
+            rows = db.execute(
+                "SELECT clinical_category,COUNT(*) total FROM clinical_assets "
+                "WHERE patient_id=? GROUP BY clinical_category", (patient_key,)
+            ).fetchall()
+            dicom = db.execute(
+                "SELECT COUNT(*) FROM clinical_assets WHERE patient_id=? AND "
+                "(LOWER(COALESCE(mime_type,''))='application/dicom' OR LOWER(COALESCE(extension,''))='.dcm')",
+                (patient_key,),
+            ).fetchone()[0]
+            stl = db.execute(
+                "SELECT COUNT(*) FROM clinical_assets WHERE patient_id=? AND LOWER(COALESCE(extension,''))='.stl'",
+                (patient_key,),
+            ).fetchone()[0]
+        counts = {str(row["clinical_category"]): int(row["total"]) for row in rows}
+        return {
+            "exams": int(exams["total"] or 0), "first_date": exams["first_date"],
+            "last_date": exams["last_date"], "radiographs": counts.get("RADIOGRAPH", 0),
+            "photographs": counts.get("PHOTOGRAPH", 0), "tomographies": counts.get("TOMOGRAPHY", 0),
+            "dicom": int(dicom), "stl": int(stl), "digital_models": counts.get("DIGITAL_MODEL", 0),
+            "reports": counts.get("REPORT", 0),
+        }
+
+    def clinical_dashboard(self) -> dict[str, Any]:
+        """Estatísticas somente leitura derivadas exclusivamente de clinical_assets."""
+        with self._connect() as db:
+            totals = db.execute(
+                "SELECT COUNT(DISTINCT patient_id), COUNT(DISTINCT exam_id), COUNT(*) "
+                "FROM clinical_assets"
+            ).fetchone()
+            categories = {
+                str(row["clinical_category"]): int(row["total"])
+                for row in db.execute(
+                    "SELECT clinical_category,COUNT(*) total FROM clinical_assets "
+                    "GROUP BY clinical_category"
+                )
+            }
+            dicom = db.execute(
+                "SELECT COUNT(*) FROM clinical_assets WHERE LOWER(COALESCE(mime_type,''))='application/dicom' "
+                "OR LOWER(COALESCE(extension,''))='.dcm'"
+            ).fetchone()[0]
+            digital = db.execute(
+                "SELECT COUNT(*) FROM clinical_assets WHERE clinical_category='DIGITAL_MODEL'"
+            ).fetchone()[0]
+            last = db.execute("SELECT MAX(created_at) FROM clinical_assets").fetchone()[0]
+            duplicate = db.execute(
+                "SELECT COUNT(*) FROM clinical_assets WHERE is_thumbnail=0 AND sha256 IN "
+                "(SELECT sha256 FROM clinical_assets WHERE sha256 IS NOT NULL GROUP BY sha256 HAVING COUNT(*)>1)"
+            ).fetchone()[0]
+        return {
+            "patients": int(totals[0] or 0), "exams": int(totals[1] or 0),
+            "assets": int(totals[2] or 0), "radiographs": categories.get("RADIOGRAPH", 0),
+            "photographs": categories.get("PHOTOGRAPH", 0), "tomographies": categories.get("TOMOGRAPHY", 0),
+            "dicom": int(dicom), "digital_models": int(digital), "reports": categories.get("REPORT", 0),
+            "last_import": last, "orphan_assets": 0, "duplicates": int(duplicate),
+        }
+
     def timeline(self, patient_name: str) -> list[IndexedExam]:
         return self.find_by_patient(patient_name)
+
+    def clinical_timeline(self, patient_name: str) -> list[dict[str, Any]]:
+        """Retorna eventos clínicos agregados somente do índice local."""
+        exams = self.find_by_patient(patient_name)
+        result: list[dict[str, Any]] = []
+        for exam in exams:
+            with self._connect() as db:
+                rows = db.execute(
+                    "SELECT clinical_category,COUNT(*) AS total FROM clinical_assets "
+                    "WHERE exam_id=? GROUP BY clinical_category", (exam.exam_id,)
+                ).fetchall()
+                request = db.execute(
+                    "SELECT provider,provider_request_id,sequential_id FROM clinical_assets "
+                    "WHERE exam_id=? ORDER BY asset_id LIMIT 1", (exam.exam_id,)
+                ).fetchone()
+            counts = {str(row["clinical_category"]): int(row["total"]) for row in rows}
+            result.append({
+                "exam_id": exam.exam_id,
+                "date": exam.exam_date or "Data não informada",
+                "provider": request["provider"] if request else None,
+                "provider_request_id": request["provider_request_id"] if request else None,
+                "sequential_id": request["sequential_id"] if request else None,
+                "counts": counts,
+                "status": exam.status,
+            })
+        return sorted(result, key=lambda item: (
+            item["date"],
+            ",".join(sorted(item["counts"])),
+            str(item["provider"] or ""),
+        ))
 
     def consistency_issues(self, exam_id: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as db:

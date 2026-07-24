@@ -446,6 +446,72 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             print("Nenhuma execução automática registrada.")
             return 1
 
+    if arguments and arguments[0] == "find-assets":
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence find-assets")
+        parser.add_argument("--patient")
+        parser.add_argument("--category")
+        parser.add_argument("--provider")
+        parser.add_argument("--after")
+        parser.add_argument("--before")
+        try:
+            options = parser.parse_args(arguments[1:])
+            index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            rows = index.search_assets(
+                patient=options.patient, category=options.category,
+                provider=options.provider, after=options.after, before=options.before,
+            )
+            print("Paciente | Data | Categoria | Provider | Quantidade | OneDrive")
+            for row in rows:
+                print(
+                    f"{row['patient']} | {row['date'] or 'não informada'} | "
+                    f"{row['category']} | {row['provider'] or 'não informado'} | "
+                    f"{row['quantity']} | {row['onedrive'] or 'não informado'}"
+                )
+            if not rows:
+                print("Nenhum asset encontrado.")
+            return 0
+        except SystemExit as exc:
+            return int(exc.code or 0)
+
+    if arguments and arguments[0] == "patient-summary":
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence patient-summary")
+        parser.add_argument("--patient", required=True)
+        try:
+            options = parser.parse_args(arguments[1:])
+            summary = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH).patient_summary(options.patient)
+            print(f"Paciente\n\nExames:\n    {summary['exams']}\n")
+            for label, key in (
+                ("Radiografias", "radiographs"), ("Fotografias", "photographs"),
+                ("Tomografias", "tomographies"), ("DICOM", "dicom"),
+                ("Modelos STL", "stl"), ("Laudos", "reports"),
+            ):
+                print(f"{label}:\n    {summary[key]}\n")
+            first = str(summary["first_date"] or "não informado")[:4]
+            last = str(summary["last_date"] or "não informado")[:4]
+            print(f"Primeiro exame:\n{first}\n\nÚltimo exame:\n{last}")
+            return 0
+        except SystemExit as exc:
+            return int(exc.code or 0)
+
+    if arguments and arguments[0] == "dashboard":
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        summary = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH).clinical_dashboard()
+        for label, key in (
+            ("Pacientes", "patients"), ("Pedidos", "exams"), ("Assets", "assets"),
+            ("Radiografias", "radiographs"), ("Fotografias", "photographs"),
+            ("Tomografias", "tomographies"), ("DICOM", "dicom"),
+            ("Modelos Digitais", "digital_models"), ("Laudos", "reports"),
+            ("Última importação", "last_import"), ("Assets órfãos", "orphan_assets"),
+            ("Duplicados", "duplicates"),
+        ):
+            print(f"{label}: {summary[key] if summary[key] is not None else 'não informado'}")
+        return 0
+
     if arguments and arguments[0] == "clinical-assets":
         import json
         from core.config import Config
@@ -503,6 +569,35 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         except (ExamIndexError, OSError) as exc:
             print(f"Rebuild de clinical_assets não concluído: {exc}")
             return 1
+
+    if arguments and arguments[0] == "patient-timeline":
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence patient-timeline")
+        parser.add_argument("--patient", required=True)
+        try:
+            options = parser.parse_args(arguments[1:])
+            index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            events = index.clinical_timeline(options.patient)
+            print(f"Paciente\n{'─' * 36}\n")
+            labels = {
+                "RADIOGRAPH": "Radiografias", "PHOTOGRAPH": "Fotografias",
+                "REPORT": "Laudos", "DIGITAL_MODEL": "Modelos Digitais",
+                "TOMOGRAPHY": "Tomografias", "DOCUMENTATION": "Documentação",
+                "AUXILIARY": "Arquivos Auxiliares", "UNKNOWN": "Não classificados",
+            }
+            for event in events:
+                print(event["date"])
+                print("Documentação Radiológica\n")
+                for category, label in labels.items():
+                    print(f"{label}\n    {event['counts'].get(category, 0)} arquivos\n")
+                print(f"Provider\n    {event['provider'] or 'não informado'}\n")
+                print(f"Pedido\n    {event['provider_request_id'] or event['sequential_id'] or 'não informado'}\n")
+            if not events:
+                print("Nenhum exame indexado encontrado.")
+            return 0
+        except SystemExit as exc:
+            return int(exc.code or 0)
 
     if arguments and arguments[0] == "rebuild-radiology-index":
         from core.config import Config
