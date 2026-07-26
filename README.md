@@ -10,6 +10,8 @@ O contexto técnico oficial, a arquitetura vigente, o histórico de Sprints,
 schemas, comandos, decisões, bugs e a próxima tarefa única estão no
 [Documento Mestre de Engenharia](docs/ENGINEERING_MASTER.md). Ele é a fonte
 única de verdade do projeto e deve ser atualizado ao final de cada Sprint.
+Os registros especializados das Sprints 16.1–17.8 estão em
+[`docs/history/`](docs/history/README.md).
 
 ## Fluxo
 

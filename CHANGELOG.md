@@ -4,6 +4,11 @@
 
 ### Added
 
+- histórico técnico reconstruído das Sprints 16.1–17.8 em `docs/history/`,
+  usando o livro histórico do projeto, Git, código e testes
+- documentação arquitetural do `ClinicalPackage`, camada de consultas,
+  filtragem de thumbnails, descoberta/aquisição de modelos digitais Cfaz e
+  reset/reimportação
 - modo `radiology-auto-run` fail-closed, fila SQLite `REVIEW_REQUIRED` e resumo sanitizado da execução agendada
 - download TransferNow headless opcional, filtro de data inicial, relatório de pendências e lock do agendador Windows
 - comandos `intake-review-list` e `radiology-auto-status`, além do script Windows `scripts/run_radiology_auto.ps1`

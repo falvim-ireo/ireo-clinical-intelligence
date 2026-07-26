@@ -2,47 +2,71 @@
 
 ## Objetivo
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Criar a Clinical Timeline por paciente sobre os ativos indexados.
 
 ## Motivação
 
-Dar continuidade à camada clínica após o commit agregado da Sprint 17
-(`d065a6f`). A finalidade individual de 17.1 não foi preservada.
+Até a Sprint 16, o projeto possuía infraestrutura de aquisição e persistência,
+mas o usuário ainda não tinha uma visão longitudinal navegável. A Sprint 17
+deveria tornar os dados utilizáveis antes de introduzir IA.
 
 ## Arquitetura afetada
 
-Existe evidência agregada posterior em aquisição Cfaz, modelos digitais, CLI e
-índice. A parcela pertencente a 17.1 é **PENDENTE DE DOCUMENTAÇÃO**.
+Somente a camada de consulta:
+
+```text
+clinical_assets + exams + patients
+  → ExamIndexService
+  → patient-timeline
+```
+
+Não acessa provider, manifesto, OneDrive, Gmail, Clinicorp ou IA.
 
 ## Arquivos alterados
 
-Não atribuíveis individualmente. Estado agregado: `src/acquisition/`,
-`src/main.py`, `src/radiology/exam_index_service.py` e testes Cfaz.
+- `src/radiology/exam_index_service.py`;
+- `src/main.py`;
+- testes do índice/consulta.
+
+O diff individual não foi preservado em commit próprio.
 
 ## Comandos criados
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+```bash
+python -m main patient-timeline --patient "Nome do paciente"
+```
+
+Ordena por data, tipo e provider e apresenta categorias, quantidades e pedido.
 
 ## Problemas encontrados
 
-Ausência de commit/checkpoint individual.
+Ativos históricos estavam fielmente classificados como `DOCUMENTATION` quando
+não havia metadado suficiente; a consulta não deveria reinterpretá-los.
 
 ## Problemas resolvidos
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Foi criada uma timeline somente leitura, independente da aquisição e baseada
+exclusivamente no SQLite.
 
 ## Critérios de aceite
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+- banco vazio e paciente inexistente não falham;
+- ordenação cronológica;
+- múltiplos exames/providers;
+- nenhuma escrita ou chamada externa;
+- nenhuma heurística de reclassificação.
+
+Validação histórica: 492 testes aprovados, 2 ignorados e `git diff --check`.
 
 ## Resultado alcançado
 
-Sprint declarada como implementada, sem evidência que separe seu incremento.
+Timeline implementada e validada com pacientes reais já indexados, refletindo
+exatamente as categorias persistidas.
 
 ## Limitações
 
-Não atribuir comandos ou módulos específicos por ordem presumida.
+A qualidade da timeline depende da qualidade histórica de `clinical_assets`.
 
 ## Próximo Sprint
 
-Sprint 17.2.
+Sprint 17.2 — Clinical Search.

@@ -2,82 +2,97 @@
 
 ## Objetivo
 
-Consolidar o estado implementado até 17.8. A decomposição exata do incremento
-desta Sprint é **PENDENTE DE DOCUMENTAÇÃO**.
+Permitir reset local e reimportação controlada de um único pedido Cfaz,
+preservando auditoria e sem exclusão remota.
 
 ## Motivação
 
-Estabilizar o repositório clínico após uma sequência de Sprints sem commits
-individuais e recuperar rastreabilidade sem reescrever o Git.
+A homologação de modelos digitais exigia repetir um pedido como importação
+virgem, sem editar SQLite/manifests manualmente, sem afetar outros pacientes e
+sem duplicar dados no OneDrive.
 
 ## Arquitetura afetada
 
-Estado agregado observado:
-
-- aquisição e inventário Cfaz;
-- sessão browser e observação de downloads;
-- identificação/coleção de modelos digitais;
-- extensão de `ClinicalPackage` com IDs de modelo/STL;
-- CLI de diagnóstico, reprocessamento, reimportação e reset;
-- projeção/consulta em `clinical_assets`;
-- testes offline dos novos fluxos.
-
-Não é possível afirmar que todas essas mudanças nasceram especificamente em
-17.8; elas compõem o estado consolidado através de 17.8.
+```text
+cfaz-reset
+  → inventário dry-run por request
+  → clinical_assets/exams/manifests/caches/intake
+  → preservação cfaz_import_history como READY_FOR_REIMPORT
+  → nenhuma exclusão OneDrive
+  → nova aquisição/reconciliação idempotente
+```
 
 ## Arquivos alterados
 
-O conjunto exato será preservado pelo commit
-`feat: consolidate implementation through Sprint 17.8`. Antes dele, o estado
-local inclui arquivos modificados em `src/acquisition`, `src/main.py`,
-`src/radiology`, `pyproject.toml` e testes, além de novos módulos/testes Cfaz.
+- `src/main.py`;
+- `src/acquisition/cfaz_operations.py`;
+- `src/radiology/intake_history.py`;
+- `src/radiology/exam_index_service.py`;
+- módulos de modelos digitais/coleção/sessão;
+- testes de reset, inventário, modelos e idempotência.
+
+O estado final dessas alterações foi preservado no commit consolidado
+`18540ea`.
 
 ## Comandos criados
 
-Estado agregado inclui `thumbnail-report`, `cfaz-reprocess`,
-`cfaz-browser-login`, `cfaz-download-models`,
-`cfaz-digital-models-identify`,
-`cfaz-digital-models-collection-identify`, `cfaz-reimport`,
-`cfaz-digital-models`, `cfaz-reset`, `clinical-assets`,
-`clinical-assets-rebuild`, `patient-timeline`, `find-assets`,
-`patient-summary` e `dashboard`. A Sprint individual de origem de cada comando
-é **PENDENTE DE DOCUMENTAÇÃO**.
+```bash
+python -m main cfaz-reset --request-id ID --dry-run
+python -m main cfaz-reset --request-id ID --apply
+```
+
+Também foram construídos/experimentados fluxos de `cfaz-reimport`,
+`cfaz-download-models`, identificação e collection-identify.
 
 ## Problemas encontrados
 
-- ausência de commits 16.2 e 17.1–17.8;
-- downloads de modelos dependentes de sessão/browser/Google Storage;
-- necessidade de validar ZIP/STL por conteúdo;
-- thumbnails genéricos contaminando inventário;
-- identidade de paciente fragmentada no índice;
-- reset/reimportação exigindo preservação de auditoria.
+- primeira versão limpava `cfaz_import_history`, `clinical_assets`, `exams` e
+  manifesto, mas deixava um intake `COMPLETED`;
+- a segunda camada de idempotência bloqueava por `DESTINATION`;
+- reimportação baixava novamente e parava antes da publicação;
+- destino remoto existente precisava ser reconciliado, nunca duplicado;
+- histórico precisava ser preservado, não apagado.
 
 ## Problemas resolvidos
 
-O estado agregado contém validações, inventário, identificação/coleção,
-normalização e consultas necessárias. O grau de homologação produtiva do fluxo
-de modelos continua limitado.
+- dry-run mostra manifesto, pacote, assets, exames, histórico, intake e
+  fingerprints;
+- reset remove/invalida somente projeções e estados locais do pedido;
+- `cfaz_import_history` passa a `READY_FOR_REIMPORT`;
+- demais pacientes permanecem intactos;
+- OneDrive não é alterado pelo reset;
+- inventário/diagnóstico de modelos e coleção foi ampliado.
 
 ## Critérios de aceite
 
-- documentação histórica criada sem alterar commits antigos;
-- implementação consolidada em um único commit novo;
-- suíte completa executada;
-- nenhum segredo ou artefato duplicado indevido versionado;
-- tag anotada `v0.17.8`;
-- OneDrive e dados externos não alterados durante a consolidação.
+- reset restrito ao request;
+- nenhuma exclusão remota;
+- auditoria preservada;
+- intake/destination fingerprints incluídos;
+- nova importação não bloqueada por idempotência local residual;
+- destino remoto reconciliado sem nova pasta ou duplicação;
+- modelos ausentes adicionados;
+- dashboard/summary atualizados sem rebuild;
+- suíte completa.
 
 ## Resultado alcançado
 
-**PENDENTE ATÉ O COMMIT CONSOLIDADO E A VALIDAÇÃO FINAL.**
+O dry-run e o primeiro apply foram executados em caso real: 1 manifesto,
+1 pacote, 15 assets, 1 exame e 30 arquivos locais; histórico mudou para
+`READY_FOR_REIMPORT` e os outros pacientes permaneceram intactos.
+
+A homologação revelou o bug da segunda fonte de idempotência
+(`radiology_imports`/destination fingerprint). O código consolidado inclui a
+evolução local posterior, mas a homologação ponta a ponta dos STL não foi
+registrada como concluída.
 
 ## Limitações
 
-O commit final registra um snapshot agregado. Ele não transforma o snapshot em
-evidência individual das Sprints anteriores. Homologação real Cfaz/modelos
-permanece requisito separado.
+Sprint implementada, porém homologação produtiva completa permanece aberta:
+download → extração → publicação → indexação → consulta de dois STL e segunda
+execução idempotente.
 
 ## Próximo Sprint
 
-Sprint 18 — consolidação/homologação operacional, conforme o Livro de
-Engenharia.
+Sprint 18 deve começar pela homologação única pendente dos modelos digitais e
+da reimportação completa, não por IA.

@@ -2,46 +2,61 @@
 
 ## Objetivo
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Fechar a primeira camada de inteligência clínica com dashboard operacional
+somente leitura e sem interface gráfica.
 
 ## Motivação
 
-Continuidade do fluxo Cfaz/modelos digitais observada apenas de forma agregada.
+Era necessário observar o estado global do repositório depois de timeline,
+search e summary, sem introduzir dashboard web ou IA.
 
 ## Arquitetura afetada
 
-Possíveis áreas agregadas: provider Cfaz, browser session, normalização,
-manifesto e índice. A atribuição a 17.4 é **PENDENTE DE DOCUMENTAÇÃO**.
+Agregações globais no SQLite, expostas pelo comando `dashboard`.
 
 ## Arquivos alterados
 
-Não atribuíveis individualmente.
+- `src/radiology/exam_index_service.py`;
+- `src/main.py`;
+- testes do dashboard.
 
 ## Comandos criados
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+```bash
+python -m main dashboard
+```
+
+Exibe pacientes, pedidos/exames, assets, categorias, última importação, órfãos
+e duplicados.
 
 ## Problemas encontrados
 
-Links efêmeros, conteúdo Google Storage e modelos STL aparecem no estado
-agregado, mas sua Sprint de origem não está registrada.
+O relatório precisava funcionar com banco vazio e colunas opcionais, sem
+reclassificar ou acessar serviços externos.
 
 ## Problemas resolvidos
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Dashboard textual, rápido e somente leitura foi incorporado à camada de
+consulta.
 
 ## Critérios de aceite
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+- totais consistentes com `clinical_assets`;
+- banco vazio;
+- múltiplos providers/categorias;
+- registros incompletos;
+- nenhuma escrita ou chamada externa.
 
 ## Resultado alcançado
 
-Sprint declarada como implementada; incremento individual desconhecido.
+A camada de consulta clínica passou a oferecer timeline, busca, resumo e
+dashboard sobre uma única projeção local.
 
 ## Limitações
 
-Não usar a ordem dos arquivos ou dos comandos como cronologia.
+Não há UI gráfica, métricas clínicas interpretativas ou IA. A qualidade das
+estatísticas depende da indexação histórica.
 
 ## Próximo Sprint
 
-Sprint 17.5.
+Sprint 17.5 — Thumbnail Filtering & Clinical Publication.

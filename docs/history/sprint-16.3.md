@@ -31,9 +31,13 @@ a fornecer os metadados necessários. O SQLite continuou derivado do manifesto.
 
 ## Comandos criados
 
-O commit acrescentou interface de consulta em `src/main.py`. O nome exato do
-subcomando incluído neste commit deve ser confirmado pelo diff histórico:
-**PENDENTE DE DOCUMENTAÇÃO**.
+O commit acrescentou:
+
+```bash
+python -m main clinical-assets --patient "Nome"
+```
+
+com filtros adicionais por provider e categoria.
 
 ## Problemas encontrados
 

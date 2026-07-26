@@ -2,45 +2,67 @@
 
 ## Objetivo
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Criar busca clínica estruturada por paciente, categoria, provider e intervalo
+de datas.
 
 ## Motivação
 
-Continuidade do trabalho Cfaz/Clinical Assets posterior à Sprint 17. A
-motivação específica não foi versionada.
+A timeline resolvia navegação longitudinal de um paciente, mas faltava uma
+consulta transversal sobre todo o repositório clínico.
 
 ## Arquitetura afetada
 
-**PENDENTE DE DOCUMENTAÇÃO.** A evidência agregada não permite separar 17.2.
+`ExamIndexService` recebeu busca agregada sobre SQLite; a CLI apenas formata o
+resultado. Nenhuma integração externa participa.
 
 ## Arquivos alterados
 
-Não atribuíveis individualmente; consultar o commit consolidado posterior.
+- `src/radiology/exam_index_service.py`;
+- `src/main.py`;
+- testes da camada de consulta.
 
 ## Comandos criados
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+```bash
+python -m main find-assets \
+  --patient "PACIENTE_EXEMPLO" \
+  --category Radiografia \
+  --provider cfaz \
+  --after 2025-01-01 \
+  --before 2026-12-31
+```
+
+Retorno: paciente, data, categoria, provider, quantidade e destino OneDrive.
 
 ## Problemas encontrados
 
-Histórico técnico sem checkpoint por Sprint.
+A pesquisa não poderia voltar a ler manifests ou consultar providers, sob risco
+de resultados lentos e divergentes.
 
 ## Problemas resolvidos
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Busca parcial por paciente, filtros combináveis e agrupamento por paciente,
+data, categoria e provider foram implementados no índice local.
 
 ## Critérios de aceite
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+- somente leitura;
+- filtros independentes/combinados;
+- datas inclusivas conforme contrato;
+- banco vazio;
+- múltiplos providers/categorias;
+- nenhuma chamada Cfaz, Gmail, TransferNow, Clinicorp ou OneDrive.
+
+Validação histórica: 492 testes aprovados, 2 ignorados e `git diff --check`.
 
 ## Resultado alcançado
 
-Implementação declarada; resultado individual não reconstruível sem inferência.
+Camada de busca clínica independente da aquisição implementada.
 
 ## Limitações
 
-Testes existentes comprovam comportamentos agregados, não autoria temporal.
+Busca é estruturada, não semântica; não usa OCR, embeddings ou IA.
 
 ## Próximo Sprint
 
-Sprint 17.3.
+Sprint 17.3 — Clinical Summary.

@@ -1,5 +1,64 @@
 # IREO Clinical Intelligence Architecture
 
+> Esta visão deriva do
+> [Documento Mestre de Engenharia](../ENGINEERING_MASTER.md), dos registros em
+> `docs/history/`, do histórico Git e do livro histórico exportado do Pages.
+> Em caso de divergência, o documento mestre é normativo.
+
+## Sprints 16.2–17.8 — repositório de ativos clínicos
+
+```text
+Provider
+  → Provider Metadata
+  → ClinicalPackage
+  → ClinicalAssetNormalizer
+  → Publisher
+  → OneDrive/manifest.json
+  → clinical_assets (SQLite derivado)
+  → Timeline / Search / Summary / Dashboard
+```
+
+### ClinicalPackage como fronteira
+
+A Sprint 16.2 estabeleceu `ClinicalPackage`/`ClinicalAsset` como contrato entre
+aquisição e processamento. Coleção, seção, nome exibido, categoria e metadados
+do provider são preservados; módulos posteriores não reinterpretam o payload
+bruto do Cfaz. A Sprint 16.3 materializou cada ativo na tabela
+`clinical_assets`, sem mudar a fonte clínica: OneDrive e manifestos continuam
+duráveis, SQLite continua reconstruível.
+
+### Camada clínica somente leitura
+
+As Sprints 17.1–17.4 criaram timeline, busca, resumo e dashboard. Todas as
+consultas usam exclusivamente SQLite. Elas não acessam Cfaz, TransferNow,
+Gmail, Clinicorp, OneDrive ou IA e não reclassificam conteúdo durante a leitura.
+
+### Seleção de ativos
+
+A Sprint 17.5 comprovou que um caso de “duplicação” era, na realidade, um
+conjunto de originais e thumbnails com SHA-256 distintos. A categoria e a
+publicabilidade são decididas por asset: original e preview clínico autorizado
+seguem; thumbnail genérico é ignorado. Rebuilds aplicam a mesma regra sem
+excluir conteúdo histórico do OneDrive.
+
+### Modelos digitais Cfaz
+
+A descoberta 17.6 identificou no frontend Cfaz
+`digital_models[*].stl_files[*]`, com `id`, `download_url` e
+`document_file_name`, além de downloads efêmeros pelo Google Storage. A Sprint
+17.7 converte esses itens em ativos `DIGITAL_MODEL`, preserva IDs do modelo/STL
+e mantém URL/query/token somente em memória. Rotas de escrita como
+`PUT /digital_models/{id}.js` são proibidas.
+
+### Reset e reimportação
+
+A Sprint 17.8 introduziu reset local restrito ao pedido. Ele preserva OneDrive
+e auditoria Cfaz, remove/invalida projeções e marcadores locais e prepara
+`READY_FOR_REIMPORT`. A homologação revelou que a idempotência é multicamada:
+`cfaz_import_history` e `radiology_imports`/destination fingerprint precisam
+ser tratados conjuntamente. A homologação completa de dois STL continua sendo
+a única tarefa operacional seguinte.
+
 ## Sprint 15 — aquisição multiprovedor
 
 `acquisition.base.AcquisitionProvider` separa autenticação, descoberta,
@@ -257,10 +316,9 @@ Gmail API: messages.list + messages.get(format=full)
     -> restricted CLI output
 ```
 
-The connector requests only the OAuth scope
-`https://www.googleapis.com/auth/gmail.readonly`. It does not implement calls
+The connector requests only the Gmail readonly OAuth scope. It does not implement calls
 to send, modify, delete, trash, archive, label, or mark messages as read. The
-pilot query defaults to `from:noreply@transfernow.net subject:TransferNow`, and
+pilot query is configured locally to identify TransferNow notifications, and
 the connector enforces an absolute maximum of five messages per execution.
 
 OAuth client credentials and user tokens are local secrets. Their default file

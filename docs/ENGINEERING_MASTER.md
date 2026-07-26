@@ -674,6 +674,16 @@ As datas e commits abaixo vêm do Git. Rótulos de Sprint ausentes no histórico
 - **Testes:** grande ampliação, incluindo normalização, DICOM, índice, Cfaz e Graph.
 - **Status:** concluída.
 
+### Sprint 16.2 — ClinicalPackage e preservação da estrutura clínica
+
+- **Fonte histórica:** livro de engenharia exportado do Pages; não houve commit/tag individual.
+- **Objetivo:** tornar `ClinicalPackage` o contrato oficial entre providers e pipeline.
+- **Resultado:** `ClinicalAsset` preserva coleção, seção, nome, categoria e metadados do provider; TransferNow e Cfaz compartilham o contrato; nenhuma indexação foi antecipada.
+- **Validação registrada:** 492 testes aprovados e 2 ignorados.
+- **Decisão:** nenhum módulo posterior interpreta diretamente o payload Cfaz.
+- **Status:** concluída; checkpoint Git individual não foi criado.
+- **Documento especializado:** `docs/history/sprint-16.2.md`.
+
 ### Sprint 16.3 — Indexação de ativos clínicos
 
 - **Data/commit/tag:** 2026-07-24, `4c2860f`, tag `v0.16.3`.
@@ -691,105 +701,69 @@ As datas e commits abaixo vêm do Git. Rótulos de Sprint ausentes no histórico
 - **Testes:** nenhuma alteração de testes nesse commit; cobertura herdada.
 - **Status:** concluída no Git.
 
-### Sprints 17.1–17.8 — Estado documental
-
-- **Evidência disponível:** alterações locais não commitadas em aquisição Cfaz, modelos digitais, CLI, índice, histórico e testes; novos módulos `cfaz_browser_session`, `cfaz_digital_collection`, `cfaz_digital_identify`, `cfaz_digital_models`, `cfaz_download_models` e `cfaz_inventory`.
-- **Resultado observado:** descoberta/download de modelos, inventário, identificação, coleção, dry-run de reimportação, reset e extensões de consulta.
-- **Testes observados:** seis novos arquivos de teste Cfaz e alterações em testes existentes.
-- **Limite de certeza:** o repositório não contém commits/tags nem um registro aprovado que associe cada incremento individual a 17.1, 17.2, …, 17.8.
-- **Status:** **não aprovado/documentalmente incompleto**. Não atribuir funcionalidades a números individuais até recuperar a ata/arquivo original ou criar commits aprovados.
-
-As subseções exigidas existem individualmente abaixo. Em todas elas, os campos
-“problema existente”, “implementação”, “arquivos”, “arquitetura”, “resultado”,
-“pendências” e “lições” permanecem vinculados à mesma ausência de evidência:
-
 ### Sprint 17.1
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** uma Sprint sem commit e atualização documental perde rastreabilidade.
+- **Objetivo:** Clinical Timeline por paciente.
+- **Implementação:** `patient-timeline`, exclusivamente sobre SQLite.
+- **Resultado:** ordenação por data/tipo/provider e categorias persistidas, sem reclassificação.
+- **Validação histórica:** 492 testes aprovados, 2 ignorados.
+- **Documento:** `docs/history/sprint-17.1.md`.
 
 ### Sprint 17.2
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** não reconstruir cronologia a partir do estado final.
+- **Objetivo:** Clinical Search.
+- **Implementação:** `find-assets` com filtros de paciente, categoria, provider e datas.
+- **Resultado:** busca agregada somente SQLite, sem serviços externos.
+- **Validação histórica:** 492 testes aprovados, 2 ignorados.
+- **Documento:** `docs/history/sprint-17.2.md`.
 
 ### Sprint 17.3
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** testes provam comportamento, não o número da Sprint.
+- **Objetivo:** Clinical Summary.
+- **Implementação:** `patient-summary` com contagens e intervalo do acervo.
+- **Resultado:** resumo reflete apenas dados persistidos; não inventa categorias históricas.
+- **Documento:** `docs/history/sprint-17.3.md`.
 
 ### Sprint 17.4
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** checkpoints intermediários precisam ser versionados.
+- **Objetivo:** Dashboard operacional textual.
+- **Implementação:** `dashboard`, agregações globais somente leitura.
+- **Resultado:** pacientes, pedidos, assets, categorias, qualidade e datas consultáveis.
+- **Documento:** `docs/history/sprint-17.4.md`.
 
 ### Sprint 17.5
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** nomes de comandos não bastam para reconstruir decisões.
+- **Objetivo:** Thumbnail Filtering & Clinical Publication.
+- **Descoberta:** 30 JPEG de um pedido sanitizado eram 15 originais + 15 thumbnails, com 30 SHA únicos; não havia duplicação real.
+- **Implementação:** filtro por asset, `thumbnail-report`, rebuild/reprocessamento sem exclusão remota.
+- **Resultado:** 58 registros reduziram para 29 ativos clínicos indexáveis.
+- **Documento:** `docs/history/sprint-17.5.md`.
 
 ### Sprint 17.6
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** artefatos de homologação devem acompanhar a Sprint.
+- **Objetivo:** Cfaz Network Discovery.
+- **Problema:** modelos digitais apareciam no portal, mas não no payload persistido.
+- **Descoberta:** frontend Vue usa objeto `digitalModel`, `data.stl_files` e campos `id`, `download_url`, `document_file_name`; requisições de arquivo chegam ao Google Storage.
+- **Resultado:** evidência técnica para aquisição somente leitura, sem usar `PUT /digital_models/{id}.js`.
+- **Documento:** `docs/history/sprint-17.6.md`.
 
 ### Sprint 17.7
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo.
-- **Lições aprendidas:** alterações locais acumuladas não equivalem a entrega aprovada.
+- **Objetivo:** Cfaz Digital Model Acquisition.
+- **Implementação:** parsing `digital_models[].stl_files[]`, IDs de modelo/STL, categoria `DIGITAL_MODEL`, migração e diagnóstico dry-run.
+- **Segurança:** URL assinada somente em memória; nenhuma rota Cfaz de escrita.
+- **Validação histórica:** 492 testes aprovados, 2 ignorados.
+- **Status:** implementada; homologação real de download/publicação continuou pendente.
+- **Documento:** `docs/history/sprint-17.7.md`.
 
 ### Sprint 17.8
 
-- **Objetivo solicitado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Problema existente:** PENDENTE DE DOCUMENTAÇÃO.
-- **Implementação realizada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Arquivos alterados:** não atribuíveis com segurança.
-- **Arquitetura modificada:** PENDENTE DE DOCUMENTAÇÃO.
-- **Resultado alcançado:** PENDENTE DE DOCUMENTAÇÃO.
-- **Pendências:** recuperar registro autoritativo e consolidar o estado local.
-- **Lições aprendidas:** este documento deve ser critério de conclusão da Sprint.
+- **Objetivo:** Local Reset & Reimport.
+- **Implementação:** `cfaz-reset --dry-run|--apply`, inventário e limpeza local restrita ao pedido, preservando auditoria/OneDrive.
+- **Homologação:** reset real removeu 1 manifesto, 1 pacote, 15 assets, 1 exame e preservou outros pacientes.
+- **Bug descoberto:** intake `COMPLETED`/destination fingerprint ainda bloqueava reimportação após o primeiro reset.
+- **Status:** implementação consolidada em `18540ea`; homologação ponta a ponta dos STL permanece aberta.
+- **Documento:** `docs/history/sprint-17.8.md`.
 
 ## 5. Histórico de Comandos
 
@@ -858,8 +832,9 @@ ausência garantida de publicação; “Apply” significa que o comando pode es
 | `cfaz-reset` | reset local preservando remoto; `... --request-id ID [--dry-run|--apply]` | histórico/manifests/SQLite → inventário → exclusão local/status | dry-run padrão; apply destrutivo local, OneDrive não é alterado |
 
 Para todos os comandos, códigos de saída e exemplos completos de cada combinação:
-**PENDENTE DE DOCUMENTAÇÃO**. Os comandos da linha local 17.x não são
-considerados aprovados até serem versionados e homologados.
+**PENDENTE DE DOCUMENTAÇÃO**. Os comandos da linha 17.x estão versionados em
+`18540ea`/`v0.17.8`; os de modelos digitais continuam sujeitos à homologação
+operacional registrada em BUG-002/BUG-006.
 
 ## 6. Banco de Dados
 
@@ -933,7 +908,7 @@ projeção de busca, timeline, dashboard e resumo, não o repositório do arquiv
 
 ### 9.1 Identidade e autenticação
 
-`CfazProvider` prioriza `max.cfaz.net/api/v1`. Token de API ou credenciais de
+`CfazProvider` prioriza a API oficial configurada do Cfaz. Token de API ou credenciais de
 sessão ficam em memória/headers. `provider_request_id` é a chave interna,
 `sequential_id` é o número visível e `clinic_number` é o número operacional da
 clínica. A CLI `--request-id` aceita internal/sequential conforme o caminho.
@@ -1029,29 +1004,36 @@ modelos permanece em homologação.
 - **Correção/Sprint:** validação de paths, limites e criação exclusiva no MVP.
 - **Arquivos:** extractors, storage/publisher e testes.
 
+### BUG-R006 — Histórico 16.2 e 17.1–17.8 sem contexto
+
+- **Problema/causa raiz:** Sprints foram desenvolvidas sem commits individuais e o contexto permaneceu no histórico do chat.
+- **Descoberta:** auditoria inicial do Git não encontrou evidência suficiente.
+- **Correção:** extração integral do arquivo Pages histórico e confronto com código, testes e commits; criação/atualização de `docs/history/sprint-*.md`.
+- **Resultado:** objetivos, decisões, resultados de testes, descobertas e bugs foram recuperados sem reescrever Git.
+
 ## 12. Bugs Abertos
-
-### BUG-001 — Histórico 17.1–17.8 sem rastreabilidade versionada
-
-- **Descrição:** mudanças locais extensas não têm commits/tags nem registro por Sprint.
-- **Causa:** desenvolvimento acumulado fora do histórico Git/documento mestre.
-- **Impacto:** impossível afirmar com segurança o conteúdo exato de cada Sprint.
-- **Status:** aberto.
-- **Prioridade:** crítica documental.
-- **Como reproduzir:** comparar `git log` com os módulos locais não rastreados e procurar commits/tags 17.1–17.8.
-- **Hipótese:** trabalho foi acumulado localmente sem checkpoints Git.
-- **Próximo passo/aceite:** recuperar evidência, dividir/registrar o estado aprovado e atualizar a linha do tempo.
 
 ### BUG-002 — Modelos digitais Cfaz ainda não homologados ponta a ponta
 
-- **Descrição:** há implementação e testes locais, mas comandos indicam caminhos somente dry-run/bloqueados e o trabalho não está versionado.
+- **Descrição:** implementação e testes estão versionados em `18540ea`/`v0.17.8`, mas o fluxo real completo de dois STL não possui homologação conclusiva registrada.
 - **Causa:** integração depende de sessão browser, links efêmeros, associação de STL e destino remoto.
 - **Impacto:** modelos podem não integrar o pacote publicado de forma operacionalmente garantida.
 - **Status:** aberto, em homologação.
 - **Prioridade:** alta.
-- **Como reproduzir:** executar os comandos de modelos em dry-run para um pedido elegível; `cfaz-reimport --apply` é explicitamente bloqueado.
+- **Como reproduzir:** executar diagnóstico/dry-run para pedido elegível e seguir até download, extração, reconciliação OneDrive, indexação e segunda execução.
 - **Hipótese:** destino remoto e associação individual ainda não possuem evidência suficiente em todos os caminhos.
 - **Próximo passo/aceite:** teste real controlado, publicação idempotente, rollback/rebuild, dois STL distintos e documentação aprovada.
+
+### BUG-006 — Reset/reimportação e segunda camada de idempotência
+
+- **Descrição:** a primeira homologação do `cfaz-reset` deixou um intake `COMPLETED` associado ao destination fingerprint, bloqueando a reimportação.
+- **Causa:** idempotência existia em `cfaz_import_history` e também em `radiology_imports`/destino.
+- **Impacto:** pedido era baixado novamente, mas bloqueado antes da publicação.
+- **Status:** correção implementada no estado consolidado; homologação real pendente.
+- **Prioridade:** alta.
+- **Como reproduzir:** pedido COMPLETE + intake COMPLETED + reset + nova importação.
+- **Hipótese:** outros marcadores locais/remotos podem ainda exigir reconciliação.
+- **Próximo passo/aceite:** provar reimportação completa sem bloqueio, sem segunda pasta e sem duplicação remota.
 
 ### BUG-003 — Documentação operacional divergente
 
@@ -1148,6 +1130,33 @@ ireo-clinical-intelligence rebuild-radiology-index
 
 Antes de publicar uma referência completa dos comandos Cfaz/modelos, consolidar as alterações locais e executar `--help`/testes no estado aprovado.
 
+### Comandos históricos de validação
+
+Estes comandos aparecem repetidamente nos checkpoints do livro histórico e
+formam o gate mínimo antes de concluir uma Sprint:
+
+```bash
+python -m compileall -q src tests
+PYTHONPATH=src:. ./.venv/bin/pytest -q
+python -m pip check
+git diff --check
+git status --short
+```
+
+Para operações Cfaz, usar sempre identificadores substituíveis e executar
+dry-run antes de apply:
+
+```bash
+python -m main thumbnail-report
+python -m main cfaz-reprocess --request-id REQUEST_ID --dry-run
+python -m main cfaz-digital-models --request-id REQUEST_ID --dry-run
+python -m main cfaz-reset --request-id REQUEST_ID --dry-run
+```
+
+`System Doctor`/Sprint 16.2A apareceu como proposta no livro histórico, mas não
+há comando implementado com esse nome; não deve ser apresentado como
+funcionalidade existente.
+
 ### Testes e critérios globais de aceite
 
 ### Estado da suíte
@@ -1189,10 +1198,10 @@ Uma mudança no pipeline só é aceita quando:
 
 ### Sprint 18 — Consolidação e homologação
 
-- transformar o estado local 17.x em mudanças versionadas e rastreáveis;
 - homologar modelos digitais Cfaz ponta a ponta;
 - executar suíte completa e registrar resultado;
-- fechar BUG-001 e BUG-002 ou documentar bloqueios verificáveis.
+- validar correção da segunda camada de idempotência;
+- fechar BUG-002 e BUG-006 ou documentar bloqueios verificáveis.
 
 ### Sprint 19 — Robustez operacional
 
@@ -1231,9 +1240,13 @@ Future AI não recebe número de Sprint antes de aprovação de governança clí
 
 ## 14. Próxima Tarefa Única
 
-**SPRINT-18-TASK-001 — Consolidar e homologar o fluxo de modelos digitais Cfaz.**
+**SPRINT-18-TASK-001 — Homologar ponta a ponta o fluxo de modelos digitais Cfaz.**
 
-Resultado esperado: transformar as alterações locais da linha 17.x em um estado versionado e auditável, executar a suíte completa, realizar um dry-run e uma homologação controlada ponta a ponta dos dois STL, comprovar idempotência/rollback/rebuild, atualizar a linha do tempo 17.1–17.8 com evidência e então mover BUG-001/BUG-002 conforme o resultado.
+Resultado esperado: realizar diagnóstico e homologação controlada de dois STL,
+comprovar download, extração, classificação, reconciliação OneDrive, indexação,
+consultas e segunda execução idempotente; verificar que `cfaz-reset` elimina
+todos os bloqueios locais sem apagar auditoria ou conteúdo remoto; então mover
+BUG-002 e BUG-006 conforme o resultado.
 
 Não iniciar outra tarefa de roadmap antes de concluir ou formalmente bloquear esta.
 
@@ -1320,10 +1333,19 @@ correção factual acompanhada de nova entrada explicativa.
 - Criado `docs/ENGINEERING_MASTER.md`.
 - Auditados histórico Git, tags, código, schemas/migrações, testes e
   documentação existente.
-- Registradas as lacunas 17.1–17.8 como `PENDENTE DE DOCUMENTAÇÃO`.
+- Registradas inicialmente as lacunas 17.1–17.8, posteriormente recuperadas do livro histórico.
 - Catalogados 31 comandos CLI nomeados e o modo Clinicorp sem subcomando.
 - Registrados três conjuntos lógicos SQLite, contratos de manifesto,
   `ClinicalPackage`, Clinical Assets e fluxo Cfaz.
 - Registrados cinco bugs abertos, cinco bugs resolvidos e sete ADRs.
 - Definida uma única tarefa seguinte: consolidação/homologação dos modelos
   digitais Cfaz.
+
+### 2026-07-26 — Recuperação do livro histórico
+
+- Exportado e lido integralmente o arquivo Pages histórico (28.190 linhas).
+- Recuperados os escopos reais das Sprints 16.2 e 17.1–17.8.
+- Diferenciados planejamento, implementação, validação offline e homologação real.
+- Registradas as descobertas Cfaz/Google Storage/STL e o bug da segunda camada de idempotência.
+- BUG-001 documental movido para resolvido como BUG-R006.
+- Próxima tarefa restringida à homologação ponta a ponta dos modelos digitais.

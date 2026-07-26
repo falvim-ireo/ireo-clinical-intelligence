@@ -2,45 +2,61 @@
 
 ## Objetivo
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Criar resumo clínico estruturado do acervo radiológico de um paciente.
 
 ## Motivação
 
-Continuidade da estabilização do repositório clínico. Detalhe individual
-ausente das fontes históricas.
+Timeline e busca exibiam eventos/ativos, mas faltava uma visão quantitativa
+compacta com período e categorias do acervo.
 
 ## Arquitetura afetada
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Consulta agregada somente leitura em `ExamIndexService`, exposta pela CLI.
+O resumo consome o que está persistido; não reinterpreta arquivos.
 
 ## Arquivos alterados
 
-Não atribuíveis individualmente.
+- `src/radiology/exam_index_service.py`;
+- `src/main.py`;
+- testes do resumo.
 
 ## Comandos criados
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+```bash
+python -m main patient-summary --patient "Nome do paciente"
+```
+
+Exibe exames, radiografias, fotografias, tomografias, DICOM, modelos STL,
+laudos, primeiro e último exame.
 
 ## Problemas encontrados
 
-Impossibilidade de correlacionar o estado final com uma sequência 17.1–17.8.
+Pedidos históricos sem metadados suficientes continuavam como
+`DOCUMENTATION`. Inventar categorias na consulta violaria a arquitetura.
 
 ## Problemas resolvidos
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+Resumo quantitativo foi implementado sobre `clinical_assets`/`exams`, mantendo
+aquisição → normalização → persistência → consulta.
 
 ## Critérios de aceite
 
-**PENDENTE DE DOCUMENTAÇÃO.**
+- somente SQLite;
+- paciente inexistente retorna zero sem falha;
+- contagens consistentes;
+- datas extremas corretas;
+- nenhuma heurística ou escrita.
 
 ## Resultado alcançado
 
-Sprint declarada como implementada, sem checkpoint verificável.
+Sprint implementada no escopo e sem contaminar a consulta com regras de
+aquisição.
 
 ## Limitações
 
-Este registro preserva a lacuna e evita uma cronologia fictícia.
+O Clinical Patient Record mais amplo, health score, tamanho total e indicadores
+de qualidade foram propostos, mas o comando atual é um resumo quantitativo.
 
 ## Próximo Sprint
 
-Sprint 17.4.
+Sprint 17.4 — Dashboard.

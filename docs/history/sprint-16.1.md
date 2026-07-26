@@ -38,9 +38,9 @@ posteriormente por `def69a6`.
 
 ## Comandos criados
 
-Foram ampliados/adicionados comandos Cfaz, reparo, rebuild e consultas no
-`src/main.py`. A atribuição exata de cada subcomando dentro do grande commit
-não foi registrada separadamente: **PENDENTE DE DOCUMENTAÇÃO**.
+Foram ampliados/adicionados comandos Cfaz de reparo e diagnóstico. O marco
+central foi `cfaz-repair-files --dry-run|--apply`, usado para corrigir
+extensões/classificação de importações já concluídas.
 
 ## Problemas encontrados
 
@@ -71,8 +71,9 @@ não foi registrada separadamente: **PENDENTE DE DOCUMENTAÇÃO**.
 - manifestos completos podem reconstruir o índice;
 - testes adicionados no commit passam.
 
-O resultado exato da execução da suíte no momento do commit:
-**PENDENTE DE DOCUMENTAÇÃO**.
+O livro histórico registra homologação da correção com repetição idempotente;
+o commit consolidado adicionou uma grande suíte de normalização/Cfaz. A
+contagem exata no instante do commit permanece não registrada.
 
 ## Resultado alcançado
 
@@ -88,4 +89,4 @@ ao pipeline comum e base para indexação de ativos.
 
 ## Próximo Sprint
 
-Sprint 16.2. Objetivo e escopo individual: **PENDENTE DE DOCUMENTAÇÃO**.
+Sprint 16.2 — `ClinicalPackage` e preservação da estrutura clínica.
