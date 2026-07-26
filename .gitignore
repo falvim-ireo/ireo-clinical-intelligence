@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.egg-info/
@@ -11,6 +13,12 @@ ms_graph_token_cache.json*
 credentials.json
 token.json
 client_secret*.json
+*oauth*.json
+*token_cache*.json
+*.pem
+*.key
+*.p12
+*.pfx
 .coverage
 htmlcov/
 .pytest_cache/
@@ -23,6 +31,9 @@ blob-report/
 *.part
 *.rar
 *.zip
+*.har
+*.log
+*.pages
 *.dcm
 *.dicom
 **/manifest.json
@@ -30,6 +41,9 @@ quarantine/
 quarentena/
 **/quarantine/
 **/quarentena/
+**/.auto-run-state/
+tmp/
+data/
 data/*.db
 data/*.db-shm
 data/*.db-wal
@@ -47,12 +61,18 @@ data/radiology_auto_run.lock
 # Microsoft Graph token cache
 .ms_graph_token_cache.json
 
+# Auxiliary source snapshots are not part of the operational repository.
+ireo-cfaz-source/
+ireo-cfaz-source.zip
+
 # macOS
 .DS_Store
 
 # Gmail OAuth
 gmail_credentials*.json
 gmail_token*.json
+.gmail_credentials*.json
+.gmail_token*.json
 
 # local credentials
 *.credentials.json

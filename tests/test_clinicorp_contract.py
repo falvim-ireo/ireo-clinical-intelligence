@@ -128,7 +128,7 @@ def test_contact_fields_are_preserved_in_domain_but_never_use_network() -> None:
     patient = repository.find_candidates("Paciente Fictício Contato")[0]
 
     assert patient.telefone == "+00 00 00000-0000"
-    assert patient.email == "paciente.ficticio@example.invalid"
+    assert patient.email == "fixture1@example.invalid"
 
 
 def test_structurally_invalid_response_becomes_sanitized_domain_error() -> None:

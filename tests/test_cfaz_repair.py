@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 from acquisition.cfaz_operations import CfazHistoryRepository
 from acquisition.cfaz_repair import CfazCompletedImportRepair
+from tests.synthetic_fixtures import (
+    SYNTHETIC_CLINIC_ID,
+    SYNTHETIC_INTERNAL_REQUEST_ID,
+    SYNTHETIC_SEQUENTIAL_ID,
+)
 
 
 def jpeg(width: int, height: int, marker: bytes = b"x") -> bytes:
@@ -62,8 +67,10 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
     database = tmp_path / "index.db"
     history = CfazHistoryRepository(database)
     history.mark_complete(
-        request_id="23254315", provider_request_id="23254315",
-        sequential_id="85871", clinic_number="30510",
+        request_id=SYNTHETIC_INTERNAL_REQUEST_ID,
+        provider_request_id=SYNTHETIC_INTERNAL_REQUEST_ID,
+        sequential_id=SYNTHETIC_SEQUENTIAL_ID,
+        clinic_number=SYNTHETIC_CLINIC_ID,
         patient_name="Paciente", duration_seconds=1,
         onedrive_destination="Pacientes/Paciente/Radiologia/Exame",
         acquisition_sha="a" * 64,
@@ -77,8 +84,10 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
     manifest = {
         "status": "COMPLETED",
         "acquisition": {
-            "provider_id": "cfaz", "request_id": "23254315",
-            "provider_request_id": "23254315", "sequential_id": "85871",
+            "provider_id": "cfaz",
+            "request_id": SYNTHETIC_INTERNAL_REQUEST_ID,
+            "provider_request_id": SYNTHETIC_INTERNAL_REQUEST_ID,
+            "sequential_id": SYNTHETIC_SEQUENTIAL_ID,
         },
         "checksums": {
             "sem-extensao-a": hashlib.sha256(first).hexdigest(),
@@ -100,7 +109,7 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
         now_provider=lambda: datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
-    first_result = repair.repair("85871")
+    first_result = repair.repair(SYNTHETIC_SEQUENTIAL_ID)
 
     assert first_result.renamed_files == 2
     clinical_folder = staging / "06 - Documentos"
@@ -126,7 +135,7 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
         "duplicate_files": 0,
     }
     assert updated["schema_version"] == "16.0"
-    record = history.get_record("23254315")
+    record = history.get_record(SYNTHETIC_INTERNAL_REQUEST_ID)
     assert record.status == "COMPLETE"
     assert record.repair_version == 16 and record.repaired_at
     assert len(graph.moves) == 2
@@ -134,7 +143,7 @@ def test_completed_repair_renames_jpeg_updates_manifest_and_is_idempotent(tmp_pa
 
     move_count = len(graph.moves)
     upload_count = len(graph.uploads)
-    second_result = repair.repair("23254315")
+    second_result = repair.repair(SYNTHETIC_INTERNAL_REQUEST_ID)
     assert second_result.renamed_files == 0
     assert len(graph.moves) == move_count
     assert len(graph.uploads) == upload_count + 1

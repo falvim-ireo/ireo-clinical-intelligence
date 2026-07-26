@@ -479,7 +479,7 @@ def test_browser_fallback_opens_and_continues_without_confirmation(tmp_path):
     message = EmailMessage(
         message_id="secret", subject='TransferNow "PACIENTE.rar"', sender="TransferNow",
         reply_to=None, received_at=datetime.now(timezone.utc),
-        text_body="clinic@example.org https://transfernow.net/dl/token",
+        text_body="fixture1@example.com https://transfernow.net/dl/token",
     )
     class Gmail:
         def list_messages(self, **kwargs): return [message]
@@ -514,7 +514,7 @@ def test_landing_page_browser_download_reuses_supervised_importer(
 ):
     message = EmailMessage(
         message_id="secret", subject='TransferNow "PACIENTE.rar"', sender="TransferNow",
-        reply_to=None, text_body="clinic@example.org https://transfernow.net/dl/token",
+        reply_to=None, text_body="fixture1@example.com https://transfernow.net/dl/token",
     )
     class Gmail:
         def list_messages(self, **kwargs): return [message]

@@ -62,9 +62,18 @@ from radiology.exam_index_service import ExamIndexService
 from repositories.patient_repository import InMemoryPatientRepository
 from repositories.patient_repository import EmptyPatientRepository
 from repositories.patient_repository import PatientRepositoryUnavailableError
+from synthetic_fixtures import (
+    SYNTHETIC_PATIENT_ALPHA,
+    SYNTHETIC_PATIENT_ALPHA_ASCII,
+    SYNTHETIC_PATIENT_ID,
+    SYNTHETIC_REQUEST_ID,
+    SYNTHETIC_TIMESTAMP,
+    SYNTHETIC_TIMESTAMP_BETA,
+    SYNTHETIC_TIMESTAMP_GAMMA,
+)
 
 
-PATIENT_NAME = "CLÁUDIA EXEMPLO FICTÍCIA"
+PATIENT_NAME = SYNTHETIC_PATIENT_ALPHA
 
 
 class FakeOneDriveClient:
@@ -300,15 +309,15 @@ def test_local_zip_runs_complete_supervised_copy_and_manifest(tmp_path: Path) ->
 
 def test_extracts_clinical_date_and_time_from_compound_archive_name() -> None:
     exam_date, exam_time = SupervisedRadiologyImporter._date_time_from_archive_name(
-        "ANTONIO CUSTODIO DE SOUZA PRADO_20260310111013.SL.rar"
+        f"{SYNTHETIC_PATIENT_ALPHA_ASCII}_{SYNTHETIC_TIMESTAMP}.SL.rar"
     )
-    assert exam_date == date(2026, 3, 10)
-    assert exam_time is not None and exam_time.isoformat() == "11:10:13"
+    assert exam_date == date(2099, 1, 2)
+    assert exam_time is not None and exam_time.isoformat() == "12:00:00"
 
 
 def test_archive_date_drives_destination_and_manifest(tmp_path: Path) -> None:
     archive = create_zip(
-        tmp_path / f"{PATIENT_NAME}_20260310111013.zip",
+        tmp_path / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}.zip",
         {"viewer/data.bin": b"proprietary"},
     )
     importer, _, _, _ = build_importer(tmp_path)
@@ -316,9 +325,9 @@ def test_archive_date_drives_destination_and_manifest(tmp_path: Path) -> None:
     result = importer.run(archive_path=archive)
     manifest = json.loads(result.manifest_path.read_text("utf-8"))
 
-    assert result.destination.name == "2026-03-10 - Radiologia"
-    assert manifest["exam_date"] == "2026-03-10"
-    assert manifest["exam_time"] == "11:10:13"
+    assert result.destination.name == "2099-01-02 - Radiologia"
+    assert manifest["exam_date"] == "2099-01-02"
+    assert manifest["exam_time"] == "12:00:00"
     assert manifest["exam_date_source"] == "ARCHIVE_FILENAME"
     assert manifest["import_started_at"]
     assert manifest["import_completed_at"]
@@ -326,9 +335,9 @@ def test_archive_date_drives_destination_and_manifest(tmp_path: Path) -> None:
 
 def test_consistent_dicom_study_date_precedes_archive_name(tmp_path: Path) -> None:
     archive = create_dicom_zip(
-        tmp_path / f"{PATIENT_NAME}_20260310111013.zip",
+        tmp_path / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}.zip",
         tmp_path,
-        study_date="20260201",
+        study_date="20990101",
         study_time="081500",
     )
     importer, _, _, _ = build_importer(tmp_path)
@@ -336,7 +345,7 @@ def test_consistent_dicom_study_date_precedes_archive_name(tmp_path: Path) -> No
     result = importer.run(archive_path=archive)
     manifest = json.loads(result.manifest_path.read_text("utf-8"))
 
-    assert result.destination.name == "2026-02-01 - Radiologia"
+    assert result.destination.name == "2099-01-01 - Radiologia"
     assert manifest["exam_date_source"] == "DICOM_STUDY_DATE"
     assert manifest["exam_time"] == "08:15:00"
 
@@ -347,10 +356,10 @@ def test_different_clinical_dates_imported_on_same_day_use_distinct_destinations
     first_root, second_root = tmp_path / "first", tmp_path / "second"
     first_root.mkdir(); second_root.mkdir()
     first_archive = create_zip(
-        first_root / f"{PATIENT_NAME}_20260310111013.zip", {"a.bin": b"first"}
+        first_root / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}.zip", {"a.bin": b"first"}
     )
     second_archive = create_zip(
-        second_root / f"{PATIENT_NAME}_20260411121013.zip", {"b.bin": b"second"}
+        second_root / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP_BETA}.zip", {"b.bin": b"second"}
     )
     first, _, _, _ = build_importer(first_root)
     second, _, _, _ = build_importer(second_root)
@@ -359,8 +368,8 @@ def test_different_clinical_dates_imported_on_same_day_use_distinct_destinations
     first_result = first.run(archive_path=first_archive)
     second_result = second.run(archive_path=second_archive)
 
-    assert first_result.onedrive_destination.endswith("/2026-03-10 - Radiologia")
-    assert second_result.onedrive_destination.endswith("/2026-04-11 - Radiologia")
+    assert first_result.onedrive_destination.endswith("/2099-01-02 - Radiologia")
+    assert second_result.onedrive_destination.endswith("/2099-01-03 - Radiologia")
 
 
 def test_two_different_exams_same_patient_and_day_are_distinguished_by_time(
@@ -369,10 +378,10 @@ def test_two_different_exams_same_patient_and_day_are_distinguished_by_time(
     first_root, second_root = tmp_path / "first", tmp_path / "second"
     first_root.mkdir(); second_root.mkdir()
     first_archive = create_zip(
-        first_root / f"{PATIENT_NAME}_20260310111013.zip", {"scan.bin": b"first"}
+        first_root / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}.zip", {"scan.bin": b"first"}
     )
     second_archive = create_zip(
-        second_root / f"{PATIENT_NAME}_20260310124559.zip", {"scan.bin": b"second"}
+        second_root / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP_GAMMA}.zip", {"scan.bin": b"second"}
     )
     first, _, _, _ = build_importer(first_root)
     second, _, _, _ = build_importer(second_root)
@@ -381,9 +390,9 @@ def test_two_different_exams_same_patient_and_day_are_distinguished_by_time(
     first_result = first.run(archive_path=first_archive)
     second_result = second.run(archive_path=second_archive)
 
-    assert first_result.onedrive_destination.endswith("/2026-03-10 - Radiologia")
+    assert first_result.onedrive_destination.endswith("/2099-01-02 - Radiologia")
     assert second_result.onedrive_destination.endswith(
-        "/2026-03-10 12-45 - Radiologia"
+        "/2099-01-02 12-45 - Radiologia"
     )
     assert "(2)" not in second_result.onedrive_destination
 
@@ -446,7 +455,7 @@ def test_dicom_intelligence_reports_manifest_and_onedrive_publication(
 
 def test_completed_publication_is_incrementally_indexed(tmp_path: Path) -> None:
     archive = create_dicom_zip(
-        tmp_path / f"{PATIENT_NAME}_20260310111013.zip", tmp_path,
+        tmp_path / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}.zip", tmp_path,
         study_date="20260310", study_time="111013",
     )
     importer, _, _, output = build_importer(tmp_path)
@@ -467,7 +476,7 @@ def test_cfaz_metadata_uses_existing_pipeline_manifest_index_and_dashboard(
     tmp_path: Path,
 ) -> None:
     archive = create_zip(
-        tmp_path / f"{PATIENT_NAME}_20260310111013_CFAZ-307471.zip",
+        tmp_path / f"{PATIENT_NAME}_{SYNTHETIC_TIMESTAMP}_CFAZ-{SYNTHETIC_REQUEST_ID}.zip",
         {
             "panoramica.jpg": b"pan",
             "telerradiografia.png": b"tele",
@@ -479,14 +488,14 @@ def test_cfaz_metadata_uses_existing_pipeline_manifest_index_and_dashboard(
     importer.exam_index_service = index
     metadata = {
         "provider_id": "cfaz",
-        "request_id": "307471",
+        "request_id": SYNTHETIC_REQUEST_ID,
         "provider_exam_id": "reports:99",
         "request_date": "2026-03-10T11:00:00-03:00",
         "exam_date": "2026-03-10T11:10:13-03:00",
         "patient_name": PATIENT_NAME,
         "radiology_clinic": "Radiologia Exemplo",
         "professional": "Dra. Solicitante",
-        "source_url": "https://max.cfaz.net/requests/307471",
+        "source_url": f"https://max.cfaz.net/requests/{SYNTHETIC_REQUEST_ID}",
         "classifications": ["Laudo", "Panorâmica", "Telerradiografia"],
         "asset_count": 3,
     }
@@ -785,12 +794,12 @@ def seed_remote_manifest(
 
 
 def test_normalized_patient_name_reuses_original_onedrive_name(tmp_path: Path) -> None:
-    remote_name = "Antônio  Custódio de Souza Prado"
-    requested_name = "antonio custodio de souza prado"
+    remote_name = SYNTHETIC_PATIENT_ALPHA
+    requested_name = SYNTHETIC_PATIENT_ALPHA_ASCII
     archive = create_zip(tmp_path / f"{requested_name}_20991231.zip")
     importer, _, _, _ = build_importer(
         tmp_path,
-        patients=[Patient(id=990000010, nome=requested_name)],
+        patients=[Patient(id=SYNTHETIC_PATIENT_ID, nome=requested_name)],
     )
     client = importer.onedrive_client
     original = client.create_folder(client.root, remote_name)

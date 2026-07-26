@@ -9,13 +9,20 @@ import zipfile
 
 from acquisition.base import AcquiredPackage, AcquisitionRequest
 from acquisition.clinical_normalizer import ClinicalAssetNormalizer
+from tests.synthetic_fixtures import (
+    SYNTHETIC_CLINIC_ID,
+    SYNTHETIC_INTERNAL_REQUEST_ID,
+    SYNTHETIC_SEQUENTIAL_ID,
+)
 
 
 def request() -> AcquisitionRequest:
     return AcquisitionRequest(
-        provider_id="cfaz", request_id="27754597",
-        provider_request_id="27754597", sequential_id="85871",
-        clinic_number="30510", source_url="https://max.cfaz.net/requests/27754597",
+        provider_id="cfaz", request_id=SYNTHETIC_INTERNAL_REQUEST_ID,
+        provider_request_id=SYNTHETIC_INTERNAL_REQUEST_ID,
+        sequential_id=SYNTHETIC_SEQUENTIAL_ID,
+        clinic_number=SYNTHETIC_CLINIC_ID,
+        source_url=f"https://max.cfaz.net/requests/{SYNTHETIC_INTERNAL_REQUEST_ID}",
         patient_name=None, request_date=None, exam_date=None,
         radiology_clinic=None, professional=None, assets=(),
     )

@@ -10,6 +10,10 @@ from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
 import radiology.dicom_reader as dicom_module
 from radiology.dicom_reader import DicomReader
+from synthetic_fixtures import (
+    SYNTHETIC_PATIENT_ALPHA_ASCII,
+    SYNTHETIC_PATIENT_ALPHA_DICOM,
+)
 
 
 def write_dicom(
@@ -17,8 +21,8 @@ def write_dicom(
     *,
     study_uid: str | None = None,
     series_uid: str | None = None,
-    patient_name: str | None = "Antônio^Prado",
-    patient_id: str | None = "123",
+    patient_name: str | None = SYNTHETIC_PATIENT_ALPHA_DICOM,
+    patient_id: str | None = "SYNTHETIC-DICOM-ID",
     modality: str | None = "CT",
     description: str | None = "CBCT odontológica",
     instance_number: int | None = 1,
@@ -198,18 +202,18 @@ def test_accent_normalization_is_comparison_only(tmp_path: Path) -> None:
         tmp_path / "accent.dcm",
         study_uid=generate_uid(),
         series_uid=generate_uid(),
-        patient_name="Antônio^Custódio de Souza Prado",
-        patient_id="123",
+        patient_name=SYNTHETIC_PATIENT_ALPHA_DICOM,
+        patient_id="SYNTHETIC-DICOM-ID",
     )
 
     analysis = DicomReader().analyze(
         tmp_path,
-        confirmed_patient_name="Antonio Custodio de Souza Prado",
-        confirmed_patient_id="123",
+        confirmed_patient_name=SYNTHETIC_PATIENT_ALPHA_DICOM,
+        confirmed_patient_id="SYNTHETIC-DICOM-ID",
     )
 
     assert not any("nome incompatível" in alert for alert in analysis.alerts)
-    assert analysis.valid_dicoms[0].patient_name == "Antônio^Custódio de Souza Prado"
+    assert analysis.valid_dicoms[0].patient_name == SYNTHETIC_PATIENT_ALPHA_DICOM
 
 
 def test_incompatible_confirmed_identity_generates_alerts(tmp_path: Path) -> None:

@@ -71,12 +71,12 @@ def sensitive_message() -> EmailMessage:
         message_id="gmail-real-looking-sensitive-id-123",
         subject='TransferNow - "CLÁUDIA EXEMPLO FICTÍCIA_20991231.zip"',
         sender="TransferNow <no-reply@transfernow.net>",
-        reply_to="Unidade Fictícia <origem-ficticia@example.invalid>",
-        recipients=["destino-ficticio@example.invalid"],
+        reply_to="Unidade Fictícia <fixture1@example.com>",
+        recipients=["fixture2@example.com"],
         received_at=datetime(2099, 12, 31, tzinfo=timezone.utc),
         text_body=(
             "CORPO ULTRASSECRETO telefone +00 00 00000-0000 "
-            "paciente.ficticio@example.invalid"
+            "fixture3@example.com"
         ),
         html_body=(
             '<a href="https://transfernow.net/dl/TOKEN-ULTRASSECRETO'
@@ -125,7 +125,7 @@ def test_match_emits_expected_events_and_only_sanitized_identifiers() -> None:
         id=990000010,
         nome="CLÁUDIA EXEMPLO FICTÍCIA",
         telefone="+00 00 00000-0000",
-        email="paciente.ficticio@example.invalid",
+        email="fixture3@example.com",
     )
     workflow = workflow_with_audit(audit, [patient])
 
@@ -160,7 +160,7 @@ def test_match_emits_expected_events_and_only_sanitized_identifiers() -> None:
         "CORPO ULTRASSECRETO",
         "https://transfernow.net/dl/",
         "+00 00 00000-0000",
-        "paciente.ficticio@example.invalid",
+        "fixture3@example.com",
         "CLÁUDIA EXEMPLO FICTÍCIA",
         "gmail-real-looking-sensitive-id-123",
     ]
@@ -309,7 +309,7 @@ def test_allowlist_discards_unknown_metadata_even_in_debug() -> None:
             "message_count": 2,
             "patient_name": "PACIENTE REAL",
             "phone": "+55 11 99999-9999",
-            "email": "real@example.com",
+            "email": "fixture4@example.com",
             "token": "secret-token",
         },
     )
@@ -332,7 +332,7 @@ def test_allowlist_discards_unknown_metadata_even_in_debug() -> None:
     }
     assert "PACIENTE REAL" not in stream.getvalue()
     assert "+55 11 99999-9999" not in stream.getvalue()
-    assert "real@example.com" not in stream.getvalue()
+    assert "fixture4@example.com" not in stream.getvalue()
     assert "secret-token" not in stream.getvalue()
 
 

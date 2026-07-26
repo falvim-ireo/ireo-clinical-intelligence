@@ -14,6 +14,12 @@ from models.patient import Patient
 from radiology.gmail_dry_run import run_gmail_dry_run
 from repositories.patient_repository import InMemoryPatientRepository
 from services.patient_resolver import PatientResolver
+from tests.synthetic_fixtures import (
+    SYNTHETIC_ARCHIVE_NAME,
+    SYNTHETIC_EPOCH_MILLISECONDS,
+    SYNTHETIC_MESSAGE_ID,
+    SYNTHETIC_PERSON_ACCENTED,
+)
 from workflows.imaging_workflow import ImagingWorkflow
 
 
@@ -24,8 +30,8 @@ def encode_body(content: str) -> str:
 def gmail_message(
     *,
     message_id: str = "gmail-message-id-001",
-    subject: str = 'TransferNow - "JOÃO SILVA_20260713.zip"',
-    reply_to: str = "Sorrimagem <atendimento@sorrimagem.example>",
+    subject: str = f'TransferNow - "{SYNTHETIC_ARCHIVE_NAME}"',
+    reply_to: str = "Sorrimagem <fixture1@example.com>",
     text_body: str | None = None,
     html_body: str | None = None,
 ) -> dict:
@@ -47,7 +53,7 @@ def gmail_message(
 
     return {
         "id": message_id,
-        "internalDate": "1783956600000",
+        "internalDate": SYNTHETIC_EPOCH_MILLISECONDS,
         "payload": {
             "mimeType": "multipart/alternative",
             "headers": [
@@ -59,7 +65,7 @@ def gmail_message(
                 {"name": "Reply-To", "value": reply_to},
                 {
                     "name": "To",
-                    "value": "Radiologia <radiologia@ireo.example>",
+                    "value": "Radiologia <fixture2@example.com>",
                 },
                 {
                     "name": "Date",
@@ -111,7 +117,7 @@ class ReadOnlyFakeUsers:
         return self._messages
 
     def getProfile(self, **kwargs) -> FakeRequest:
-        return FakeRequest({"emailAddress": "ireoaju.cmj@gmail.com"})
+        return FakeRequest({"emailAddress": "fixture3@example.com"})
 
 
 class ReadOnlyFakeGmailService:
@@ -147,7 +153,7 @@ def test_parses_multipart_plain_text_and_html() -> None:
     assert message.text_body == "Mensagem em texto simples."
     assert "https://transfernow.net/dl/example" in message.html_body
     assert message.sender == "TransferNow <noreply@transfernow.net>"
-    assert message.recipients == ["radiologia@ireo.example"]
+    assert message.recipients == ["fixture2@example.com"]
     assert message.received_at.utcoffset().total_seconds() == -10800
 
 
@@ -167,14 +173,14 @@ def test_parses_html_message_without_plain_text() -> None:
 def test_preserves_truncated_subject_and_sorrimagem_reply_to() -> None:
     raw = gmail_message(
         subject="TransferNow - envio de exame...",
-        reply_to="Sorrimagem <contato@sorrimagem.example>",
+        reply_to="Sorrimagem <fixture4@example.com>",
         html_body="<p>Mensagem sem arquivo completo.</p>",
     )
 
     message = GmailConnector.parse_message(raw)
 
     assert message.subject == "TransferNow - envio de exame..."
-    assert message.reply_to == "Sorrimagem <contato@sorrimagem.example>"
+    assert message.reply_to == "Sorrimagem <fixture4@example.com>"
 
 
 def test_message_without_link_is_rejected_by_dry_run_workflow() -> None:
@@ -183,7 +189,7 @@ def test_message_without_link_is_rejected_by_dry_run_workflow() -> None:
     )
 
     with pytest.raises(ValueError, match="link HTTPS válido"):
-        workflow_with_patients(["JOÃO SILVA"]).run_dry_run(message)
+        workflow_with_patients([SYNTHETIC_PERSON_ACCENTED]).run_dry_run(message)
 
 
 def test_malicious_link_is_rejected_by_dry_run_workflow() -> None:
@@ -196,7 +202,7 @@ def test_malicious_link_is_rejected_by_dry_run_workflow() -> None:
     )
 
     with pytest.raises(ValueError, match="link HTTPS válido"):
-        workflow_with_patients(["JOÃO SILVA"]).run_dry_run(message)
+        workflow_with_patients([SYNTHETIC_PERSON_ACCENTED]).run_dry_run(message)
 
 
 def test_missing_credentials_fails_before_network(tmp_path: Path) -> None:
@@ -211,7 +217,7 @@ def test_missing_credentials_fails_before_network(tmp_path: Path) -> None:
 
 def test_connector_uses_only_read_operations_and_safe_pilot_limit() -> None:
     raw = gmail_message(
-        text_body="Contato: atendimento@sorrimagem.example",
+        text_body="Contato: fixture1@example.com",
         html_body=(
             '<a href="https://transfernow.net/dl/example">Baixar</a>'
         ),
@@ -272,7 +278,7 @@ def test_provider_notifications_use_pagination_without_changing_legacy_limit() -
         {"userId": "me", "q": "from:cfaz.example", "maxResults": 1,
          "pageToken": "next"},
     ]
-    assert connector.authenticated_account() == "ireoaju.cmj@gmail.com"
+    assert connector.authenticated_account() == "fixture3@example.com"
 
 
 def test_connector_reads_one_selected_message_without_listing_or_mutation() -> None:
@@ -300,13 +306,13 @@ def test_connector_reads_one_selected_message_without_listing_or_mutation() -> N
 
 def test_gmail_message_id_preserves_workflow_idempotency() -> None:
     raw = gmail_message(
-        text_body="Contato: atendimento@sorrimagem.example",
+        text_body="Contato: fixture1@example.com",
         html_body=(
             '<a href="https://transfernow.net/dl/example">Baixar</a>'
         ),
     )
     message = GmailConnector.parse_message(raw)
-    workflow = workflow_with_patients(["JOÃO SILVA"])
+    workflow = workflow_with_patients([SYNTHETIC_PERSON_ACCENTED])
 
     first = workflow.run_dry_run(message)
     second = workflow.run_dry_run(message)
@@ -323,9 +329,9 @@ def test_runner_has_no_transfernow_or_onedrive_network_side_effects(
         raise AssertionError("Chamadas de rede adicionais são proibidas")
 
     raw = gmail_message(
-        message_id="1783959118015abcdef",
+        message_id=SYNTHETIC_MESSAGE_ID,
         text_body=(
-            "Corpo confidencial. Contato: atendimento@sorrimagem.example"
+            "Corpo confidencial. Contato: fixture1@example.com"
         ),
         html_body=(
             '<a href="https://transfernow.net/dl/secret-token">Baixar</a>'
@@ -337,17 +343,17 @@ def test_runner_has_no_transfernow_or_onedrive_network_side_effects(
 
     result = run_gmail_dry_run(
         connector=connector,
-        workflow=workflow_with_patients(["JOÃO SILVA"]),
+        workflow=workflow_with_patients([SYNTHETIC_PERSON_ACCENTED]),
     )
     output = capsys.readouterr().out
 
     assert result == 0
-    assert "1783...cdef" in output
-    assert "1783959118015abcdef" not in output
+    assert f"{SYNTHETIC_MESSAGE_ID[:4]}...{SYNTHETIC_MESSAGE_ID[-4:]}" in output
+    assert SYNTHETIC_MESSAGE_ID not in output
     assert "secret-token" not in output
     assert "Corpo confidencial" not in output
-    assert "JOÃO SILVA_20260713.zip" in output
-    assert "JOÃO SILVA" in output
+    assert SYNTHETIC_ARCHIVE_NAME in output
+    assert SYNTHETIC_PERSON_ACCENTED in output
 
 
 def test_cli_dispatches_gmail_dry_run_without_changing_default_flow(

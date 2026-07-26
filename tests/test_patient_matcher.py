@@ -5,11 +5,23 @@ from __future__ import annotations
 from models.patient import Patient
 from radiology.dicom_reader import DicomStudy
 from radiology.patient_matcher import MatchStatus, PatientMatcher
+from tests.synthetic_fixtures import (
+    SYNTHETIC_BIRTH_DATE,
+    SYNTHETIC_NUMERIC_PATIENT_ID,
+    SYNTHETIC_PERSON_ACCENTED,
+    SYNTHETIC_PERSON_ACCENTED_ASCII,
+    SYNTHETIC_PERSON_DICOM,
+    SYNTHETIC_PERSON_EXACT,
+    SYNTHETIC_PERSON_EXACT_TITLE,
+    SYNTHETIC_PERSON_SIMILAR,
+    SYNTHETIC_PERSON_UNRELATED,
+    SYNTHETIC_STUDY_DATE,
+)
 
 
 def study(
     *,
-    patient_name: str = "JOAO DA SILVA",
+    patient_name: str = SYNTHETIC_PERSON_EXACT,
     patient_id: str | None = None,
     birth_date: str | None = None,
 ) -> DicomStudy:
@@ -18,7 +30,7 @@ def study(
     return DicomStudy(
         patient_name=patient_name,
         patient_id=patient_id,
-        study_date="20260721",
+        study_date=SYNTHETIC_STUDY_DATE,
         study_description=None,
         study_instance_uid="1.2.3",
         manufacturer=None,
@@ -37,11 +49,11 @@ def patient(identifier: int, name: str, birth_date: str | None = None) -> Patien
 
 
 def test_matches_exact_patient_id() -> None:
-    expected = patient(123, "Nome divergente")
+    expected = patient(int(SYNTHETIC_NUMERIC_PATIENT_ID), SYNTHETIC_PERSON_UNRELATED)
 
     result = PatientMatcher.match(
-        study(patient_name="OUTRO NOME", patient_id="000123"),
-        [expected, patient(456, "OUTRO NOME")],
+        study(patient_name=SYNTHETIC_PERSON_EXACT, patient_id=SYNTHETIC_NUMERIC_PATIENT_ID),
+        [expected, patient(900002, SYNTHETIC_PERSON_EXACT)],
     )
 
     assert result.status is MatchStatus.EXACT
@@ -51,10 +63,10 @@ def test_matches_exact_patient_id() -> None:
 
 
 def test_matches_exact_name_and_birth_date() -> None:
-    expected = patient(1, "João da Silva", "1980-05-03")
+    expected = patient(1, SYNTHETIC_PERSON_EXACT_TITLE, "2090-01-02")
 
     result = PatientMatcher.match(
-        study(patient_name="JOAO DA SILVA", birth_date="19800503"),
+        study(patient_name=SYNTHETIC_PERSON_EXACT, birth_date=SYNTHETIC_BIRTH_DATE),
         [expected],
     )
 
@@ -64,10 +76,10 @@ def test_matches_exact_name_and_birth_date() -> None:
 
 
 def test_matches_inverted_dicom_name_with_birth_date() -> None:
-    expected = patient(1, "João Carlos Silva", "03/05/1980")
+    expected = patient(1, SYNTHETIC_PERSON_ACCENTED, "02/01/2090")
 
     result = PatientMatcher.match(
-        study(patient_name="SILVA^JOAO^CARLOS", birth_date="19800503"),
+        study(patient_name=SYNTHETIC_PERSON_DICOM, birth_date=SYNTHETIC_BIRTH_DATE),
         [expected],
     )
 
@@ -77,10 +89,10 @@ def test_matches_inverted_dicom_name_with_birth_date() -> None:
 
 
 def test_normalizes_accents_and_case() -> None:
-    expected = patient(1, "Cláudia Ângela", "1991-12-30")
+    expected = patient(1, SYNTHETIC_PERSON_ACCENTED, "2090-01-02")
 
     result = PatientMatcher.match(
-        study(patient_name="CLAUDIA^ANGELA", birth_date="19911230"),
+        study(patient_name=SYNTHETIC_PERSON_ACCENTED_ASCII, birth_date=SYNTHETIC_BIRTH_DATE),
         [expected],
     )
 
@@ -90,10 +102,10 @@ def test_normalizes_accents_and_case() -> None:
 
 def test_homonyms_are_ambiguous() -> None:
     result = PatientMatcher.match(
-        study(patient_name="MARIA SOUZA", birth_date="19900101"),
+        study(patient_name=SYNTHETIC_PERSON_EXACT, birth_date=SYNTHETIC_BIRTH_DATE),
         [
-            patient(1, "Maria Souza", "1990-01-01"),
-            patient(2, "Maria Souza", "1990-01-01"),
+            patient(1, SYNTHETIC_PERSON_EXACT_TITLE, "2090-01-02"),
+            patient(2, SYNTHETIC_PERSON_EXACT_TITLE, "2090-01-02"),
         ],
     )
 
@@ -104,8 +116,8 @@ def test_homonyms_are_ambiguous() -> None:
 
 def test_similar_name_without_birth_never_matches_automatically() -> None:
     result = PatientMatcher.match(
-        study(patient_name="JOAO SILVA"),
-        [patient(1, "João da Silveira")],
+        study(patient_name=SYNTHETIC_PERSON_SIMILAR),
+        [patient(1, SYNTHETIC_PERSON_EXACT)],
     )
 
     assert result.status is MatchStatus.REVIEW_REQUIRED
@@ -116,8 +128,8 @@ def test_similar_name_without_birth_never_matches_automatically() -> None:
 
 def test_returns_no_match_without_candidates() -> None:
     result = PatientMatcher.match(
-        study(patient_name="JOAO DA SILVA"),
-        [patient(99, "MARIA OLIVEIRA", "1970-01-01")],
+        study(patient_name=SYNTHETIC_PERSON_EXACT),
+        [patient(99, SYNTHETIC_PERSON_UNRELATED, "2090-01-02")],
     )
 
     assert result.status is MatchStatus.NO_MATCH

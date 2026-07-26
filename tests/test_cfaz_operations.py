@@ -16,6 +16,14 @@ from acquisition.cfaz_provider import CfazAmbiguousRequestError
 from core.config import Config
 from models.email_message import EmailMessage
 from radiology.exam_index_service import ExamIndexService
+from synthetic_fixtures import (
+    SYNTHETIC_PATIENT_ALPHA,
+    SYNTHETIC_PATIENT_BETA,
+    SYNTHETIC_PATIENT_GAMMA,
+    SYNTHETIC_REQUEST_ID,
+    synthetic_patient_name,
+    synthetic_request_id,
+)
 
 
 def message(request_id: str, patient: str, *, hour: int = 9) -> EmailMessage:
@@ -25,7 +33,7 @@ def message(request_id: str, patient: str, *, hour: int = 9) -> EmailMessage:
         sender="SORRIMAGEM <noreply@cfaz.net>", reply_to=None,
         received_at=datetime(2026, 7, 20, hour, 31, tzinfo=timezone.utc),
         text_body=(
-            f"Paciente: {patient}\n"
+            f"PACIENTE SINTÉTICO 07: {patient}\n"
             f"https://max.cfaz.net/requests/{request_id}"
         ),
     )
@@ -33,7 +41,7 @@ def message(request_id: str, patient: str, *, hour: int = 9) -> EmailMessage:
 
 class Gmail:
     def __init__(self, values): self.values = values; self.calls = []
-    def authenticated_account(self): return "ireoaju.cmj@gmail.com"
+    def authenticated_account(self): return "fixture1@example.com"
     def list_provider_notifications(self, **kwargs):
         self.calls.append(kwargs)
         return self.values
@@ -42,16 +50,16 @@ class Gmail:
 def test_catalog_extracts_request_patient_date_deduplicates_and_marks_imported(tmp_path):
     history = CfazHistoryRepository(tmp_path / "index.db")
     history.mark_started(
-        request_id="82679", message_id="secret", patient_name="Maria Souza"
+        request_id=synthetic_request_id(1), message_id="secret", patient_name=synthetic_patient_name(6)
     )
     history.mark_complete(
-        request_id="82679", patient_name="Maria Souza", duration_seconds=12.5,
-        onedrive_destination="Pacientes/Maria/Radiologia/2026-07-20 - Panorâmica",
+        request_id=synthetic_request_id(1), patient_name=synthetic_patient_name(6), duration_seconds=12.5,
+        onedrive_destination="PACIENTE SINTÉTICO 07s/PACIENTE SINTÉTICO 10/Radiologia/2026-07-20 - Panorâmica",
     )
     gmail = Gmail([
-        message("82678", "João da Silva"),
-        message("82679", "Maria Souza", hour=10),
-        message("82678", "João da Silva", hour=11),
+        message(synthetic_request_id(2), synthetic_patient_name(5)),
+        message(synthetic_request_id(1), synthetic_patient_name(6), hour=10),
+        message(synthetic_request_id(2), synthetic_patient_name(5), hour=11),
     ])
     catalog = CfazNotificationCatalog(
         gmail=gmail, history=history, query="cfaz-query", limit=100
@@ -59,10 +67,10 @@ def test_catalog_extracts_request_patient_date_deduplicates_and_marks_imported(t
 
     values = catalog.list()
 
-    assert [item.request_id for item in values] == ["82678", "82679"]
-    assert [item.patient_name for item in values] == ["João da Silva", "Maria Souza"]
+    assert [item.request_id for item in values] == [synthetic_request_id(2), synthetic_request_id(1)]
+    assert [item.patient_name for item in values] == [synthetic_patient_name(5), synthetic_patient_name(6)]
     assert [item.imported for item in values] == [False, True]
-    assert [item.request_id for item in catalog.pending(values)] == ["82678"]
+    assert [item.request_id for item in catalog.pending(values)] == [synthetic_request_id(2)]
     assert gmail.calls == [{"query": "cfaz-query", "max_results": 100}]
 
 
@@ -70,11 +78,11 @@ def test_catalog_accepts_real_cfazpost_html_and_encoded_redirect(tmp_path):
     real = EmailMessage(
         message_id="must-not-be-shown",
         sender="SORRIMAGEM <noreply@cfaz.net>", reply_to=None,
-        subject="CfazPost - JULIANO GENYSON DE OLIVEIRA",
+        subject="CfazPost - PACIENTE SINTÉTICO 01",
         received_at=datetime(2026, 7, 20, 9, 31, tzinfo=timezone.utc),
         html_body=(
             '<a href="https://tracker.example/redirect?target='
-            'https%3A%2F%2Fmax.cfaz.net%2Frequests%2F82678%3Fsource%3Demail">'
+            f'https%3A%2F%2Fmax.cfaz.net%2Frequests%2F{synthetic_request_id(2)}%3Fsource%3Demail">'
             "Abrir pedido</a>"
         ),
     )
@@ -86,8 +94,8 @@ def test_catalog_accepts_real_cfazpost_html_and_encoded_redirect(tmp_path):
     values = catalog.list()
 
     assert len(values) == 1
-    assert values[0].request_id == "82678"
-    assert values[0].patient_name == "JULIANO GENYSON DE OLIVEIRA"
+    assert values[0].request_id == synthetic_request_id(2)
+    assert values[0].patient_name == synthetic_patient_name(1)
     assert values[0].accepted is True
     assert catalog.counters.gmail_messages == 1
     assert catalog.counters.cfazpost_subjects == 1
@@ -98,7 +106,7 @@ def test_catalog_accepts_real_cfazpost_html_and_encoded_redirect(tmp_path):
 def test_recognized_notification_without_request_is_visible_but_not_pending(tmp_path):
     value = EmailMessage(
         message_id="hidden", sender="SORRIMAGEM <noreply@cfaz.net>",
-        reply_to=None, subject="cfazpost - FABIANO ALVIM PEREIRA",
+        reply_to=None, subject="cfazpost - PACIENTE SINTÉTICO 03",
         received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
         html_body="<p>Seu pedido está disponível.</p>",
     )
@@ -119,14 +127,14 @@ def test_recognized_notification_without_request_is_visible_but_not_pending(tmp_
 def test_history_persists_success_failure_duration_and_destination(tmp_path):
     database = tmp_path / "index.db"
     history = CfazHistoryRepository(database)
-    history.mark_started(request_id="1", message_id="gmail-1", patient_name="Um")
+    history.mark_started(request_id="1", message_id="gmail-1", patient_name=synthetic_patient_name(12))
     history.mark_complete(
-        request_id="1", patient_name="Um", duration_seconds=5.25,
-        onedrive_destination="Pacientes/Um/Radiologia/Exame",
+        request_id="1", patient_name=synthetic_patient_name(12), duration_seconds=5.25,
+        onedrive_destination="PACIENTE SINTÉTICO 07s/PACIENTE SINTÉTICO 12/Radiologia/Exame",
     )
-    history.mark_started(request_id="2", message_id="gmail-2", patient_name="Dois")
+    history.mark_started(request_id="2", message_id="gmail-2", patient_name=synthetic_patient_name(11))
     history.mark_failed(
-        request_id="2", patient_name="Dois", duration_seconds=2.0,
+        request_id="2", patient_name=synthetic_patient_name(11), duration_seconds=2.0,
         error_code="TimeoutError",
     )
 
@@ -143,49 +151,49 @@ def test_history_persists_success_failure_duration_and_destination(tmp_path):
 def test_manual_archive_is_distinct_from_empty_cfaz_acquisition_history(tmp_path):
     database = tmp_path / "index.db"
     ExamIndexService(database).index_manifest({
-        "onedrive_destination": "Pacientes/Legado/Radiologia/2020-01-01 - Radiologia",
+        "onedrive_destination": "PACIENTE SINTÉTICO 07s/Legado/Radiologia/2020-01-01 - Radiologia",
         "publication": {
             "exam_id": "a" * 64,
             "source_archive_sha256": "b" * 64,
             "state": "COMPLETE",
         },
         "dicom_intelligence": {"studies": [], "alerts": []},
-    }, patient_name="Paciente do acervo manual", source="rebuild")
+    }, patient_name=synthetic_patient_name(2), source="rebuild")
     history = CfazHistoryRepository(database)
 
     # Acervo, timeline e dashboard existentes não constituem aquisição Cfaz.
-    assert history.is_imported("82678") is False
+    assert history.is_imported(synthetic_request_id(2)) is False
     with history._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM exams").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM cfaz_import_history").fetchone()[0] == 0
 
     # IN_PROGRESS ainda pode ser retomado e somente COMPLETE torna o pedido importado.
     history.mark_started(
-        request_id="82678", message_id="internal", patient_name="Paciente",
+        request_id=synthetic_request_id(2), message_id="internal", patient_name=synthetic_patient_name(7),
         provider_exam_id="exam-provider-1",
-        provider_request_id="23254315", sequential_id="85871",
-        clinic_number="30510",
+        provider_request_id=synthetic_request_id(3), sequential_id=synthetic_request_id(4),
+        clinic_number=synthetic_request_id(5),
     )
-    assert history.is_imported("82678") is False
+    assert history.is_imported(synthetic_request_id(2)) is False
     history.mark_complete(
-        request_id="82678", patient_name="Paciente", duration_seconds=5,
-        onedrive_destination="Pacientes/Paciente/Radiologia/Exame",
+        request_id=synthetic_request_id(2), patient_name=synthetic_patient_name(7), duration_seconds=5,
+        onedrive_destination="PACIENTE SINTÉTICO 07s/PACIENTE SINTÉTICO 07/Radiologia/Exame",
         provider_exam_id="exam-provider-1", acquisition_sha="c" * 64,
-        provider_request_id="23254315", sequential_id="85871",
-        clinic_number="30510",
+        provider_request_id=synthetic_request_id(3), sequential_id=synthetic_request_id(4),
+        clinic_number=synthetic_request_id(5),
     )
-    assert CfazHistoryRepository(database).is_imported("82678") is True
+    assert CfazHistoryRepository(database).is_imported(synthetic_request_id(2)) is True
     record = history.list_records()[0]
     assert record.provider_exam_id == "exam-provider-1"
     assert record.acquisition_sha == "c" * 64
     assert record.import_timestamp
-    assert record.provider_request_id == "23254315"
-    assert record.sequential_id == "85871"
-    assert record.clinic_number == "30510"
-    assert history.is_imported("23254315") is True
-    assert history.is_imported("85871") is True
+    assert record.provider_request_id == synthetic_request_id(3)
+    assert record.sequential_id == synthetic_request_id(4)
+    assert record.clinic_number == synthetic_request_id(5)
+    assert history.is_imported(synthetic_request_id(3)) is True
+    assert history.is_imported(synthetic_request_id(4)) is True
     second_run = CfazNotificationCatalog(
-        gmail=Gmail([message("82678", "Paciente")]), history=history,
+        gmail=Gmail([message(synthetic_request_id(2), synthetic_patient_name(7))]), history=history,
         query="query", limit=100,
     )
     listed = second_run.list()
@@ -195,9 +203,9 @@ def test_manual_archive_is_distinct_from_empty_cfaz_acquisition_history(tmp_path
 
 def test_provider_service_records_complete_operational_history(tmp_path):
     request = SimpleNamespace(
-        request_id="82678", patient_name="João", provider_id="cfaz",
+        request_id=synthetic_request_id(2), patient_name=synthetic_patient_name(9), provider_id="cfaz",
         provider_exam_id=None, exam_date=None,
-        manifest_metadata=lambda: {"provider_id": "cfaz", "request_id": "82678"},
+        manifest_metadata=lambda: {"provider_id": "cfaz", "request_id": synthetic_request_id(2)},
     )
     package = SimpleNamespace(
         request=request, archive_path=tmp_path / "package.zip", sha256="a" * 64,
@@ -212,7 +220,7 @@ def test_provider_service_records_complete_operational_history(tmp_path):
 
     class Importer:
         def run(self, **kwargs):
-            return SimpleNamespace(onedrive_destination="Pacientes/João/Radiologia/Exame")
+            return SimpleNamespace(onedrive_destination="PACIENTE SINTÉTICO 07s/PACIENTE SINTÉTICO 09/Radiologia/Exame")
 
     clock = iter((10.0, 14.5))
     history = CfazHistoryRepository(tmp_path / "history.db")
@@ -220,7 +228,7 @@ def test_provider_service_records_complete_operational_history(tmp_path):
         provider=Provider(), importer=Importer(), quarantine_root=tmp_path,
         correlation_id="correlation", history=history,
         monotonic_provider=lambda: next(clock), output=lambda _: None,
-    ).run(message("82678", "João"))
+    ).run(message(synthetic_request_id(2), synthetic_patient_name(9)))
 
     record = history.list_records()[0]
     assert record.status == "COMPLETE"
@@ -241,16 +249,16 @@ def test_ambiguous_visible_number_is_recorded_without_import(tmp_path):
     )
 
     with pytest.raises(CfazAmbiguousRequestError):
-        service.run_request_id("85871")
+        service.run_request_id(synthetic_request_id(4))
 
     record = history.list_records()[0]
     assert record.status == "AMBIGUOUS"
-    assert record.sequential_id == "85871"
+    assert record.sequential_id == synthetic_request_id(4)
     assert record.provider_request_id is None
 
 
 def test_list_and_history_commands_hide_message_id(tmp_path, monkeypatch, capsys):
-    values = [message("82678", "João da Silva")]
+    values = [message(synthetic_request_id(2), synthetic_patient_name(5))]
     database = tmp_path / "index.db"
     monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
     monkeypatch.setattr(Config, "CFAZ_GMAIL_QUERY", "query")
@@ -260,30 +268,30 @@ def test_list_and_history_commands_hide_message_id(tmp_path, monkeypatch, capsys
 
     assert main.main(["cfaz-list-notifications"]) == 0
     output = capsys.readouterr().out
-    assert "Paciente: João da Silva" in output
-    assert "Pedido: 82678" in output
+    assert f"Paciente: {synthetic_patient_name(5)}" in output
+    assert "Pedido: 99000002" in output
     assert "Status: NÃO IMPORTADO" in output
-    assert "internal-82678" not in output
+    assert "internal-99000002" not in output
 
     history = CfazHistoryRepository(database)
-    history.mark_started(request_id="82678", message_id="internal-82678", patient_name="João")
+    history.mark_started(request_id=synthetic_request_id(2), message_id="internal-99000002", patient_name=synthetic_patient_name(9))
     history.mark_complete(
-        request_id="82678", patient_name="João", duration_seconds=3.0,
-        onedrive_destination="Pacientes/João/Radiologia/Exame",
+        request_id=synthetic_request_id(2), patient_name=synthetic_patient_name(9), duration_seconds=3.0,
+        onedrive_destination="PACIENTE SINTÉTICO 07s/PACIENTE SINTÉTICO 09/Radiologia/Exame",
     )
     assert main.main(["cfaz-history"]) == 0
     output = capsys.readouterr().out
-    assert "pedido=82678" in output and "status=COMPLETE" in output
-    assert "internal-82678" not in output
+    assert "pedido=99000002" in output and "status=COMPLETE" in output
+    assert "internal-99000002" not in output
 
 
 def test_list_debug_reports_safe_diagnostics_and_effective_query(
     tmp_path, monkeypatch, capsys,
 ):
-    valid = message("82678", "JULIANO GENYSON DE OLIVEIRA")
+    valid = message(synthetic_request_id(2), synthetic_patient_name(1))
     missing = EmailMessage(
         message_id="raw-secret-id", sender="SORRIMAGEM <noreply@cfaz.net>",
-        reply_to=None, subject="CfazPost - FABIANO ALVIM PEREIRA",
+        reply_to=None, subject="CfazPost - PACIENTE SINTÉTICO 03",
         received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
         html_body="<p>sem link</p>",
     )
@@ -297,7 +305,7 @@ def test_list_debug_reports_safe_diagnostics_and_effective_query(
     assert main.main(["cfaz-list-notifications", "--debug"]) == 0
 
     output = capsys.readouterr().out
-    assert "Conta Gmail autenticada: ireoaju.cmj@gmail.com" in output
+    assert "Conta Gmail autenticada: fixture1@example.com" in output
     assert "Consulta Gmail: from:cfaz.net newer_than:365d" in output
     assert "Mensagens retornadas pelo Gmail: 2" in output
     assert "Mensagens com assunto CfazPost: 2" in output
@@ -351,7 +359,7 @@ def test_import_by_request_id_does_not_require_gmail_message_id(
                         str(tmp_path / "index.db"))
     _patch_import_runtime(
         monkeypatch,
-        [message("82678", "João"), message("82679", "Maria")], selected,
+        [message(synthetic_request_id(2), synthetic_patient_name(9)), message(synthetic_request_id(1), synthetic_patient_name(10))], selected,
     )
     import integrations.gmail_connector as gmail_module
     import acquisition.cfaz_provider as provider_module
@@ -366,14 +374,14 @@ def test_import_by_request_id_does_not_require_gmail_message_id(
     )
 
     assert main.main([
-        "radiology-import-from-cfaz", "--request-id", "82679", "--debug-auth",
+        "radiology-import-from-cfaz", "--request-id", synthetic_request_id(1), "--debug-auth",
         "--debug-payload",
     ]) == 0
 
-    assert selected == ["82679"]
+    assert selected == [synthetic_request_id(1)]
     assert provider_options["auth_diagnostics"] is True
     assert provider_options["payload_diagnostics"] is True
-    assert "internal-82679" not in capsys.readouterr().out
+    assert "internal-99000001" not in capsys.readouterr().out
 
 
 def test_explicit_completed_request_stops_before_gmail_or_provider(
@@ -383,11 +391,11 @@ def test_explicit_completed_request_stops_before_gmail_or_provider(
     monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
     history = CfazHistoryRepository(database)
     history.mark_complete(
-        request_id="23254315", patient_name="Paciente", duration_seconds=1,
+        request_id=synthetic_request_id(3), patient_name=synthetic_patient_name(7), duration_seconds=1,
         onedrive_destination="OneDrive/exame", provider_exam_id="exam-1",
         acquisition_sha="a" * 64,
-        provider_request_id="23254315", sequential_id="85871",
-        clinic_number="30510",
+        provider_request_id=synthetic_request_id(3), sequential_id=synthetic_request_id(4),
+        clinic_number=synthetic_request_id(5),
     )
     import integrations.gmail_connector as gmail_module
     import acquisition.cfaz_provider as provider_module
@@ -401,7 +409,7 @@ def test_explicit_completed_request_stops_before_gmail_or_provider(
     )
 
     assert main.main([
-        "radiology-import-from-cfaz", "--request-id", "85871"
+        "radiology-import-from-cfaz", "--request-id", synthetic_request_id(4)
     ]) == 0
 
     assert "já foi importado" in capsys.readouterr().out
@@ -412,21 +420,21 @@ def test_select_imports_chosen_pending_notification(tmp_path, monkeypatch):
     database = tmp_path / "index.db"
     monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
     history = CfazHistoryRepository(database)
-    history.mark_started(request_id="82678", message_id="hidden", patient_name="João")
+    history.mark_started(request_id=synthetic_request_id(2), message_id="hidden", patient_name=synthetic_patient_name(9))
     history.mark_complete(
-        request_id="82678", patient_name="João", duration_seconds=1,
-        onedrive_destination="OneDrive/João",
+        request_id=synthetic_request_id(2), patient_name=synthetic_patient_name(9), duration_seconds=1,
+        onedrive_destination="OneDrive/PACIENTE SINTÉTICO 09",
     )
     _patch_import_runtime(
         monkeypatch,
-        [message("82678", "João"), message("82679", "Maria"),
-         message("82680", "José")], selected,
+        [message(synthetic_request_id(2), synthetic_patient_name(9)), message(synthetic_request_id(1), synthetic_patient_name(10)),
+         message(synthetic_request_id(6), synthetic_patient_name(8))], selected,
     )
     monkeypatch.setattr("builtins.input", lambda _: "2")
 
     assert main.main(["radiology-import-from-cfaz", "--select"]) == 0
 
-    assert selected == ["82680"]
+    assert selected == [synthetic_request_id(6)]
 
 
 def test_default_imports_all_and_only_pending_notifications(tmp_path, monkeypatch):
@@ -434,20 +442,20 @@ def test_default_imports_all_and_only_pending_notifications(tmp_path, monkeypatc
     database = tmp_path / "index.db"
     monkeypatch.setattr(Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(database))
     history = CfazHistoryRepository(database)
-    history.mark_started(request_id="82679", message_id="hidden", patient_name="Maria")
+    history.mark_started(request_id=synthetic_request_id(1), message_id="hidden", patient_name=synthetic_patient_name(10))
     history.mark_complete(
-        request_id="82679", patient_name="Maria", duration_seconds=1,
-        onedrive_destination="OneDrive/Maria",
+        request_id=synthetic_request_id(1), patient_name=synthetic_patient_name(10), duration_seconds=1,
+        onedrive_destination="OneDrive/PACIENTE SINTÉTICO 10",
     )
     _patch_import_runtime(
         monkeypatch,
-        [message("82678", "João"), message("82679", "Maria"),
-         message("82680", "José")], selected,
+        [message(synthetic_request_id(2), synthetic_patient_name(9)), message(synthetic_request_id(1), synthetic_patient_name(10)),
+         message(synthetic_request_id(6), synthetic_patient_name(8))], selected,
     )
 
     assert main.main(["radiology-import-from-cfaz"]) == 0
 
-    assert selected == ["82678", "82680"]
+    assert selected == [synthetic_request_id(2), synthetic_request_id(6)]
 
 
 def test_unidentified_notifications_are_not_counted_as_imported(
@@ -455,7 +463,7 @@ def test_unidentified_notifications_are_not_counted_as_imported(
 ):
     unidentified = EmailMessage(
         message_id="hidden", sender="SORRIMAGEM <noreply@cfaz.net>",
-        reply_to=None, subject="CfazPost - PACIENTE LEGADO",
+        reply_to=None, subject="CfazPost - PACIENTE SINTÉTICO 04",
         received_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
         html_body="<p>sem link reconhecível</p>",
     )

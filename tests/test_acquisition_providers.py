@@ -20,6 +20,11 @@ from acquisition.service import ProviderAcquisitionService
 from acquisition.transfernow_provider import TransferNowProvider
 from models.email_message import EmailMessage
 from radiology.transfernow_download import DownloadResult
+from tests.synthetic_fixtures import (
+    SYNTHETIC_CPF_PLACEHOLDER,
+    SYNTHETIC_PERSON_ACCENTED,
+    SYNTHETIC_TIMESTAMP,
+)
 
 
 class Response:
@@ -52,7 +57,7 @@ class Session:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        if url.endswith("/api/v1/requests/307471"):
+        if url.endswith("/api/v1/requests/99999991"):
             if isinstance(self.request_payload, Exception): raise self.request_payload
             return Response(payload=self.request_payload)
         value = self.files[url]
@@ -72,16 +77,16 @@ def notification():
         message_id="gmail-secret", subject="Seu pedido Cfaz está disponível",
         sender="Cfaz <notificacao@cfaz.net>", reply_to=None,
         received_at=datetime(2026, 3, 10, tzinfo=timezone.utc),
-        text_body="Acesse https://max.cfaz.net/requests/307471 para consultar.",
+        text_body="Acesse https://max.cfaz.net/requests/99999991 para consultar.",
     )
 
 
 def order_payload(*, assets=True):
     return {
-        "id": 307471,
+        "id": 99999991,
         "created_at": "2026-03-10T11:00:00-03:00",
         "date": "2026-03-10T11:10:13-03:00",
-        "patient_datum": {"name": "Antônio Custódio"},
+        "patient_datum": {"name": SYNTHETIC_PERSON_ACCENTED},
         "dentist_datum": {"name": "Dra. Solicitante"},
         "clinic": {"name": "Radiologia Exemplo"},
         "images_download_links": ([
@@ -105,11 +110,11 @@ def test_authentication_supports_official_token_and_dentist_session() -> None:
 
     login = Response(headers={
         "access-token": "secret-access", "client": "client-secret",
-        "uid": "dentista@example.org", "expiry": "999999", "token-type": "Bearer",
+        "uid": "fixture1@example.com", "expiry": "999999", "token-type": "Bearer",
     })
     password_session = Session(login=login)
     provider = CfazProvider(
-        email="dentista@example.org", password="never-log", session=password_session
+        email="fixture1@example.com", password="never-log", session=password_session
     )
     provider.authenticate()
     call = password_session.calls[0]
@@ -121,7 +126,7 @@ def test_fixed_api_token_uses_exact_official_authorization_header() -> None:
     session = Session(request_payload=order_payload())
     provider = CfazProvider(api_token="  abc123  ", session=session)
 
-    provider.discover_request("307471")
+    provider.discover_request("99999991")
 
     assert session.calls[0][2]["headers"] == {"Authorization": "Token abc123"}
     for invalid in ('"abc123"', "abc 123", "abc\n123", "Token abc123"):
@@ -135,11 +140,11 @@ def test_discovers_request_metadata_all_assets_and_classifications() -> None:
     )
     request = provider.discover(notification())[0]
 
-    assert request.request_id == "307471"
-    assert request.patient_name == "Antônio Custódio"
+    assert request.request_id == "99999991"
+    assert request.patient_name == SYNTHETIC_PERSON_ACCENTED
     assert request.radiology_clinic == "Radiologia Exemplo"
     assert request.professional == "Dra. Solicitante"
-    assert request.source_url == "https://max.cfaz.net/requests/307471"
+    assert request.source_url == "https://max.cfaz.net/requests/99999991"
     assert len(request.assets) == 3
     assert {item.classification.value for item in request.assets} == {
         "Imagem", "Laudo",
@@ -150,22 +155,22 @@ def test_discovers_explicit_request_directly_without_gmail_notification() -> Non
     session = Session(request_payload=order_payload())
     provider = CfazProvider(api_token="token", session=session)
 
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
 
-    assert request.request_id == "307471"
-    assert request.provider_request_id == "307471"
-    assert session.calls[0][1].endswith("/api/v1/requests/307471")
+    assert request.request_id == "99999991"
+    assert request.provider_request_id == "99999991"
+    assert session.calls[0][1].endswith("/api/v1/requests/99999991")
     with pytest.raises(CfazRequestError, match="Request ID.*inválido"):
-        provider.discover_request("307471?token=secret")
+        provider.discover_request("99999991?token=secret")
 
 
 def test_visible_sequential_id_is_resolved_by_documented_paginated_listing() -> None:
     output = []
     detail = order_payload()
     detail.update({
-        "id": 23254315,
-        "sequential_id": 85871,
-        "clinic": {"sequential_id": 30510, "name": "must not appear in debug"},
+        "id": 99999992,
+        "sequential_id": 999991,
+        "clinic": {"sequential_id": 999992, "name": "must not appear in debug"},
     })
 
     class LookupSession:
@@ -173,9 +178,9 @@ def test_visible_sequential_id_is_resolved_by_documented_paginated_listing() -> 
         def __init__(self): self.calls = []
         def get(self, url, **kwargs):
             self.calls.append((url, kwargs))
-            if url.endswith("/requests/85871"):
+            if url.endswith("/requests/999991"):
                 return Response(status=404, payload={"message": "not found"})
-            if url.endswith("/requests/23254315"):
+            if url.endswith("/requests/99999992"):
                 return Response(payload=detail)
             page = kwargs["params"]["page"]
             if page == 1:
@@ -184,7 +189,7 @@ def test_visible_sequential_id_is_resolved_by_documented_paginated_listing() -> 
                     "pagination": {"total_pages": 2},
                 })
             return Response(payload={
-                "data": [{"id": 23254315, "sequential_id": 85871}],
+                "data": [{"id": 99999992, "sequential_id": 999991}],
                 "pagination": {"total_pages": 2},
             })
 
@@ -195,22 +200,22 @@ def test_visible_sequential_id_is_resolved_by_documented_paginated_listing() -> 
         now_provider=lambda: datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
-    request = provider.discover_request("85871")[0]
+    request = provider.discover_request("999991")[0]
 
-    assert request.request_id == "23254315"
-    assert request.provider_request_id == "23254315"
-    assert request.sequential_id == "85871"
-    assert request.clinic_number == "30510"
+    assert request.request_id == "99999992"
+    assert request.provider_request_id == "99999992"
+    assert request.sequential_id == "999991"
+    assert request.clinic_number == "999992"
     assert [call[0].rsplit("/", 1)[-1] for call in session.calls] == [
-        "85871", "requests", "requests", "23254315",
+        "999991", "requests", "requests", "99999992",
     ]
     list_params = session.calls[1][1]["params"]
     assert list_params["page"] == 1 and list_params["per_page"] == 100
     assert list_params["q[created_at_gteq]"].startswith("2025-07-24")
     text = "\n".join(output)
-    assert "Pedido visível: 85871" in text
-    assert "ID interno resolvido: 23254315" in text
-    assert "Nº Clínica: 30510" in text
+    assert "Pedido visível: 999991" in text
+    assert "ID interno resolvido: 99999992" in text
+    assert "Nº Clínica: 999992" in text
     assert "must not appear" not in text
 
 
@@ -219,11 +224,11 @@ def test_sequential_id_missing_or_ambiguous_never_imports(mode) -> None:
     class LookupSession:
         cookies = {}
         def get(self, url, **kwargs):
-            if url.endswith("/requests/85871"):
+            if url.endswith("/requests/999991"):
                 return Response(status=404, payload={})
             items = [] if mode == "missing" else [
-                {"id": 100, "sequential_id": 85871},
-                {"id": 101, "sequential_id": 85871},
+                {"id": 100, "sequential_id": 999991},
+                {"id": 101, "sequential_id": 999991},
             ]
             return Response(payload={
                 "data": items, "pagination": {"total_pages": 1},
@@ -232,22 +237,22 @@ def test_sequential_id_missing_or_ambiguous_never_imports(mode) -> None:
     provider = CfazProvider(api_token="abc123", session=LookupSession())
     expected = CfazAmbiguousRequestError if mode == "ambiguous" else CfazRequestError
     with pytest.raises(expected):
-        provider.discover_request("85871")
+        provider.discover_request("999991")
 
 
 def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
     output = []
     payload = {
         "data": {
-            "id": 307471,
+            "id": 99999991,
             "patient_datum": {
                 "name": "PATIENT MUST NOT LEAK",
-                "cpf": "00000000000",
+                "cpf": SYNTHETIC_CPF_PLACEHOLDER,
             },
             "archives": [],
             "images_download_links": [],
             "reports": [{
-                "id": 166265,
+                "id": 999993,
                 "associated_images_download_links": [],
                 "result_document": (
                     "https://files.cfaz.net/results/report.pdf?token=SIGNED-SECRET"
@@ -255,7 +260,7 @@ def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
                 "text": "REPORT CONTENT MUST NOT LEAK",
             }],
             "tomographies": [{
-                "id": 61025,
+                "id": 999994,
                 "tomography_files": [{
                     "document_url": (
                         "https://storage.googleapis.com/bucket/volume.zip?signature=SECRET"
@@ -263,7 +268,7 @@ def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
                 }],
             }],
             "link_token": (
-                "https://max.cfaz.net/requests_with_token/307471?access_token=SECRET"
+                "https://max.cfaz.net/requests_with_token/99999991?access_token=SECRET"
             ),
         }
     }
@@ -272,7 +277,7 @@ def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
         payload_diagnostics=True, output=output.append,
     )
 
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
 
     assert len(request.assets) == 2
     text = "\n".join(output)
@@ -286,7 +291,7 @@ def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
     assert "domínio=storage.googleapis.com" in text
     assert "Endpoint separado por exam_id: não documentado publicamente" in text
     for sensitive in (
-        "PATIENT MUST NOT LEAK", "00000000000", "SIGNED-SECRET",
+        "PATIENT MUST NOT LEAK", SYNTHETIC_CPF_PLACEHOLDER, "SIGNED-SECRET",
         "REPORT CONTENT MUST NOT LEAK", "signature=", "access_token=SECRET",
     ):
         assert sensitive not in text
@@ -294,12 +299,12 @@ def test_payload_diagnostics_accept_anonymized_real_nested_structure() -> None:
 
 def test_empty_diagnostics_distinguish_exams_without_files_and_denied_access(tmp_path) -> None:
     payload = order_payload(assets=False)
-    payload["tomographies"] = [{"id": 61025, "tomography_files": []}]
+    payload["tomographies"] = [{"id": 999994, "tomography_files": []}]
     provider = CfazProvider(
         api_token="abc123", session=Session(request_payload=payload),
         payload_diagnostics=True, output=lambda _: None,
     )
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
     with pytest.raises(
         CfazEmptyRequestError, match="Exames existentes sem arquivos"
     ):
@@ -317,7 +322,7 @@ def test_empty_diagnostics_distinguish_exams_without_files_and_denied_access(tmp
         payload_diagnostics=True, output=output.append,
     )
     with pytest.raises(CfazRequestError, match="HTTP 403"):
-        denied.discover_request("307471")
+        denied.discover_request("99999991")
     assert "Acesso ao pedido/arquivos: negado (HTTP 403)" in output
 
 
@@ -329,14 +334,14 @@ def test_auth_diagnostics_report_presence_and_never_credential_values() -> None:
         auth_diagnostics=True, output=output.append,
     )
 
-    provider.discover_request("307471")
+    provider.discover_request("99999991")
 
     text = "\n".join(output)
     assert "Login URL: não aplicável" in text
     assert "Token recebido: sim" in text
     assert "Authorization configurado: sim" in text
     assert "Tipo de autenticação: Token" in text
-    assert "Consulta URL: https://max.cfaz.net/api/v1/requests/307471" in text
+    assert "Consulta URL: https://max.cfaz.net/api/v1/requests/99999991" in text
     assert "Cabeçalho Authorization presente: sim" in text
     assert "Cookies enviados: não" in text
     assert "Consulta HTTP Status: 200" in text
@@ -366,7 +371,7 @@ def test_fixed_token_401_retries_once_with_sanitized_query_fallback() -> None:
         auth_diagnostics=True, output=output.append,
     )
 
-    provider.discover_request("307471")
+    provider.discover_request("99999991")
 
     assert len(session.calls) == 2
     assert session.calls[0][1] == {
@@ -391,7 +396,7 @@ def test_fixed_token_401_retries_once_with_sanitized_query_fallback() -> None:
     normal_session = FallbackSession()
     CfazProvider(
         api_token="abc123", session=normal_session
-    ).discover_request("307471")
+    ).discover_request("99999991")
     # O fallback é parte da autenticação funcional, não depende do modo debug.
     assert len(normal_session.calls) == 2
     assert normal_session.calls[1][1]["params"] == {
@@ -418,17 +423,17 @@ def test_login_and_401_diagnostics_sanitize_json_tokens_cookies_and_credentials(
         "Content-Type": "application/json; charset=utf-8",
         "Set-Cookie": "session=cookie-secret",
         "access-token": "login-secret", "client": "client-secret",
-        "uid": "dentista@example.org", "expiry": "999999",
+        "uid": "fixture1@example.com", "expiry": "999999",
         "token-type": "Bearer",
     }, cookies={"session": "cookie-secret"})
     session = UnauthorizedSession(login=login)
     provider = CfazProvider(
-        email="dentista@example.org", password="password-secret",
+        email="fixture1@example.com", password="password-secret",
         session=session, auth_diagnostics=True, output=output.append,
     )
 
     with pytest.raises(CfazRequestError, match="HTTP 401"):
-        provider.discover_request("307471")
+        provider.discover_request("99999991")
 
     text = "\n".join(output)
     assert "Login HTTP Status: 200" in text
@@ -522,7 +527,7 @@ def test_real_url_lists_html_view_link_content_dedup_and_signed_url_idempotency(
     class RealSession(Session):
         def get(self, url, **kwargs):
             self.calls.append(("GET", url, kwargs))
-            if url.endswith("/api/v1/requests/307471"):
+            if url.endswith("/api/v1/requests/99999991"):
                 return Response(payload=payload)
             responses = {
                 root_one: Response(
@@ -542,7 +547,7 @@ def test_real_url_lists_html_view_link_content_dedup_and_signed_url_idempotency(
 
     session = RealSession()
     provider = CfazProvider(api_token="abc123", session=session)
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
 
     assert len(request.assets) == 5
     assert sum(
@@ -575,7 +580,7 @@ def test_real_url_lists_html_view_link_content_dedup_and_signed_url_idempotency(
     payload["images_download_links"][0] = (
         "https://storage.googleapis.com/bucket/root-one?signature=ROTATED-SECRET"
     )
-    second_request = provider.discover_request("307471")[0]
+    second_request = provider.discover_request("99999991")[0]
     second = provider.download(second_request, tmp_path, "correlation-real")
     assert second.sha256 == first.sha256
     assert second.file_count == 3
@@ -590,7 +595,7 @@ def test_cfaz_download_rejects_declared_or_streamed_size_over_limit(tmp_path) ->
 
     class LargeSession(Session):
         def get(self, request_url, **kwargs):
-            if request_url.endswith("/api/v1/requests/307471"):
+            if request_url.endswith("/api/v1/requests/99999991"):
                 return Response(payload=payload)
             return Response(
                 content=b"\x89PNG\r\n\x1a\n12345",
@@ -600,7 +605,7 @@ def test_cfaz_download_rejects_declared_or_streamed_size_over_limit(tmp_path) ->
     provider = CfazProvider(
         api_token="abc123", session=LargeSession(), max_file_bytes=8,
     )
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
     with pytest.raises(CfazRequestError, match="excede o limite"):
         provider.download(request, tmp_path, "correlation-large")
 
@@ -624,14 +629,14 @@ def test_extensionless_jpeg_gets_readable_name_dimensions_and_thumbnail_filter(t
     class ImageSession(Session):
         def get(self, url, **kwargs):
             self.calls.append(("GET", url, kwargs))
-            if url.endswith("/api/v1/requests/307471"):
+            if url.endswith("/api/v1/requests/99999991"):
                 return Response(payload=payload)
             return Response(
                 content=files[url], headers={"Content-Type": "application/octet-stream"}
             )
 
     provider = CfazProvider(api_token="abc123", session=ImageSession())
-    request = provider.discover_request("307471")[0]
+    request = provider.discover_request("99999991")[0]
     acquired = provider.download(request, tmp_path, "jpeg-no-extension")
 
     assert acquired.file_count == 2
@@ -685,7 +690,7 @@ def test_generic_service_passes_stable_provider_identity_to_existing_pipeline(tm
     assert service.run(notification()) == ("complete",)
     call = importer.calls[0]
     assert call["source_provider"] == "cfaz"
-    assert call["acquisition_metadata"]["request_id"] == "307471"
+    assert call["acquisition_metadata"]["request_id"] == "99999991"
     assert call["acquisition_metadata"]["provider_id"] == "cfaz"
     assert len(call["acquisition_exam_id"]) == 64
     assert Path(call["archive_path"]).is_relative_to(tmp_path)
@@ -693,7 +698,7 @@ def test_generic_service_passes_stable_provider_identity_to_existing_pipeline(tm
 
 
 def test_transfernow_adapter_preserves_existing_connector_and_downloader(tmp_path) -> None:
-    archive = tmp_path / "PACIENTE_20260310111013.zip"
+    archive = tmp_path / f"PACIENTE SINTÉTICO_{SYNTHETIC_TIMESTAMP}.zip"
     archive.write_bytes(b"zip")
 
     class Downloader:
@@ -701,9 +706,10 @@ def test_transfernow_adapter_preserves_existing_connector_and_downloader(tmp_pat
             return DownloadResult(archive, 3, hashlib.sha256(b"zip").hexdigest())
 
     message = EmailMessage(
-        message_id="message", subject='TransferNow "PACIENTE_20260310111013.zip"',
+        message_id="message",
+        subject=f'TransferNow "PACIENTE SINTÉTICO_{SYNTHETIC_TIMESTAMP}.zip"',
         sender="TransferNow", reply_to=None,
-        text_body="clinic@example.org https://transfernow.net/dl/public-token",
+        text_body="fixture2@example.com https://transfernow.net/dl/public-token",
     )
     provider = TransferNowProvider(downloader=Downloader())
     request = provider.discover(message)[0]

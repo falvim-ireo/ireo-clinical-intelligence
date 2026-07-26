@@ -1,4 +1,5 @@
 from acquisition.models.clinical_package import ClinicalAsset, ClinicalPackage
+from tests.synthetic_fixtures import SYNTHETIC_CLINIC_ID, SYNTHETIC_SEQUENTIAL_ID
 
 
 def test_clinical_package_preserves_provider_metadata_and_asset_collection():
@@ -18,8 +19,11 @@ def test_clinical_package_preserves_provider_metadata_and_asset_collection():
     })
     package = ClinicalPackage(
         provider="cfaz", provider_request_id="internal-1",
-        provider_internal_id="internal-1", sequential_id="85871",
-        clinic_number="30510", patient="Paciente", exam_date="2026-07-24",
+        provider_internal_id="internal-1",
+        sequential_id=SYNTHETIC_SEQUENTIAL_ID,
+        clinic_number=SYNTHETIC_CLINIC_ID,
+        patient="Paciente Sintético",
+        exam_date="2099-01-02",
         provider_name="Cfaz", assets=(asset,),
         metadata={"owner_name": "Clínica"},
     )

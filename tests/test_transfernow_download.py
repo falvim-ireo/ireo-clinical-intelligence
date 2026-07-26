@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
+
+from tests.synthetic_fixtures import SYNTHETIC_RAR_NAME
 import requests
 
 from models.email_message import EmailMessage
@@ -153,8 +155,8 @@ def test_accents_spaces_and_windows_invalid_characters_are_sanitized(tmp_path: P
     session = FakeSession(
         FakeResponse(headers={"Content-Type": "application/octet-stream"}, chunks=(b"rar",))
     )
-    result = download(downloader(session), tmp_path, 'JOÃO ÁLVARO: EXAME? FINAL.rar')
-    assert result.path.name == "JOÃO ÁLVARO_ EXAME_ FINAL.rar"
+    result = download(downloader(session), tmp_path, 'PESSOA TESTE: EXAME? FINAL.rar')
+    assert result.path.name == "PESSOA TESTE_ EXAME_ FINAL.rar"
 
 
 def test_content_disposition_overrides_full_email_filename(tmp_path: Path) -> None:
@@ -276,7 +278,7 @@ def test_gmail_orchestration_is_readonly_and_reuses_supervised_import(tmp_path: 
         reply_to=None,
         received_at=datetime(2099, 12, 31, tzinfo=timezone.utc),
         text_body=(
-            "clinica@institucional.example enviou. Tamanho: 636 MB. "
+            "fixture1@example.com enviou. Tamanho: 636 MB. "
             "Válido: 31/12/2099 https://transfernow.net/dl/token"
         ),
     )
@@ -327,13 +329,13 @@ def test_gmail_orchestration_is_readonly_and_reuses_supervised_import(tmp_path: 
 
 
 def test_gmail_display_filename_is_separate_from_original_download_name(tmp_path: Path) -> None:
-    original = "JULIANO GENYSON DE OLIVEIRA_20260714153000.rar"
+    original = SYNTHETIC_RAR_NAME
     message = EmailMessage(
         message_id="secret-id",
         subject=f'TransferNow "{original}"',
         sender="TransferNow <noreply@transfernow.net>",
         reply_to=None,
-        text_body="clinica@example.org https://transfernow.net/dl/token",
+        text_body="fixture1@example.com https://transfernow.net/dl/token",
     )
 
     class Gmail:
@@ -375,7 +377,7 @@ def test_pipeline_continues_automatically_after_download(tmp_path: Path, monkeyp
         subject='TransferNow "PACIENTE_20991231.zip"',
         sender="TransferNow",
         reply_to=None,
-        text_body="sender@example.org https://transfernow.net/dl/token",
+        text_body="fixture2@example.com https://transfernow.net/dl/token",
     )
 
     class Gmail:

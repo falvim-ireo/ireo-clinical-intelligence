@@ -522,14 +522,14 @@ def test_provider_uses_configured_session_login_when_page_rejects_api_token():
             return HttpResponse(200, {}, headers={
                 "access-token": "session-token",
                 "client": "client",
-                "uid": "user@example.com",
+                "uid": "fixture1@example.com",
                 "expiry": "9999999999",
             })
 
     session = CredentialSession()
     provider = CfazProvider(
         api_token="token",
-        email="user@example.com",
+        email="fixture1@example.com",
         password="password",
         session=session,
         output=lambda _message: None,

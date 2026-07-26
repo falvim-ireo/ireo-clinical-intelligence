@@ -44,7 +44,7 @@ def active_patient(patient_id=1, name="MARIA SILVA") -> dict:
         "Name": name,
         "Status": "ACTIVE",
         "Phone": "0000-0000",
-        "Email": "patient@example.test",
+        "Email": "fixture1@example.com",
         "BirthDate": "2000-01-01",
     }
 
@@ -54,10 +54,10 @@ def radiology_message() -> EmailMessage:
         message_id="clinicorp-repository-workflow-001",
         subject='TransferNow - "MARIA SILVA_20260713.zip"',
         sender="TransferNow <noreply@transfernow.net>",
-        reply_to="Sorrimagem <contato@sorrimagem.example>",
-        recipients=["radiologia@ireo.example"],
+        reply_to="Sorrimagem <fixture2@example.com>",
+        recipients=["fixture3@example.com"],
         received_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
-        text_body="Contato: contato@sorrimagem.example",
+        text_body="Contato: fixture2@example.com",
         html_body=(
             '<a href="https://transfernow.net/dl/test-token">Baixar</a>'
         ),
@@ -74,7 +74,7 @@ def test_returns_one_valid_active_patient() -> None:
     assert patients[0].nome == "MARIA SILVA"
     assert patients[0].status == "ACTIVE"
     assert patients[0].telefone == "0000-0000"
-    assert patients[0].email == "patient@example.test"
+    assert patients[0].email == "fixture1@example.com"
     assert patients[0].data_nascimento == "2000-01-01"
 
 

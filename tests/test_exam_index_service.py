@@ -7,12 +7,16 @@ import time
 
 from integrations.onedrive_graph import GraphFolder, OneDriveGraphError
 from radiology.exam_index_service import ExamIndexService, OneDriveRadiologyIndexRebuilder
+from synthetic_fixtures import (
+    SYNTHETIC_PATIENT_ALPHA,
+    SYNTHETIC_PATIENT_ALPHA_ASCII,
+)
 
 
 def manifest(
     exam_id: str,
     *,
-    patient: str = "Antônio Custódio de Souza Prado",
+    patient: str = SYNTHETIC_PATIENT_ALPHA,
     exam_date: str = "2026-03-10",
     exam_time: str = "11:10:13",
     modality: str = "CT",
@@ -84,11 +88,11 @@ def manifest(
 def test_indexes_persists_and_queries_all_supported_keys(tmp_path) -> None:
     database = tmp_path / "radiology.db"
     service = ExamIndexService(database)
-    service.index_manifest(manifest("a" * 64), patient_name="Antônio Custódio")
+    service.index_manifest(manifest("a" * 64), patient_name=SYNTHETIC_PATIENT_ALPHA)
 
     reopened = ExamIndexService(database)
     assert reopened.get_by_exam_id("a" * 64).series_count == 1
-    assert reopened.find_by_patient("antonio custodio")[0].exam_id == "a" * 64
+    assert reopened.find_by_patient(SYNTHETIC_PATIENT_ALPHA_ASCII)[0].exam_id == "a" * 64
     assert reopened.find_by_date("2026-03-10")
     assert reopened.find_by_modality("ct")
     assert reopened.find_by_manufacturer("carestream")
@@ -117,7 +121,7 @@ def test_incremental_update_timeline_comparison_and_dashboard(tmp_path) -> None:
     updated = manifest("a" * 64, manufacturer="Carestream Dental")
     service.index_manifest(updated)
 
-    timeline = service.timeline("Antonio Custodio de Souza Prado")
+    timeline = service.timeline(SYNTHETIC_PATIENT_ALPHA_ASCII)
     assert [item.exam_id for item in timeline] == ["a" * 64, "b" * 64]
     assert service.get_by_exam_id("a" * 64).manufacturer == "Carestream Dental"
     assert service.compare("a" * 64, "b" * 64).differences["modality"] == ("CT", "DX")

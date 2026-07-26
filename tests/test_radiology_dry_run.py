@@ -10,25 +10,36 @@ from models.patient import Patient
 from radiology.patient_matcher import PatientMatcher
 from repositories.patient_repository import InMemoryPatientRepository
 from services.patient_resolver import PatientResolver
+from tests.synthetic_fixtures import (
+    SYNTHETIC_ARCHIVE_NAME,
+    SYNTHETIC_PERSON_ACCENTED,
+    SYNTHETIC_PERSON_ACCENTED_ASCII,
+    SYNTHETIC_PERSON_AMBIGUOUS,
+    SYNTHETIC_PERSON_AMBIGUOUS_ALT,
+    SYNTHETIC_PERSON_DICOM,
+    SYNTHETIC_PERSON_DICOM_ASCII,
+    SYNTHETIC_PERSON_UNRELATED,
+    SYNTHETIC_STUDY_DATE,
+)
 from workflows.imaging_workflow import ImagingWorkflow
 
 
 def sorrimagem_message(
     *,
     message_id: str = "sorrimagem-message-001",
-    archive_name: str = "JOÃO DA SILVA_20260713.zip",
+    archive_name: str = SYNTHETIC_ARCHIVE_NAME,
     transfer_url: str = "https://transfernow.net/dl/test-token",
 ) -> EmailMessage:
     return EmailMessage(
         message_id=message_id,
         subject=f'Sorrimagem enviou "{archive_name}"',
         sender="TransferNow <no-reply@transfernow.net>",
-        reply_to="Sorrimagem <atendimento@sorrimagem.example>",
-        recipients=["radiologia@ireo.example"],
+        reply_to="Sorrimagem <fixture1@example.com>",
+        recipients=["fixture2@example.com"],
         received_at=datetime(2026, 7, 13, 15, 30, tzinfo=timezone.utc),
         text_body=(
             "Sorrimagem compartilhou um exame. "
-            "Contato: atendimento@sorrimagem.example"
+            "Contato: fixture1@example.com"
         ),
         html_body=(
             "<p>O exame está disponível.</p>"
@@ -48,17 +59,17 @@ def workflow_with_patients(names: list[str]) -> ImagingWorkflow:
 
 
 def test_sorrimagem_email_produces_ready_dry_run_plan() -> None:
-    workflow = workflow_with_patients(["JOÃO DA SILVA"])
+    workflow = workflow_with_patients([SYNTHETIC_PERSON_ACCENTED])
 
     plan = workflow.run_dry_run(sorrimagem_message())
 
     assert plan.message_id == "sorrimagem-message-001"
     assert plan.transfer_url == "https://transfernow.net/dl/test-token"
-    assert plan.archive_name == "JOÃO DA SILVA_20260713.zip"
-    assert plan.patient_name_candidate == "JOÃO DA SILVA"
-    assert plan.sender_email == "atendimento@sorrimagem.example"
+    assert plan.archive_name == SYNTHETIC_ARCHIVE_NAME
+    assert plan.patient_name_candidate == SYNTHETIC_PERSON_ACCENTED
+    assert plan.sender_email == "fixture1@example.com"
     assert plan.proposed_destination == (
-        "Radiology Intake/JOÃO DA SILVA/JOÃO DA SILVA_20260713.zip"
+        f"Radiology Intake/{SYNTHETIC_PERSON_ACCENTED}/{SYNTHETIC_ARCHIVE_NAME}"
     )
     assert plan.requires_manual_review is False
     assert plan.review_reasons == []
@@ -66,38 +77,44 @@ def test_sorrimagem_email_produces_ready_dry_run_plan() -> None:
 
 
 def test_patient_matcher_accepts_exact_name() -> None:
-    result = PatientMatcher.match("JOÃO DA SILVA", ["JOÃO DA SILVA"])
+    result = PatientMatcher.match(SYNTHETIC_PERSON_ACCENTED, [SYNTHETIC_PERSON_ACCENTED])
 
     assert result.score == 1.0
-    assert result.selected_name == "JOÃO DA SILVA"
+    assert result.selected_name == SYNTHETIC_PERSON_ACCENTED
     assert result.requires_manual_review is False
 
 
 def test_patient_matcher_normalizes_accents_and_case() -> None:
-    result = PatientMatcher.match("JOÃO DA SILVA", ["joao da silva"])
+    result = PatientMatcher.match(
+        SYNTHETIC_PERSON_ACCENTED,
+        [SYNTHETIC_PERSON_ACCENTED_ASCII.lower()],
+    )
 
     assert result.score == 1.0
-    assert result.selected_name == "joao da silva"
+    assert result.selected_name == SYNTHETIC_PERSON_ACCENTED_ASCII.lower()
 
 
 def test_patient_matcher_normalizes_dicom_caret_separator() -> None:
-    result = PatientMatcher.match("SILVA^JOÃO^CARLOS", ["silva joao carlos"])
+    result = PatientMatcher.match(
+        SYNTHETIC_PERSON_DICOM,
+        [SYNTHETIC_PERSON_DICOM_ASCII.lower()],
+    )
 
     assert result.score == 1.0
-    assert result.selected_name == "silva joao carlos"
+    assert result.selected_name == SYNTHETIC_PERSON_DICOM_ASCII.lower()
 
 
 def test_similar_patients_require_manual_review() -> None:
     message = sorrimagem_message(
-        archive_name="ANA MARIA SILVA_20260713.zip"
+        archive_name=f"{SYNTHETIC_PERSON_AMBIGUOUS}_{SYNTHETIC_STUDY_DATE}.zip"
     )
     match_result = PatientMatcher.match(
-        "ANA MARIA SILVA",
-        ["ANA MARIA SILVA", "ANA MARIA DA SILVA"],
+        SYNTHETIC_PERSON_AMBIGUOUS,
+        [SYNTHETIC_PERSON_AMBIGUOUS, SYNTHETIC_PERSON_AMBIGUOUS_ALT],
     )
 
     plan = workflow_with_patients(
-        ["ANA MARIA SILVA", "ANA MARIA DA SILVA"],
+        [SYNTHETIC_PERSON_AMBIGUOUS, SYNTHETIC_PERSON_AMBIGUOUS_ALT],
     ).run_dry_run(message)
 
     assert match_result.selected_name is None
@@ -110,10 +127,10 @@ def test_similar_patients_require_manual_review() -> None:
 
 def test_low_score_requires_manual_review() -> None:
     message = sorrimagem_message(
-        archive_name="CARLOS EDUARDO_20260713.zip"
+        archive_name=f"{SYNTHETIC_PERSON_ACCENTED}_{SYNTHETIC_STUDY_DATE}.zip"
     )
 
-    plan = workflow_with_patients(["MARIANA COSTA"]).run_dry_run(message)
+    plan = workflow_with_patients([SYNTHETIC_PERSON_UNRELATED]).run_dry_run(message)
 
     assert plan.requires_manual_review is True
     assert "Correspondência abaixo do limiar automático." in plan.review_reasons
@@ -134,11 +151,11 @@ def test_malicious_transfernow_lookalike_is_rejected() -> None:
     )
 
     with pytest.raises(ValueError, match="link HTTPS válido"):
-        workflow_with_patients(["JOÃO DA SILVA"]).run_dry_run(message)
+        workflow_with_patients([SYNTHETIC_PERSON_ACCENTED]).run_dry_run(message)
 
 
 def test_reprocessing_message_id_reuses_the_same_logical_plan() -> None:
-    workflow = workflow_with_patients(["JOÃO DA SILVA"])
+    workflow = workflow_with_patients([SYNTHETIC_PERSON_ACCENTED])
     message = sorrimagem_message()
 
     first_plan = workflow.run_dry_run(message)
@@ -162,7 +179,7 @@ def test_dry_run_does_not_use_network_or_create_files(
     monkeypatch.setattr(Path, "touch", forbidden_operation)
 
     before = tuple(tmp_path.iterdir())
-    plan = workflow_with_patients(["JOÃO DA SILVA"]).run_dry_run(
+    plan = workflow_with_patients([SYNTHETIC_PERSON_ACCENTED]).run_dry_run(
         sorrimagem_message()
     )
     after = tuple(tmp_path.iterdir())
