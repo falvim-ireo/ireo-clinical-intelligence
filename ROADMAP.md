@@ -15,11 +15,15 @@
 - filtragem de thumbnails genéricos
 - descoberta e implementação de leitura de modelos digitais Cfaz
 - reset local auditável por pedido
+- homologação sintética integrada do ciclo Cfaz base: importação, normalização,
+  resolução de paciente, publicação local stateful, indexação, reset e
+  reimportação idempotente;
+- reconciliação fail-closed de publicação remota `COMPLETE` quando `exam_id`,
+  caminhos, checksums, tamanhos e arquivos remotos coincidem integralmente.
 
 ## Próximos
 
-- homologação ponta a ponta de dois STL Cfaz;
-- validação do reset contra todas as camadas locais de idempotência;
+- homologação real supervisionada de dois STL Cfaz e do destino OneDrive;
 - reconciliação idempotente com destino remoto existente;
 - validação em múltiplos exames;
 - upload direto Microsoft Graph;
@@ -31,3 +35,13 @@
 
 IA, busca semântica e comparação inteligente permanecem posteriores à
 homologação do repositório clínico e exigem governança própria.
+
+## Segurança adiada para antes de distribuição
+
+A reescrita do histórico Git anterior ao commit de sanitização permanece como
+débito técnico obrigatório antes de adicionar colaboradores, tornar o
+repositório público, criar releases/distribuir a aplicação, implantar em nuvem
+ou ambiente multiusuário, ou integrar serviços externos adicionais.
+
+Enquanto isso, o projeto permanece protótipo local em repositório privado,
+individual, sem dados identificáveis ou segredos em novos commits.

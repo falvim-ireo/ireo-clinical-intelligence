@@ -831,7 +831,7 @@ def test_complete_remote_import_blocks_reimport_without_new_folder(tmp_path: Pat
     )
     client.uploads.clear()
 
-    with pytest.raises(SupervisedImportError, match="já está COMPLETE"):
+    with pytest.raises(SupervisedImportError, match="COMPLETE.*bloqueado"):
         importer.run(archive_path=archive)
 
     assert client.uploads == []

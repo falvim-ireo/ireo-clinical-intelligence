@@ -5,7 +5,8 @@
 > Última atualização: 2026-07-26
 >
 > Estado documental: v1, criado por auditoria do repositório, do histórico Git e dos testes.
-> Referência de código: `main` em `d065a6f`, acrescida das alterações locais ainda não versionadas existentes em 2026-07-26.
+> Referência de código: `main` em `c2aa428`, acrescida das alterações locais
+> ainda não versionadas da Sprint 18.1.
 
 ## Protocolo obrigatório para novas sessões
 
@@ -1018,7 +1019,8 @@ modelos permanece em homologação.
 - **Descrição:** implementação e testes estão versionados em `18540ea`/`v0.17.8`, mas o fluxo real completo de dois STL não possui homologação conclusiva registrada.
 - **Causa:** integração depende de sessão browser, links efêmeros, associação de STL e destino remoto.
 - **Impacto:** modelos podem não integrar o pacote publicado de forma operacionalmente garantida.
-- **Status:** aberto, em homologação.
+- **Status:** lógica local coberta por teste integrado com STL sintético;
+  homologação real supervisionada Cfaz/OneDrive permanece pendente.
 - **Prioridade:** alta.
 - **Como reproduzir:** executar diagnóstico/dry-run para pedido elegível e seguir até download, extração, reconciliação OneDrive, indexação e segunda execução.
 - **Hipótese:** destino remoto e associação individual ainda não possuem evidência suficiente em todos os caminhos.
@@ -1029,7 +1031,10 @@ modelos permanece em homologação.
 - **Descrição:** a primeira homologação do `cfaz-reset` deixou um intake `COMPLETED` associado ao destination fingerprint, bloqueando a reimportação.
 - **Causa:** idempotência existia em `cfaz_import_history` e também em `radiology_imports`/destino.
 - **Impacto:** pedido era baixado novamente, mas bloqueado antes da publicação.
-- **Status:** correção implementada no estado consolidado; homologação real pendente.
+- **Status:** lógica local coberta por teste integrado. A reconciliação agora
+  reutiliza o remoto `COMPLETE` somente quando `exam_id`, caminhos, SHA-256,
+  tamanhos e existência remota coincidem integralmente; homologação real
+  supervisionada Cfaz/OneDrive permanece pendente.
 - **Prioridade:** alta.
 - **Como reproduzir:** pedido COMPLETE + intake COMPLETED + reset + nova importação.
 - **Hipótese:** outros marcadores locais/remotos podem ainda exigir reconciliação.
@@ -1193,12 +1198,16 @@ Uma mudança no pipeline só é aceita quando:
 | DT-006 | Criar validação automatizada que exige atualização deste arquivo por Sprint | média |
 | DT-007 | Definir retenção de histórico e quarentena | alta |
 | DT-008 | Registrar inventário completo de comandos e flags após aprovação da linha 17.x | alta |
+| DT-009 | Reescrever o histórico Git antigo para remover credenciais e dados identificáveis antes de colaboração, publicidade, release/distribuição, nuvem/multiusuário ou novas integrações externas | bloqueante antes desses gatilhos |
 
 ## 13. Roadmap
 
 ### Sprint 18 — Consolidação e homologação
 
-- homologar modelos digitais Cfaz ponta a ponta;
+- lógica local da Sprint 18.1 coberta por cenário integrado determinístico:
+  aquisição, normalização, `ClinicalPackage`, resolução inequívoca do paciente,
+  publicação stateful, manifesto, históricos, índice, reset e reimportação;
+- homologar modelos digitais Cfaz ponta a ponta em execução real supervisionada;
 - executar suíte completa e registrar resultado;
 - validar correção da segunda camada de idempotência;
 - fechar BUG-002 e BUG-006 ou documentar bloqueios verificáveis.
@@ -1240,13 +1249,13 @@ Future AI não recebe número de Sprint antes de aprovação de governança clí
 
 ## 14. Próxima Tarefa Única
 
-**SPRINT-18-TASK-001 — Homologar ponta a ponta o fluxo de modelos digitais Cfaz.**
+**SPRINT-18-TASK-002 — Homologar em execução real supervisionada o ciclo Cfaz/OneDrive.**
 
-Resultado esperado: realizar diagnóstico e homologação controlada de dois STL,
-comprovar download, extração, classificação, reconciliação OneDrive, indexação,
-consultas e segunda execução idempotente; verificar que `cfaz-reset` elimina
-todos os bloqueios locais sem apagar auditoria ou conteúdo remoto; então mover
-BUG-002 e BUG-006 conforme o resultado.
+Resultado esperado: realizar diagnóstico e homologação controlada de dois STL
+reais, comprovar aquisição, classificação, reconciliação OneDrive, indexação,
+reset e reimportação sem duplicação; então reavaliar BUG-002 e BUG-006 com
+evidência operacional. A cobertura sintética da lógica local não encerra esses
+bugs.
 
 Não iniciar outra tarefa de roadmap antes de concluir ou formalmente bloquear esta.
 
@@ -1327,6 +1336,24 @@ documentos normativos devem ser lidos.
 Histórico append-only deste documento. Entradas futuras são acrescentadas no
 topo desta seção; entradas antigas nunca são removidas ou reescritas, salvo
 correção factual acompanhada de nova entrada explicativa.
+
+### 2026-07-26 — Sprint 18.1 local, ainda não versionada
+
+- Criado um cenário integrado determinístico do ciclo Cfaz base com fronteiras
+  externas simuladas e componentes internos reais.
+- Comprovados aquisição e normalização de imagem e STL sintéticos,
+  `ClinicalPackage`, resolução inequívoca de paciente, publicação stateful,
+  manifesto, históricos, índice SQLite, reset dry-run/apply, preservação de
+  pedido de controle e reimportação.
+- Corrigida a reconciliação pós-reset: remoto `COMPLETE` só é reutilizado
+  quando inventário, caminhos, checksums, tamanhos e existência coincidem.
+- Comprovado que a terceira execução é idempotente e não acessa o provider.
+- Teste integrado direcionado aprovado; suíte completa aprovada com 525 testes
+  e 2 testes ignorados; `pip check` e `git diff --check` aprovados.
+- BUG-002 e BUG-006 permanecem abertos para homologação real supervisionada.
+- Fase 2B de reescrita histórica adiada e registrada como DT-009, bloqueante
+  antes de colaboração, publicidade, distribuição, nuvem/multiusuário ou novas
+  integrações externas.
 
 ### 2026-07-26 — Documento mestre inicial
 

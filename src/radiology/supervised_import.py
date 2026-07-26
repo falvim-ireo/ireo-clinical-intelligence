@@ -1117,9 +1117,64 @@ class SupervisedRadiologyImporter:
                         )
                 state = str(remote_publication.get("state") or "").upper()
                 if state == "COMPLETE":
-                    raise SupervisedImportError(
-                        "A importação remota deste exame já está COMPLETE; novo upload bloqueado."
+                    remote_uploaded = remote_publication.get("uploaded_files")
+                    if not isinstance(remote_uploaded, dict):
+                        raise SupervisedImportError(
+                            "A importação remota COMPLETE não possui inventário "
+                            "verificável; novo upload bloqueado."
+                        )
+                    expected_paths = set(checksums)
+                    if set(remote_uploaded) != expected_paths:
+                        raise SupervisedImportError(
+                            "A importação remota COMPLETE diverge do pacote local; "
+                            "novo upload bloqueado."
+                        )
+                    verified = all(
+                        isinstance(remote_uploaded.get(relative_name), dict)
+                        and remote_uploaded[relative_name].get("sha256")
+                        == checksum
+                        and isinstance(
+                            remote_uploaded[relative_name].get("size"), int
+                        )
+                        and self._remote_file_matches(
+                            remote_destination,
+                            Path(relative_name),
+                            remote_uploaded[relative_name]["size"],
+                        )
+                        for relative_name, checksum in checksums.items()
                     )
+                    if not verified:
+                        raise SupervisedImportError(
+                            "A importação remota COMPLETE não pôde ser validada "
+                            "integralmente; novo upload bloqueado."
+                        )
+                    remote_path = "/".join(
+                        (
+                            self.onedrive_root,
+                            patient.name,
+                            radiology.name,
+                            remote_destination.name,
+                        )
+                    )
+                    publication.clear()
+                    publication.update(
+                        json.loads(json.dumps(remote_publication))
+                    )
+                    manifest["onedrive_destination"] = remote_path
+                    manifest["status"] = "COMPLETED"
+                    manifest["import_completed_at"] = (
+                        remote_manifest.get("import_completed_at")
+                        or manifest.get("import_completed_at")
+                        or self._utc_datetime(self.now_provider())
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                    self._write_manifest(manifest_path, manifest)
+                    self.output(
+                        "Publicação remota COMPLETE validada e reutilizada; "
+                        "nenhum upload adicional foi necessário."
+                    )
+                    return remote_path
                 publication["uploaded_files"] = dict(
                     remote_publication.get("uploaded_files") or {}
                 )
