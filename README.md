@@ -4,6 +4,13 @@ Plataforma operacional para ingestão segura e supervisionada de exames radioló
 
 **Status:** MVP v1.0.0 validado em piloto real supervisionado. O sistema exige supervisão humana em todas as importações.
 
+## Documento mestre de engenharia
+
+O contexto técnico oficial, a arquitetura vigente, o histórico de Sprints,
+schemas, comandos, decisões, bugs e a próxima tarefa única estão no
+[Documento Mestre de Engenharia](docs/ENGINEERING_MASTER.md). Ele é a fonte
+única de verdade do projeto e deve ser atualizado ao final de cada Sprint.
+
 ## Fluxo
 
 ```text
