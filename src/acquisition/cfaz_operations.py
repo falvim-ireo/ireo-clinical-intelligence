@@ -178,6 +178,15 @@ class CfazHistoryRepository:
             error_code="AMBIGUOUS", acquisition_sha=None, import_timestamp=None,
         )
 
+    def mark_ready_for_reimport(self, identifier: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                """UPDATE cfaz_import_history SET status='READY_FOR_REIMPORT',
+                updated_at=?, error_code=NULL WHERE provider='cfaz' AND
+                (request_id=? OR provider_request_id=? OR sequential_id=?)""",
+                (self._now(), str(identifier), str(identifier), str(identifier)),
+            )
+
     def mark_repaired(self, identifier: str, repair_version: int) -> None:
         now = self._now()
         with self._connect() as db:

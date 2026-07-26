@@ -25,6 +25,8 @@ class ClinicalAsset:
     normalized_filename: str
     download_source: str | None = None
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    digital_model_id: str | None = None
+    stl_file_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,6 +54,8 @@ class ClinicalAsset:
             provider_metadata=dict(value.get("provider_metadata") or {
                 key: value[key] for key in ("provider", "provider_id") if key in value
             }),
+            digital_model_id=value.get("provider_exam_id") or value.get("digital_model_id"),
+            stl_file_id=value.get("provider_asset_id") or value.get("stl_file_id"),
         )
 
 

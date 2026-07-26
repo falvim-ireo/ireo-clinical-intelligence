@@ -9,8 +9,8 @@ from pathlib import Path
 import re
 import shutil
 from typing import Any, Callable
-from dataclasses import replace
-from urllib.parse import unquote, urlsplit
+from dataclasses import dataclass, field as dataclass_field, replace
+from urllib.parse import parse_qsl, unquote, urlsplit
 from html import unescape
 import zipfile
 
@@ -39,6 +39,25 @@ class CfazHTTPError(CfazRequestError):
 class CfazAmbiguousRequestError(CfazRequestError): pass
 
 
+@dataclass(frozen=True)
+class CfazDigitalModelFile:
+    """Referência efêmera a um arquivo de modelo digital do Cfaz."""
+
+    digital_model_id: str
+    stl_file_id: str
+    download_url: str = dataclass_field(repr=False)
+    filename: str | None = None
+    model_name: str | None = None
+    source_field: str | None = None
+
+
+@dataclass(frozen=True)
+class CfazDigitalModelInventory:
+    request: AcquisitionRequest
+    model_count: int
+    files: tuple[CfazDigitalModelFile, ...]
+
+
 class CfazProvider(AcquisitionProvider):
     provider_id = "cfaz"
     provider_name = "Cfaz.net"
@@ -63,6 +82,7 @@ class CfazProvider(AcquisitionProvider):
         auth_diagnostics: bool = False,
         payload_diagnostics: bool = False,
         now_provider: Callable[[], datetime] | None = None,
+        browser_resolver: Callable[..., list[str]] | None = None,
     ) -> None:
         self._api_token = str(api_token or "").strip() or None
         self._email = str(email or "").strip() or None
@@ -75,7 +95,9 @@ class CfazProvider(AcquisitionProvider):
         self.payload_diagnostics = bool(payload_diagnostics)
         self._auth_headers: dict[str, str] = {}
         self._request_exam_counts: dict[str, int] = {}
+        self._request_payloads: dict[str, dict[str, Any]] = {}
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self._browser_resolver = browser_resolver
 
     def authenticate(self) -> None:
         if self._api_token:
@@ -89,6 +111,9 @@ class CfazProvider(AcquisitionProvider):
                 self.output("Cookie recebido: não")
                 self._diagnose_configured_auth()
             return
+        self._authenticate_with_credentials()
+
+    def _authenticate_with_credentials(self) -> None:
         if not self._email or not self._password:
             raise CfazAuthenticationError("Credenciais do Cfaz não foram configuradas.")
         try:
@@ -157,6 +182,7 @@ class CfazProvider(AcquisitionProvider):
         if resolved_from_sequential and sequential_id != supplied_id:
             raise CfazRequestError("O Cfaz retornou um número visível diferente do solicitado.")
         clinic_number = self._clinic_number(data)
+        self._request_payloads[actual_id] = data
         self.output(f"Pedido visível: {sequential_id or supplied_id}")
         self.output(f"ID interno resolvido: {actual_id}")
         self.output(f"Nº Clínica: {clinic_number or 'não informado'}")
@@ -181,6 +207,162 @@ class CfazProvider(AcquisitionProvider):
             professional=self._optional_text(dentist.get("name")),
             assets=assets,
         ),)
+
+    def discover_digital_models(
+        self, request_id: str
+    ) -> CfazDigitalModelInventory:
+        """Resolve os ZIPs/STL expostos pela página autenticada do pedido."""
+        request = self.discover_request(request_id)[0]
+        payload = self._request_payloads.get(request.request_id)
+        if not isinstance(payload, dict):
+            raise CfazRequestError(
+                "Os metadados do pedido Cfaz não ficaram disponíveis para os modelos."
+            )
+        descriptors: list[dict[str, Any]] = []
+        model_links: dict[str, str] = {}
+        models = payload.get("digital_models")
+        if not isinstance(models, list):
+            models = []
+        for model_position, model in enumerate(models, 1):
+            if not isinstance(model, dict):
+                continue
+            model_id = self._optional_identifier(model.get("id"))
+            if not model_id:
+                raise CfazRequestError(
+                    "O Cfaz retornou um modelo digital sem identificador."
+                )
+            model_link = self._optional_https_url(model.get("link") or model.get("digital_model_link"))
+            if model_link:
+                model_links[model_id] = model_link
+            model_name = self._optional_text(model.get("model_name"))
+            stl_files = model.get("stl_files")
+            if not isinstance(stl_files, list):
+                stl_files = []
+            for file_position, item in enumerate(stl_files, 1):
+                if not isinstance(item, dict):
+                    continue
+                stl_file_id = self._optional_identifier(item.get("id"))
+                if not stl_file_id:
+                    raise CfazRequestError(
+                        "O Cfaz retornou um arquivo STL sem identificador."
+                    )
+                direct_url = self._optional_https_url(
+                    item.get("download_url")
+                    or item.get("url")
+                    or item.get("link")
+                )
+                descriptors.append({
+                    "digital_model_id": model_id,
+                    "stl_file_id": stl_file_id,
+                    "model_name": model_name,
+                    "filename": self._optional_text(
+                        item.get("document_file_name")
+                        or item.get("filename")
+                        or item.get("name")
+                    ),
+                    "download_url": direct_url,
+                    "source_field": (
+                        f"digital_models[{model_position}]."
+                        f"stl_files[{file_position}]"
+                    ),
+                })
+        if self.payload_diagnostics and descriptors:
+            field_names = sorted({key for item in descriptors for key in item if key not in {"download_url"}})
+            unique_ids = len({str(item["stl_file_id"]) for item in descriptors})
+            self.output("Campos técnicos STL: " + ",".join(field_names))
+            self.output(f"IDs STL únicos: {unique_ids}/{len(descriptors)}")
+        if not descriptors:
+            return CfazDigitalModelInventory(
+                request=request, model_count=len(models), files=()
+            )
+        if any(not item["download_url"] for item in descriptors):
+            page_payload = self._page_get(
+                f"/requests/{request.request_id}.json"
+            )
+            candidates = self._digital_model_url_candidates(page_payload)
+            # A resposta do pedido contém apenas os IDs. A página de detalhe
+            # do modelo é a fonte autenticada dos links assinados.
+            unresolved_ids = {
+                str(item["stl_file_id"]) for item in descriptors if not item["download_url"]
+            }
+            page_ids = {str(item.get("stl_file_id")) for item in candidates if item.get("stl_file_id")}
+            for model_id in sorted({item["digital_model_id"] for item in descriptors}):
+                if unresolved_ids.issubset(page_ids):
+                    break
+                try:
+                    model_payload = self._page_get(
+                        f"/digital_models/{model_id}.json"
+                    )
+                except CfazHTTPError as exc:
+                    if exc.status_code == 404:
+                        continue
+                    raise
+                model_candidates = self._digital_model_url_candidates(model_payload)
+                if not model_candidates:
+                    model_link = model_links.get(model_id)
+                    if model_link:
+                        model_payload = self._page_get(model_link)
+                        model_candidates = self._digital_model_url_candidates(model_payload)
+                if not model_candidates:
+                    try:
+                        model_payload = self._page_get(f"/digital_models/{model_id}")
+                    except CfazHTTPError as exc:
+                        if exc.status_code == 404:
+                            continue
+                        raise
+                    model_candidates = self._digital_model_url_candidates(model_payload)
+                candidates.extend(model_candidates)
+            self._assign_digital_model_urls(descriptors, candidates)
+        unresolved = [
+            str(item["stl_file_id"])
+            for item in descriptors if not item["download_url"]
+        ]
+        if unresolved:
+            if self._browser_resolver:
+                browser_urls = self._browser_resolver(
+                    request_id=request.request_id,
+                    model_id=str(descriptors[0]["digital_model_id"]),
+                    expected_stl_file_ids={str(item["stl_file_id"]) for item in descriptors},
+                )
+                if not isinstance(browser_urls, dict):
+                    raise CfazRequestError(
+                        "As URLs do navegador não estão associadas inequivocamente "
+                        "aos stl_file_id; associação por ordem foi bloqueada."
+                    )
+                for descriptor in descriptors:
+                    url = browser_urls.get(str(descriptor["stl_file_id"]))
+                    if url:
+                        descriptor["download_url"] = str(url)
+                        descriptor["source_field"] = "browser:unzipFileDownloadUrl"
+                unresolved = [
+                    str(item["stl_file_id"])
+                    for item in descriptors if not item["download_url"]
+                ]
+        if unresolved:
+            raise CfazRequestError(
+                "A página autenticada do Cfaz não forneceu todos os downloads "
+                "dos modelos digitais."
+            )
+        files = []
+        for item in descriptors:
+            url = str(item["download_url"])
+            self._validate_download_url(url)
+            files.append(CfazDigitalModelFile(
+                digital_model_id=str(item["digital_model_id"]),
+                stl_file_id=str(item["stl_file_id"]),
+                download_url=url,
+                filename=(
+                    self._optional_text(item.get("filename"))
+                    or self._filename_from({}, url)
+                ),
+                model_name=self._optional_text(item.get("model_name")),
+                source_field=self._optional_text(item.get("source_field")),
+            ))
+        return CfazDigitalModelInventory(
+            request=request,
+            model_count=len(models),
+            files=tuple(files),
+        )
 
     def _resolve_sequential_id(self, sequential_id: str) -> str:
         since = self._now_provider()
@@ -359,6 +541,13 @@ class CfazProvider(AcquisitionProvider):
                 "source_collection": collection,
                 "provider_section": asset.source_field,
                 "provider_display_name": refined_asset.classification.value,
+                "provider_exam_id": asset.provider_exam_id,
+                "provider_asset_id": asset.provider_asset_id,
+                "clinical_category": (
+                    "DIGITAL_MODEL"
+                    if refined_asset.classification == AssetClassification.DIGITAL_MODEL
+                    else None
+                ),
                 "provider_metadata": {
                     "provider": request.provider_id,
                     "provider_request_id": request.provider_request_id or request.request_id,
@@ -425,6 +614,37 @@ class CfazProvider(AcquisitionProvider):
             return AssetClassification.AUXILIARY_DOCUMENT
         return AssetClassification.OTHER
 
+    def download_digital_model_archive(
+        self, item: CfazDigitalModelFile, destination: str | Path
+    ) -> tuple[str, int, str]:
+        """Baixa um ZIP de modelo sem persistir a URL assinada."""
+        target = Path(destination)
+        result = self._download_asset(
+            AcquisitionAsset(
+                asset_id=f"digital-model-{item.digital_model_id}-{item.stl_file_id}",
+                download_url=item.download_url,
+                filename=item.filename,
+                classification=AssetClassification.DIGITAL_MODEL,
+                source_field=item.source_field,
+                provider_exam_id=item.digital_model_id,
+                provider_asset_id=item.stl_file_id,
+            ),
+            target,
+        )
+        if result is None:
+            raise CfazRequestError(
+                "O download do modelo digital retornou uma página em vez do arquivo."
+            )
+        digest, size, mime_type = result
+        if mime_type not in {
+            "application/zip", "application/x-zip-compressed",
+        } or not zipfile.is_zipfile(target):
+            target.unlink(missing_ok=True)
+            raise CfazRequestError(
+                "O download do modelo digital não retornou um ZIP válido."
+            )
+        return digest, size, mime_type
+
     def finalize(self, request: AcquisitionRequest, *, success: bool) -> None:
         # A API/e-mail permanecem somente leitura; o histórico local controla idempotência.
         return None
@@ -459,7 +679,7 @@ class CfazProvider(AcquisitionProvider):
             if response.status_code == 401:
                 self._diagnose_unauthorized(response)
 
-        if response.status_code == 401 and self._api_token and self.auth_diagnostics:
+        if response.status_code == 401 and self._api_token:
             try:
                 response = self._session.get(
                     url,
@@ -496,6 +716,281 @@ class CfazProvider(AcquisitionProvider):
         except (ValueError, TypeError):
             raise CfazRequestError("O Cfaz retornou JSON inválido.") from None
         return payload
+
+    def _page_get(self, path: str) -> Any:
+        """Lê o JSON usado pela página sem registrar query ou conteúdo sensível."""
+        url = path if str(path).startswith("https://") else f"{self.BASE_URL}{path}"
+        headers = {
+            **dict(self._auth_headers),
+            "Accept": "application/json",
+        }
+        try:
+            response = self._session.get(
+                url, headers=headers, timeout=self.timeout
+            )
+        except requests.Timeout:
+            raise CfazRequestError(
+                "Tempo limite excedido ao consultar os modelos digitais."
+            ) from None
+        except requests.RequestException:
+            raise CfazRequestError(
+                "Falha de comunicação ao consultar os modelos digitais."
+            ) from None
+        if response.status_code in {401, 403} and self._api_token:
+            try:
+                response = self._session.get(
+                    url,
+                    headers={"Accept": "application/json"},
+                    params={"access_token": self._api_token},
+                    timeout=self.timeout,
+                )
+            except requests.Timeout:
+                raise CfazRequestError(
+                    "Tempo limite excedido no acesso autenticado aos modelos digitais."
+                ) from None
+            except requests.RequestException:
+                raise CfazRequestError(
+                    "Falha de comunicação no acesso autenticado aos modelos digitais."
+                ) from None
+        if (
+            response.status_code in {401, 403}
+            and self._email
+            and self._password
+        ):
+            self._authenticate_with_credentials()
+            try:
+                response = self._session.get(
+                    url,
+                    headers={
+                        **dict(self._auth_headers),
+                        "Accept": "application/json",
+                    },
+                    timeout=self.timeout,
+                )
+            except requests.Timeout:
+                raise CfazRequestError(
+                    "Tempo limite excedido na sessão dos modelos digitais."
+                ) from None
+            except requests.RequestException:
+                raise CfazRequestError(
+                    "Falha de comunicação na sessão dos modelos digitais."
+                ) from None
+        # A API pode responder 204 ao token fixo para páginas protegidas.  A
+        # aplicação web, porém, entrega os links assinados no HTML da página
+        # autenticada.  Tente a representação de página (e, quando houver
+        # credenciais configuradas, a sessão de login) sem registrar seu corpo.
+        if response.status_code == 204:
+            try:
+                response = self._session.get(
+                    url,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    timeout=self.timeout,
+                )
+            except requests.Timeout:
+                raise CfazRequestError(
+                    "Tempo limite excedido ao consultar a página dos modelos digitais."
+                ) from None
+            except requests.RequestException:
+                raise CfazRequestError(
+                    "Falha de comunicação ao consultar a página dos modelos digitais."
+                ) from None
+        if (
+            response.status_code == 204
+            and self._email
+            and self._password
+        ):
+            self._authenticate_with_credentials()
+            try:
+                response = self._session.get(
+                    url,
+                    headers={
+                        **dict(self._auth_headers),
+                        "Accept": "text/html,application/xhtml+xml,application/json",
+                    },
+                    timeout=self.timeout,
+                )
+            except requests.Timeout:
+                raise CfazRequestError(
+                    "Tempo limite excedido na sessão da página dos modelos digitais."
+                ) from None
+            except requests.RequestException:
+                raise CfazRequestError(
+                    "Falha de comunicação na sessão da página dos modelos digitais."
+                ) from None
+        if not 200 <= response.status_code < 300:
+            raise CfazRequestError(
+                "O Cfaz recusou a consulta dos modelos digitais "
+                f"(HTTP {response.status_code})."
+            )
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            # A página autenticada pode ser HTML com JSON/URLs assinadas
+            # embutidos no componente DigitalModel. O corpo nunca é logado;
+            # somente sua estrutura é analisada pelo extrator sanitizado.
+            payload = getattr(response, "text", "") or ""
+            if not isinstance(payload, str):
+                payload = ""
+        if not isinstance(payload, (dict, list, str)):
+            raise CfazRequestError(
+                "A página do Cfaz retornou uma estrutura inválida para os modelos digitais."
+            )
+        if self.payload_diagnostics:
+            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
+            size = response.headers.get("Content-Length") or len(getattr(response, "content", b"") or b"")
+            if isinstance(payload, dict):
+                keys = sorted(str(key) for key in payload)
+                stl_count = sum(
+                    len(value) for key, value in payload.items()
+                    if str(key).casefold() in {"stl_files", "files"} and isinstance(value, list)
+                )
+            else:
+                keys = []
+                stl_count = 0
+            candidates = self._digital_model_url_candidates(payload)
+            self.output(
+                f"Modelo endpoint {urlsplit(str(path)).path}: HTTP {response.status_code}; "
+                f"Content-Type={content_type or 'não informado'}; tamanho={size}; "
+                f"chaves={','.join(keys[:30]) or 'nenhuma'}; stl_files={stl_count}; "
+                f"URLs candidatas={len(candidates)}"
+            )
+        return payload
+
+    @classmethod
+    def _digital_model_url_candidates(
+        cls, payload: Any
+    ) -> list[dict[str, str | None]]:
+        candidates: list[dict[str, str | None]] = []
+        seen: set[str] = set()
+        expected_id_keys = (
+            "stl_file_id", "stlfile_id", "file_id", "attachment_id", "id",
+        )
+        filename_keys = (
+            "document_file_name", "filename", "file_name", "name",
+        )
+
+        def context_value(
+            contexts: tuple[dict[str, Any], ...], keys: tuple[str, ...]
+        ) -> str | None:
+            for context in reversed(contexts):
+                normalized = {
+                    str(key).casefold(): value for key, value in context.items()
+                }
+                for key in keys:
+                    value = cls._optional_identifier(normalized.get(key))
+                    if value:
+                        return value
+            return None
+
+        def strings(value: str) -> list[str]:
+            decoded = unescape(
+                value.replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("\\u003d", "=")
+            )
+            if decoded.strip().startswith(("https://", "http://")):
+                return [decoded.strip()]
+            return re.findall(r"https?://[^\s\"'<>]+", decoded)
+
+        def visit(
+            value: Any,
+            contexts: tuple[dict[str, Any], ...] = (),
+            path: tuple[str, ...] = (),
+        ) -> None:
+            if isinstance(value, dict):
+                next_contexts = contexts + (value,)
+                for key, child in value.items():
+                    visit(child, next_contexts, path + (str(key),))
+                return
+            if isinstance(value, list):
+                for position, child in enumerate(value):
+                    visit(child, contexts, path + (f"[{position}]",))
+                return
+            if not isinstance(value, str):
+                return
+            for url in strings(value):
+                url = url.rstrip("),;")
+                if url in seen or not cls._is_digital_model_download_url(url):
+                    continue
+                cls._validate_download_url(url)
+                seen.add(url)
+                stl_file_id = context_value(contexts, expected_id_keys)
+                filename = context_value(contexts, filename_keys)
+                if not stl_file_id:
+                    joined = ".".join(path)
+                    match = re.search(r"(?<!\d)(\d{4,})(?!\d)", joined)
+                    stl_file_id = match.group(1) if match else None
+                candidates.append({
+                    "url": url,
+                    "stl_file_id": stl_file_id,
+                    "filename": filename,
+                })
+
+        visit(payload)
+        return candidates
+
+    @classmethod
+    def _assign_digital_model_urls(
+        cls,
+        descriptors: list[dict[str, Any]],
+        candidates: list[dict[str, str | None]],
+    ) -> None:
+        expected = {
+            str(item["stl_file_id"]): item for item in descriptors
+        }
+        used_urls: set[str] = set()
+        for candidate in candidates:
+            stl_file_id = str(candidate.get("stl_file_id") or "")
+            item = expected.get(stl_file_id)
+            if item is None or item.get("download_url"):
+                continue
+            url = str(candidate.get("url") or "")
+            if not url:
+                continue
+            item["download_url"] = url
+            item["filename"] = (
+                cls._optional_text(candidate.get("filename"))
+                or item.get("filename")
+            )
+            used_urls.add(url)
+        # Nunca associe candidatos sem identidade pelo comprimento ou ordem.
+        # A ausência de stl_file_id mantém o fluxo fechado.
+
+    @classmethod
+    def _is_digital_model_download_url(cls, value: str) -> bool:
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            return False
+        host = (parts.hostname or "").casefold()
+        if parts.scheme != "https" or not any(
+            host == suffix or host.endswith(f".{suffix}")
+            for suffix in cls.ALLOWED_DOWNLOAD_SUFFIXES
+        ):
+            return False
+        suffix = Path(unquote(parts.path)).suffix.casefold()
+        query_keys = {
+            key.casefold() for key, _ in parse_qsl(
+                parts.query, keep_blank_values=True
+            )
+        }
+        signed = bool(query_keys.intersection({
+            "signature", "googleaccessid", "expires",
+            "x-goog-signature", "x-goog-credential",
+        }))
+        return (
+            suffix in {".zip", ".stl"}
+            or signed
+            or host == "storage.googleapis.com"
+            or host.endswith(".storage.googleapis.com")
+        )
+
+    @staticmethod
+    def _optional_https_url(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text if text.startswith("https://") else None
 
     def _diagnose_login_response(self, response: Any) -> None:
         self.output(f"Login URL: {self.API_ROOT}/auth/sign_in")
@@ -633,6 +1128,27 @@ class CfazProvider(AcquisitionProvider):
                     AssetClassification.REPORT, True,
                 ))
 
+        # Modelos digitais são uma coleção explícita do payload e não devem
+        # passar pelo walker genérico de imagens/documentos.
+        for model_position, model in enumerate(payload.get("digital_models") or [], 1):
+            if not isinstance(model, dict):
+                continue
+            model_id = str(model.get("id") or "").strip() or None
+            for file_position, file in enumerate(model.get("stl_files") or [], 1):
+                if not isinstance(file, dict):
+                    continue
+                url = file.get("download_url")
+                if not isinstance(url, str) or not url.strip().startswith("https://"):
+                    continue
+                filename = str(file.get("document_file_name") or "").strip() or None
+                found.append((
+                    url.strip(), {
+                        "filename": filename, "id": file.get("id"),
+                        "provider_exam_id": model_id,
+                    }, f"digital_models[{model_position}].stl_files[{file_position}]",
+                    AssetClassification.DIGITAL_MODEL, False,
+                ))
+
         def visit(value: Any, context: dict[str, Any] | None = None, path="request") -> None:
             if isinstance(value, dict):
                 for key, child in value.items():
@@ -681,6 +1197,8 @@ class CfazProvider(AcquisitionProvider):
                 classification=classification,
                 source_field=source_field,
                 probe_html=probe_html,
+                provider_exam_id=str(metadata.get("provider_exam_id") or "") or None,
+                provider_asset_id=str(metadata.get("id") or "") or None,
             ))
         return assets
 
@@ -1088,6 +1606,8 @@ class CfazProvider(AcquisitionProvider):
             prefix = "fotografia"
         elif asset.classification == AssetClassification.REPORT:
             prefix = "laudo"
+        elif asset.classification == AssetClassification.DIGITAL_MODEL:
+            prefix = "modelo_digital"
         else:
             prefix = "imagem" if mime_type.startswith("image/") else "arquivo"
         extension = {

@@ -389,11 +389,14 @@ def test_fixed_token_401_retries_once_with_sanitized_query_fallback() -> None:
     ) in text
 
     normal_session = FallbackSession()
-    with pytest.raises(CfazRequestError, match="HTTP 401"):
-        CfazProvider(api_token="abc123", session=normal_session).discover_request(
-            "307471"
-        )
-    assert len(normal_session.calls) == 1
+    CfazProvider(
+        api_token="abc123", session=normal_session
+    ).discover_request("307471")
+    # O fallback é parte da autenticação funcional, não depende do modo debug.
+    assert len(normal_session.calls) == 2
+    assert normal_session.calls[1][1]["params"] == {
+        "access_token": "abc123"
+    }
 
 
 def test_login_and_401_diagnostics_sanitize_json_tokens_cookies_and_credentials() -> None:

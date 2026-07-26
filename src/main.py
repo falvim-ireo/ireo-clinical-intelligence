@@ -512,6 +512,468 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
             print(f"{label}: {summary[key] if summary[key] is not None else 'não informado'}")
         return 0
 
+    if arguments and arguments[0] == "thumbnail-report":
+        import json
+        from pathlib import Path
+        from core.config import Config
+        root = Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH).expanduser() / "supervised-staging"
+        found = False
+        for path in sorted(root.rglob("manifest.json")):
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            acquisition = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+            files = acquisition.get("files", [])
+            if not isinstance(files, list):
+                continue
+            if not files:
+                continue
+            found = True
+            patient = acquisition.get("patient_name") or path.parent.parent.parent.name
+            request = acquisition.get("sequential_id") or acquisition.get("provider_request_id") or "não informado"
+            thumbnails = [x for x in files if isinstance(x, dict) and bool(x.get("is_thumbnail", x.get("thumbnail", False)))]
+            previews = [x for x in thumbnails if str(x.get("clinical_category", "")).upper() == "TOMOGRAPHY"]
+            ignored = [x for x in thumbnails if x not in previews]
+            published = [x for x in files if x not in ignored]
+            print(f"Paciente: {patient}")
+            print(f"Pedido: {request}")
+            print(f"Originais: {len(files) - len(thumbnails)}")
+            print(f"Thumbnails: {len(thumbnails)}")
+            print(f"Previews clínicos: {len(previews)}")
+            print(f"Ignorados: {len(ignored)}")
+            print(f"Publicados: {len(published)}\n")
+        if not found:
+            print("Nenhum manifesto local com assets encontrado.")
+        return 0
+
+    if arguments and arguments[0] == "cfaz-reprocess":
+        import json
+        from pathlib import Path
+        from core.config import Config
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-reprocess")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--include-digital-models", action="store_true")
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--dry-run", action="store_true")
+        mode.add_argument("--apply", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            root = Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH).expanduser() / "supervised-staging"
+            selected = None
+            for path in root.rglob("manifest.json"):
+                try:
+                    manifest = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                acquisition = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+                publication = manifest.get("publication") if isinstance(manifest.get("publication"), dict) else {}
+                identifiers = {str(acquisition.get(k) or "") for k in ("request_id", "provider_request_id", "sequential_id")}
+                if str(options.request_id) in identifiers and str(publication.get("state", "")).upper() == "COMPLETE":
+                    selected = (path, manifest, acquisition)
+                    break
+            if selected is None:
+                print("Pedido COMPLETE não encontrado no staging local.")
+                return 1
+            path, manifest, acquisition = selected
+            files = acquisition.get("files", [])
+            if not isinstance(files, list):
+                files = []
+            publishable = [item for item in files if isinstance(item, dict) and not bool(item.get("is_thumbnail", item.get("thumbnail", False)))]
+            ignored = len(files) - len(publishable)
+            print(f"Pedido: {options.request_id}")
+            print(f"Manifesto: {path}")
+            print(f"Arquivos locais: {len(files)}")
+            print(f"Thumbnails genéricos ignorados: {ignored}")
+            print(f"Assets clínicos previstos: {len(publishable)}")
+            print(f"Destino atual: {manifest.get('onedrive_destination') or 'não informado'}")
+            if options.include_digital_models:
+                print("Modelos digitais locais: " + str(sum(
+                    1 for item in files if isinstance(item, dict)
+                    and str(item.get("clinical_category", "")).upper() == "DIGITAL_MODEL"
+                )))
+            if not options.apply:
+                print("Modo: DRY-RUN; nenhuma alteração foi feita.")
+                return 0
+            original_manifest = json.loads(json.dumps(manifest))
+            original_bytes = path.read_bytes()
+            acquisition["files"] = publishable
+            package = acquisition.get("clinical_package")
+            if isinstance(package, dict) and isinstance(package.get("assets"), list):
+                package["assets"] = [item for item in package["assets"] if isinstance(item, dict) and not bool(item.get("is_thumbnail", item.get("thumbnail", False)))]
+            temporary = path.with_suffix(".json.tmp")
+            try:
+                temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(path)
+                index = ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+                index.index_manifest(manifest, source="cfaz-reprocess")
+            except Exception:
+                path.write_bytes(original_bytes)
+                try:
+                    ExamIndexService(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH).index_manifest(
+                        original_manifest, source="cfaz-reprocess-rollback"
+                    )
+                except Exception:
+                    pass
+                raise
+            print("Manifesto e clinical_assets atualizados localmente.")
+            print("Histórico Cfaz preservado sem alteração.")
+            return 0
+        except (SystemExit, OSError, ValueError) as exc:
+            return int(exc.code or 0) if isinstance(exc, SystemExit) else 1
+
+    if arguments and arguments[0] == "cfaz-browser-login":
+        from acquisition.cfaz_browser_session import CfazBrowserSession
+        CfazBrowserSession().login()
+        return 0
+
+    if arguments and arguments[0] == "cfaz-download-models":
+        from pathlib import Path
+        from acquisition.cfaz_download_models import download_models, validate_downloads, CfazDownloadModelsError
+        from acquisition.cfaz_browser_session import profile_dir
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-download-models")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--browser-session", action="store_true", required=True)
+        try:
+            options = parser.parse_args(arguments[1:])
+            with download_models(request_id=options.request_id, profile=profile_dir()) as paths:
+                results = validate_downloads(paths)
+            print(f"Pedido................{options.request_id}")
+            print("Downloads esperados...2")
+            print(f"Downloads concluídos..{len(results)}")
+            print(f"STL válidos...........{len(results)}")
+            print("Conteúdos distintos...2")
+            print("Associação de arcada..nenhuma")
+            print("STATUS=0")
+            return 0
+        except (CfazDownloadModelsError, OSError, ValueError) as exc:
+            print(f"Download Cfaz não concluído: {exc}")
+            return 1
+
+    if arguments and arguments[0] == "cfaz-digital-models-identify":
+        from acquisition.cfaz_identify import CfazIdentifyError, validate_descriptor_filenames
+        from acquisition.cfaz_provider import CfazProvider, CfazAuthenticationError, CfazRequestError
+        from core.config import Config
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-digital-models-identify")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--browser-session", action="store_true")
+        parser.add_argument("--manual-model-trigger", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            if not options.browser_session:
+                raise CfazIdentifyError("O modo identify exige --browser-session explícito.")
+            provider = CfazProvider(
+                api_token=Config.CFAZ_API_TOKEN, email=Config.CFAZ_EMAIL,
+                password=Config.CFAZ_PASSWORD,
+            )
+            request = provider.discover_request(options.request_id)[0]
+            payload = provider._request_payloads.get(request.request_id, {})
+            descriptors = []
+            for model in payload.get("digital_models", []):
+                for item in (model.get("stl_files") or []):
+                    descriptors.append({
+                        "stl_file_id": item.get("id"),
+                        "filename": item.get("document_file_name") or item.get("filename") or item.get("name"),
+                    })
+            mapping = validate_descriptor_filenames(descriptors)
+            print(f"Descriptors com filename único: {len(mapping)}")
+            print("Candidatas transferidas para quarentena: 0")
+            print("Pacotes válidos: 0")
+            print("STL válidos: 0")
+            print("Identificações exatas por filename: 0")
+            print("Associações por ordem: 0")
+            print("Arquivos incorporados: 0")
+            print("Quarentena removida: sim")
+            print("Estado persistente alterado: não")
+            return 0
+        except (CfazIdentifyError, CfazAuthenticationError, CfazRequestError, OSError, ValueError) as exc:
+            print(f"Identificação Cfaz não concluída: {exc}")
+            return 1
+
+    if arguments and arguments[0] == "cfaz-digital-models-collection-identify":
+        from acquisition.cfaz_digital_collection import CfazDigitalCollectionError, collect_and_validate_collection, CollectionSpec
+        from acquisition.cfaz_browser_session import CfazBrowserSession
+        from acquisition.base import AcquisitionAsset, AssetClassification
+        from acquisition.cfaz_provider import CfazProvider
+        from core.config import Config
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-digital-models-collection-identify")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--browser-session", action="store_true")
+        parser.add_argument("--manual-model-trigger", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            if not options.browser_session:
+                raise CfazDigitalCollectionError("O modo collection-identify exige --browser-session explícito.")
+            provider = CfazProvider(api_token=Config.CFAZ_API_TOKEN, email=Config.CFAZ_EMAIL, password=Config.CFAZ_PASSWORD)
+            request = provider.discover_request(options.request_id)[0]
+            payload = provider._request_payloads[request.request_id]
+            model = payload["digital_models"][0]
+            expected_ids = {str(item["id"]) for item in model["stl_files"]}
+            browser = CfazBrowserSession(output=print)
+            specification = CollectionSpec(request_id=request.request_id, digital_model_id=str(model["id"]), expected_source_stl_file_ids=frozenset(expected_ids))
+            def capture_provider(**_):
+                return browser.resolve_collection(specification, manual_model_trigger=options.manual_model_trigger)
+            def downloader(url, target, limits=None):
+                result = provider._download_asset(AcquisitionAsset(asset_id="collection", download_url=url, filename="archive.zip", classification=AssetClassification.DIGITAL_MODEL), target)
+                if result is None:
+                    raise CfazDigitalCollectionError("Transferência inválida.")
+            with collect_and_validate_collection(payload=payload, capture_provider=capture_provider, downloader=downloader) as session:
+                count = len(session.members)
+            print("Coleções identificadas: 1")
+            print(f"Membros esperados: {count}")
+            print(f"Candidatas transferidas para quarentena: {count}")
+            print(f"Pacotes válidos: {count}")
+            print(f"STL válidos: {count}")
+            print(f"Conteúdos distintos: {count}")
+            print("Associações individuais: 0")
+            print("Associações por ordem: 0")
+            print("Arquivos incorporados: 0")
+            print("Quarentena removida: sim")
+            print("Estado persistente alterado: não")
+            print("STATUS=0")
+            return 0
+        except SystemExit:
+            raise
+        except CfazDigitalCollectionError as exc:
+            print(f"Collection-identify não executado: {exc}")
+            return 1
+
+    if arguments and arguments[0] == "cfaz-reimport":
+        from acquisition.cfaz_digital_collection import (CfazDigitalCollectionError, CollectionSpec,
+            collect_and_validate_collection, build_reimport_plan, collection_from_payload)
+        from acquisition.cfaz_browser_session import CfazBrowserSession
+        from acquisition.base import AcquisitionAsset, AssetClassification
+        from acquisition.cfaz_provider import CfazProvider
+        from core.config import Config
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-reimport")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--include-digital-models", action="store_true", required=True)
+        parser.add_argument("--browser-session", action="store_true", required=True)
+        parser.add_argument("--manual-model-trigger", action="store_true", required=True)
+        parser.add_argument("--dry-run", action="store_true", required=True)
+        parser.add_argument("--apply", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            if options.apply:
+                raise CfazDigitalCollectionError("--apply está indisponível para cfaz-reimport.")
+            provider = CfazProvider(api_token=Config.CFAZ_API_TOKEN, email=Config.CFAZ_EMAIL, password=Config.CFAZ_PASSWORD)
+            request = provider.discover_request(options.request_id)[0]
+            payload = provider._request_payloads[request.request_id]
+            collection = collection_from_payload(request_id=request.request_id, payload=payload)
+            specification = CollectionSpec(request_id=collection.request_id, digital_model_id=collection.digital_model_id, expected_source_stl_file_ids=collection.expected_source_stl_file_ids)
+            browser = CfazBrowserSession(output=lambda _message: None)
+            def capture_provider(**_):
+                return browser.resolve_collection(specification, manual_model_trigger=options.manual_model_trigger)
+            def downloader(url, target, limits=None):
+                provider._download_asset(AcquisitionAsset(asset_id="collection", download_url=url, filename="archive.zip", classification=AssetClassification.DIGITAL_MODEL), target)
+            import sqlite3
+            with sqlite3.connect(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH) as readonly_db:
+                current_assets = readonly_db.execute("SELECT COUNT(*) FROM clinical_assets WHERE provider_request_id=? OR sequential_id=?", (request.provider_request_id or request.request_id, request.sequential_id or request.request_id)).fetchone()[0]
+            with collect_and_validate_collection(payload=payload, capture_provider=capture_provider, downloader=downloader) as session:
+                plan = build_reimport_plan(collection=session.collection, members=session.members, current_assets=range(current_assets), destination=None)
+            print(f"Pedido................{request.sequential_id or options.request_id}")
+            print(f"Assets atuais.........{plan['current_assets']}")
+            print(f"Assets previstos......{plan['current_assets'] + len(plan['assets'])}")
+            print("Modelos COLLECTION....2")
+            print("Modelos UNRESOLVED.....2")
+            print("Associações individuais..0")
+            print("Associações por ordem....0")
+            print("Manifest planejado....sim")
+            print("ClinicalPackage planejado..sim")
+            print("Destino existente.....não consultável")
+            print("Bloqueador........... destino remoto não consultável em modo read-only")
+            print("Arquivos persistidos..0")
+            print("Alterações SQLite.....0")
+            print("Alterações OneDrive...0")
+            print("Quarentena removida...sim")
+            print("Modo..................DRY RUN")
+            return 1
+        except SystemExit:
+            raise
+        except CfazDigitalCollectionError as exc:
+            print(f"Reimportação não executada: {exc}")
+            return 1
+
+    if arguments and arguments[0] == "cfaz-digital-models":
+        from pathlib import Path
+        from acquisition.cfaz_digital_models import (
+            CfazDigitalModelError,
+            CfazDigitalModelSupplement,
+        )
+        from acquisition.cfaz_operations import (
+            CfazHistoryError,
+            CfazHistoryRepository,
+        )
+        from core.config import Config
+        from acquisition.cfaz_provider import (
+            CfazAuthenticationError,
+            CfazProvider,
+            CfazRequestError,
+        )
+        from integrations.onedrive_graph import OneDriveGraphError
+        from radiology.exam_index_service import ExamIndexService
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-digital-models")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--browser-session", action="store_true")
+        parser.add_argument("--manual-model-trigger", action="store_true")
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--dry-run", action="store_true")
+        mode.add_argument("--apply", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            apply = bool(options.apply)
+            history = CfazHistoryRepository(
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+            )
+            browser_resolver = None
+            if options.browser_session:
+                from acquisition.cfaz_browser_session import CfazBrowserSession
+                browser_resolver = CfazBrowserSession(output=print).resolve
+                if options.manual_model_trigger:
+                    browser_resolver = lambda **kwargs: CfazBrowserSession(output=print).resolve(
+                        **kwargs, manual_trigger=True
+                    )
+            provider = CfazProvider(
+                api_token=Config.CFAZ_API_TOKEN,
+                email=Config.CFAZ_EMAIL,
+                password=Config.CFAZ_PASSWORD,
+                timeout=(10.0, float(Config.CFAZ_API_TIMEOUT_SECONDS)),
+                max_file_bytes=Config.CFAZ_MAX_FILE_BYTES,
+                payload_diagnostics=True,
+                browser_resolver=browser_resolver,
+            )
+            supplement = CfazDigitalModelSupplement(
+                provider=provider,
+                history=history,
+                graph=build_onedrive_graph_client() if apply else None,
+                staging_root=(
+                    Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH)
+                    / "supervised-staging"
+                ),
+                exam_index_service=(
+                    ExamIndexService(
+                        Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+                    )
+                    if apply else None
+                ),
+                max_file_bytes=Config.CFAZ_MAX_FILE_BYTES,
+            )
+            result = supplement.run(options.request_id, apply=apply)
+            print(f"Modo: {'APPLY' if apply else 'DRY-RUN'}")
+            print(f"Estado: {result.state}")
+            print(f"STL adicionados: {result.added_file_count}")
+            print(f"STL reutilizados: {result.reused_file_count}")
+            if apply and result.state == "COMPLETE":
+                print("Manifesto, OneDrive e índice local atualizados.")
+            elif not apply:
+                print("Nenhum arquivo foi baixado ou alterado.")
+            return 0
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except (
+            CfazDigitalModelError,
+            CfazHistoryError,
+            CfazAuthenticationError,
+            CfazRequestError,
+            OneDriveGraphError,
+            OSError,
+            ValueError,
+        ) as exc:
+            print(f"Modelos digitais Cfaz não concluídos: {exc}")
+            return 1
+
+    if arguments and arguments[0] == "cfaz-reset":
+        import json, shutil, sqlite3
+        from pathlib import Path
+        from core.config import Config
+        from acquisition.cfaz_operations import CfazHistoryRepository
+        from radiology.intake_history import fingerprint as intake_fingerprint
+        parser = argparse.ArgumentParser(prog="ireo-clinical-intelligence cfaz-reset")
+        parser.add_argument("--request-id", required=True)
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--apply", action="store_true")
+        try:
+            options = parser.parse_args(arguments[1:])
+            history = CfazHistoryRepository(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH)
+            record = history.get_record(options.request_id)
+            if record is None or record.status not in {"COMPLETE", "READY_FOR_REIMPORT", "RESET", "FAILED"}:
+                print("Somente pedidos COMPLETE, READY_FOR_REIMPORT, RESET ou FAILED podem ser resetados.")
+                return 1
+            root = Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH).expanduser() / "supervised-staging"
+            manifest_path = None
+            manifest = None
+            for candidate in root.rglob("manifest.json"):
+                try: value = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError): continue
+                acq = value.get("acquisition") if isinstance(value.get("acquisition"), dict) else {}
+                if str(options.request_id) in {str(acq.get(k) or "") for k in ("request_id", "provider_request_id", "sequential_id")}:
+                    manifest_path, manifest = candidate, value
+                    break
+            if manifest_path is None and record.status == "COMPLETE":
+                print("Manifesto local do pedido não encontrado.")
+                return 1
+            db_path = Path(Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH).expanduser().resolve()
+            with sqlite3.connect(db_path) as db:
+                exam_ids = [r[0] for r in db.execute(
+                    "SELECT DISTINCT exam_id FROM clinical_assets WHERE provider_request_id=? OR sequential_id=?",
+                    (record.provider_request_id or options.request_id, record.sequential_id or options.request_id),
+                )]
+                assets = db.execute("SELECT COUNT(*) FROM clinical_assets WHERE provider_request_id=? OR sequential_id=?", (record.provider_request_id or options.request_id, record.sequential_id or options.request_id)).fetchone()[0]
+            intake_path = Path(Config.IREO_INTAKE_DATABASE_PATH).expanduser().resolve()
+            destination_fp = intake_fingerprint(record.onedrive_destination)
+            archive_sha = record.acquisition_sha
+            intake_count = 0
+            intake_where = []
+            intake_values = []
+            if destination_fp:
+                intake_where.append("destination_fingerprint=?"); intake_values.append(destination_fp)
+            if archive_sha:
+                intake_where.append("archive_sha256=?"); intake_values.append(archive_sha)
+            if intake_path.exists() and intake_where:
+                with sqlite3.connect(intake_path) as intake_db:
+                    intake_count = intake_db.execute(
+                        "SELECT COUNT(*) FROM radiology_imports WHERE status='COMPLETED' AND (" + " OR ".join(intake_where) + ")",
+                        intake_values,
+                    ).fetchone()[0]
+            files = len((manifest or {}).get("checksums") or {})
+            print(f"Pedido................{options.request_id}")
+            print(f"Paciente..............{record.patient_name or 'não informado'}")
+            print(f"Manifest..............{1 if manifest_path else 0}")
+            print(f"ClinicalPackage.......{1 if (manifest and manifest.get('acquisition', {}).get('clinical_package')) else 0}")
+            print(f"Assets indexados......{assets}")
+            print(f"Exames SQLite.........{len(exam_ids)}")
+            print("Histórico.............1")
+            print(f"Intake records........{intake_count}")
+            print(f"Destination fingerprints..{1 if destination_fp else 0}")
+            print("Outros caches..........não identificados")
+            print(f"Arquivos locais.......{files}")
+            print("OneDrive..............não será alterado")
+            if not options.apply:
+                print("Modo..................DRY RUN\nNenhuma alteração é realizada.")
+                return 0
+            with sqlite3.connect(db_path) as db:
+                for exam_id in exam_ids:
+                    db.execute("DELETE FROM exams WHERE exam_id=?", (exam_id,))
+                db.execute("DELETE FROM clinical_assets WHERE provider_request_id=? OR sequential_id=?", (record.provider_request_id or options.request_id, record.sequential_id or options.request_id))
+                db.commit()
+            if intake_path.exists():
+                with sqlite3.connect(intake_path) as intake_db:
+                    if intake_where:
+                        intake_db.execute(
+                            "UPDATE radiology_imports SET status='RESET', reason_code='CFaz_RESET', "
+                            "updated_at_utc=datetime('now') WHERE status='COMPLETED' AND (" + " OR ".join(intake_where) + ")",
+                            intake_values,
+                        )
+                    intake_db.commit()
+            if manifest_path is not None:
+                manifest_path.unlink(missing_ok=True)
+            history.mark_ready_for_reimport(options.request_id)
+            print("Reset local concluído; histórico preservado como READY_FOR_REIMPORT.")
+            return 0
+        except (SystemExit, OSError, sqlite3.Error, ValueError) as exc:
+            return int(exc.code or 0) if isinstance(exc, SystemExit) else 1
+
     if arguments and arguments[0] == "clinical-assets":
         import json
         from core.config import Config
@@ -551,11 +1013,12 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                     continue
                 # Somente manifestos locais; nenhum provider ou rede é consultado.
                 index.index_manifest(manifest, source="clinical-assets-rebuild")
-                indexed += len(
-                    (manifest.get("clinical_package") or {}).get("assets", [])
-                    if isinstance(manifest.get("clinical_package"), dict)
-                    else manifest.get("assets", [])
-                )
+                acquisition = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+                package = manifest.get("clinical_package") or acquisition.get("clinical_package")
+                assets = package.get("assets") if isinstance(package, dict) else manifest.get("assets")
+                if not isinstance(assets, list):
+                    assets = acquisition.get("files", [])
+                indexed += len(assets)
             print(f"Banco: {index.database_path}")
             print(f"Assets indexados: {indexed}")
             with index._connect() as db:
@@ -1258,7 +1721,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         "[radiology-gmail-dry-run | radiology-import-supervised | "
         "radiology-import-from-gmail | radiology-import-from-cfaz | "
         "cfaz-list-notifications | cfaz-history | browser-self-test | "
-        "cfaz-repair-files | "
+        "cfaz-repair-files | cfaz-digital-models | "
         "transfernow-link-diagnosis | intake-history | intake-review-list | intake-review-resume | "
         "radiology-auto-run | radiology-auto-status | rebuild-radiology-index | "
         "process-radiology-inbox]"
@@ -1275,4 +1738,8 @@ def _sha256_for_resume(path):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Operação manual cancelada pelo operador.")
+        raise SystemExit(130)

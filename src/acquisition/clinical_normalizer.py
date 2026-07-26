@@ -224,6 +224,20 @@ class ClinicalAssetNormalizer:
                     category, subtype = self._category(
                         source_collection, detected, relative.name
                     )
+                    thumbnail = bool(
+                        source_meta.get("is_thumbnail")
+                        or source_meta.get("thumbnail")
+                        or (
+                            detected.width and detected.height
+                            and max(detected.width, detected.height) <= 320
+                            and self._thumbnail_hint(source_collection, relative.name)
+                        )
+                    )
+                    if thumbnail and not self._clinical_preview(
+                        source_collection, source_meta, category
+                    ):
+                        # Não entra no ZIP publicado nem no ClinicalPackage.
+                        continue
                     folder = CLINICAL_FOLDERS[category]
                     if category == ClinicalCategory.TOMOGRAPHY and detected.asset_type == "DICOM":
                         folder += "/DICOM"
@@ -250,13 +264,6 @@ class ClinicalAssetNormalizer:
                         seen_sha[digest] = f"{folder}/{stored_name}"
                         action = "NORMALIZED"
                     width, height = detected.width, detected.height
-                    thumbnail = bool(
-                        source_meta.get("is_thumbnail")
-                        or (
-                            width and height and max(width, height) <= 320
-                            and self._thumbnail_hint(source_collection, relative.name)
-                        )
-                    )
                     assets.append(ClinicalAsset(
                         provider=acquired.request.provider_id,
                         provider_request_id=(
@@ -558,6 +565,13 @@ class ClinicalAssetNormalizer:
     def _thumbnail_hint(source: str, name: str) -> bool:
         value = f"{source} {name}".casefold()
         return any(term in value for term in ("thumb", "thumbnail", "preview", "miniatura"))
+
+    @staticmethod
+    def _clinical_preview(source: str, metadata: dict[str, Any], category: ClinicalCategory) -> bool:
+        value = f"{source} {metadata.get('provider_section') or ''} {metadata.get('provider_display_name') or ''}".casefold()
+        return category == ClinicalCategory.TOMOGRAPHY and any(
+            term in value for term in ("preview", "dicom", "tomograph")
+        )
 
     @staticmethod
     def _source_hash(metadata: dict[str, Any]) -> str | None:

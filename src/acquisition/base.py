@@ -24,6 +24,7 @@ class AssetClassification(StrEnum):
     CLINICAL_PHOTO = "Fotografia Clínica"
     REPORT = "Laudo"
     AUXILIARY_DOCUMENT = "Documento auxiliar"
+    DIGITAL_MODEL = "Modelo digital"
     OTHER = "Outro"
 
 
@@ -35,6 +36,8 @@ class AcquisitionAsset:
     classification: AssetClassification
     source_field: str | None = None
     probe_html: bool = False
+    provider_exam_id: str | None = None
+    provider_asset_id: str | None = None
 
 
 @dataclass(frozen=True)

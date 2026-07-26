@@ -171,6 +171,7 @@ class ExamIndexService:
                     patient_id TEXT NOT NULL REFERENCES patients(patient_key),
                     clinical_category TEXT NOT NULL, provider_collection TEXT,
                     provider_section TEXT, provider_display_name TEXT,
+                    digital_model_id TEXT, stl_file_id TEXT,
                     stored_name TEXT NOT NULL, relative_path TEXT NOT NULL,
                     mime_type TEXT, extension TEXT, size_bytes INTEGER,
                     sha256 TEXT, width INTEGER, height INTEGER,
@@ -204,6 +205,10 @@ class ExamIndexService:
                 CREATE INDEX IF NOT EXISTS idx_clinical_assets_sha ON clinical_assets(sha256);
                 """
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(clinical_assets)")}
+            for column in ("digital_model_id", "stl_file_id"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE clinical_assets ADD COLUMN {column} TEXT")
             db.execute(
                 "INSERT INTO index_metadata(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -300,7 +305,7 @@ class ExamIndexService:
                 for asset_index, asset in enumerate(
                     (
                         item for item in manifest.get("assets", [])
-                        if isinstance(item, dict)
+                        if isinstance(item, dict) and not self._is_ignored_thumbnail(item)
                     ),
                     1,
                 ):
@@ -326,17 +331,21 @@ class ExamIndexService:
                             _text(asset.get("normalized_at")),
                         ),
                     )
-                package = manifest.get("clinical_package")
+                acquisition_meta = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+                acquisition_package = acquisition_meta.get("clinical_package")
+                package = manifest.get("clinical_package") or acquisition_package
                 package_assets = package.get("assets") if isinstance(package, dict) else None
-                clinical_assets = package_assets if isinstance(package_assets, list) else manifest.get("assets", [])
+                clinical_assets = package_assets if isinstance(package_assets, list) else (
+                    manifest.get("assets") if isinstance(manifest.get("assets"), list)
+                    else acquisition_meta.get("files", [])
+                )
                 db.execute("DELETE FROM clinical_assets WHERE exam_id=?", (exam_id,))
                 request_meta = manifest.get("request") if isinstance(manifest.get("request"), dict) else {}
-                acquisition_meta = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
                 provider = _text(manifest.get("provider") or acquisition_meta.get("provider_id"))
                 provider_request_id = _text(request_meta.get("provider_request_id") or acquisition_meta.get("provider_request_id"))
                 sequential_id = _text(request_meta.get("sequential_id") or acquisition_meta.get("sequential_id"))
                 for asset in clinical_assets:
-                    if not isinstance(asset, dict):
+                    if not isinstance(asset, dict) or self._is_ignored_thumbnail(asset):
                         continue
                     stored = _text(asset.get("stored_name") or asset.get("normalized_filename")) or "asset"
                     folder = _text(asset.get("relative_folder")) or ""
@@ -346,7 +355,8 @@ class ExamIndexService:
                         exam_id,provider,provider_request_id,sequential_id,patient_id,
                         clinical_category,provider_collection,provider_section,provider_display_name,
                         stored_name,relative_path,mime_type,extension,size_bytes,sha256,width,height,
-                        is_thumbnail,created_at,normalized_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        digital_model_id,stl_file_id,
+                        is_thumbnail,created_at,normalized_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(exam_id,sha256,relative_path) DO UPDATE SET
                         clinical_category=excluded.clinical_category,provider_collection=excluded.provider_collection,
                         provider_section=excluded.provider_section,provider_display_name=excluded.provider_display_name,
@@ -362,6 +372,8 @@ class ExamIndexService:
                          _text(asset.get("extension") or asset.get("detected_extension")),
                          asset.get("size") or asset.get("size_bytes"), _text(asset.get("sha256")),
                          asset.get("width"), asset.get("height"),
+                         asset.get("digital_model_id") or asset.get("provider_exam_id"),
+                         asset.get("stl_file_id") or asset.get("provider_asset_id"),
                          int(bool(asset.get("thumbnail", asset.get("is_thumbnail")))), now,
                          _text(asset.get("normalized_at"))),
                     )
@@ -401,6 +413,18 @@ class ExamIndexService:
         if result is None:
             raise ExamIndexError("O exame não foi encontrado após a indexação.")
         return result
+
+    @staticmethod
+    def _is_ignored_thumbnail(asset: dict[str, Any]) -> bool:
+        if not bool(asset.get("is_thumbnail", asset.get("thumbnail", False))):
+            return False
+        collection = str(asset.get("provider_collection") or asset.get("source_collection") or "").casefold()
+        category = str(asset.get("clinical_category") or "").upper()
+        # Somente preview explicitamente associado a tomografia é indexável.
+        return not (
+            category == "TOMOGRAPHY"
+            and any(term in collection for term in ("preview", "dicom", "tomograph"))
+        )
 
     def _record_consistency_issues(
         self, db: sqlite3.Connection, exam_id: str,
@@ -491,7 +515,7 @@ class ExamIndexService:
         return values[0] if values else None
 
     def find_by_patient(self, patient_name: str) -> list[IndexedExam]:
-        return self._query("p.normalized_name=?", (PatientNormalizer.compare_ready(patient_name),))
+        return self._query("p.normalized_name LIKE ?", (f"%{PatientNormalizer.compare_ready(patient_name)}%",))
 
     def find_by_date(self, exam_date: str) -> list[IndexedExam]:
         return self._query("e.exam_date=?", (exam_date,))
@@ -514,11 +538,13 @@ class ExamIndexService:
                         provider: str | None = None,
                         sha256: str | None = None) -> list[dict[str, Any]]:
         clauses, values = ["1=1"], []
+        join = ""
         if patient_id and len(patient_id) != 64:
-            patient_id = hashlib.sha256(
-                PatientNormalizer.compare_ready(patient_id).encode("utf-8")
-            ).hexdigest()
-        for column, value in (("patient_id", patient_id),
+            join = " JOIN patients p ON p.patient_key=clinical_assets.patient_id"
+            clauses.append("p.normalized_name LIKE ?")
+            values.append(f"%{PatientNormalizer.compare_ready(patient_id)}%")
+        exact_patient_id = patient_id if not (patient_id and len(patient_id) != 64) else None
+        for column, value in (("patient_id", exact_patient_id),
                               ("provider_request_id", provider_request_id),
                               ("clinical_category", clinical_category),
                               ("provider", provider), ("sha256", sha256)):
@@ -527,7 +553,7 @@ class ExamIndexService:
                 values.append(value)
         with self._connect() as db:
             return [dict(row) for row in db.execute(
-                "SELECT * FROM clinical_assets WHERE " + " AND ".join(clauses)
+                "SELECT clinical_assets.* FROM clinical_assets" + join + " WHERE " + " AND ".join(clauses)
                 + " ORDER BY exam_id,asset_id", values
             )]
 
@@ -559,26 +585,32 @@ class ExamIndexService:
             return [dict(row) for row in db.execute(sql, values)]
 
     def patient_summary(self, patient_name: str) -> dict[str, Any]:
-        patient_key = hashlib.sha256(
-            PatientNormalizer.compare_ready(patient_name).encode("utf-8")
-        ).hexdigest()
+        exams_for_patient = self.find_by_patient(patient_name)
+        patient_keys = {self._patient_key_for_exam(exam.exam_id) for exam in exams_for_patient}
+        patient_keys.discard(None)
+        if not patient_keys:
+            return {"exams": 0, "first_date": None, "last_date": None,
+                    "radiographs": 0, "photographs": 0, "tomographies": 0,
+                    "dicom": 0, "stl": 0, "digital_models": 0, "reports": 0}
+        placeholders = ",".join("?" for _ in patient_keys)
+        values = tuple(patient_keys)
         with self._connect() as db:
             exams = db.execute(
                 "SELECT COUNT(*) total, MIN(exam_date) first_date, MAX(exam_date) last_date "
-                "FROM exams WHERE patient_key=?", (patient_key,)
+                f"FROM exams WHERE patient_key IN ({placeholders})", values
             ).fetchone()
             rows = db.execute(
                 "SELECT clinical_category,COUNT(*) total FROM clinical_assets "
-                "WHERE patient_id=? GROUP BY clinical_category", (patient_key,)
+                f"WHERE patient_id IN ({placeholders}) GROUP BY clinical_category", values
             ).fetchall()
             dicom = db.execute(
-                "SELECT COUNT(*) FROM clinical_assets WHERE patient_id=? AND "
+                f"SELECT COUNT(*) FROM clinical_assets WHERE patient_id IN ({placeholders}) AND "
                 "(LOWER(COALESCE(mime_type,''))='application/dicom' OR LOWER(COALESCE(extension,''))='.dcm')",
-                (patient_key,),
+                values,
             ).fetchone()[0]
             stl = db.execute(
-                "SELECT COUNT(*) FROM clinical_assets WHERE patient_id=? AND LOWER(COALESCE(extension,''))='.stl'",
-                (patient_key,),
+                f"SELECT COUNT(*) FROM clinical_assets WHERE patient_id IN ({placeholders}) AND LOWER(COALESCE(extension,''))='.stl'",
+                values,
             ).fetchone()[0]
         counts = {str(row["clinical_category"]): int(row["total"]) for row in rows}
         return {
@@ -588,6 +620,11 @@ class ExamIndexService:
             "dicom": int(dicom), "stl": int(stl), "digital_models": counts.get("DIGITAL_MODEL", 0),
             "reports": counts.get("REPORT", 0),
         }
+
+    def _patient_key_for_exam(self, exam_id: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute("SELECT patient_key FROM exams WHERE exam_id=?", (exam_id,)).fetchone()
+        return str(row[0]) if row else None
 
     def clinical_dashboard(self) -> dict[str, Any]:
         """Estatísticas somente leitura derivadas exclusivamente de clinical_assets."""
