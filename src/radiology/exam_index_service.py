@@ -180,6 +180,18 @@ class ExamIndexService:
                     created_at TEXT NOT NULL, normalized_at TEXT,
                     UNIQUE(exam_id, sha256, relative_path)
                 );
+                CREATE TABLE IF NOT EXISTS cfaz_supplement_index_projection (
+                    operation_id TEXT NOT NULL,
+                    operation_payload_hash TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    semantic_role TEXT NOT NULL,
+                    stl_file_id TEXT NOT NULL,
+                    asset_sha256 TEXT NOT NULL,
+                    destination_logical TEXT NOT NULL,
+                    technical_asset_id TEXT NOT NULL,
+                    PRIMARY KEY(operation_id, semantic_role),
+                    UNIQUE(operation_id, stl_file_id)
+                );
                 CREATE TABLE IF NOT EXISTS consistency_issues (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     exam_id TEXT NOT NULL REFERENCES exams(exam_id) ON DELETE CASCADE,
@@ -242,7 +254,8 @@ class ExamIndexService:
     def index_manifest(
         self, manifest: dict[str, Any], *, patient_name: str | None = None,
         source: str = "pipeline", connection: sqlite3.Connection | None = None,
-        operation_id: str | None = None,
+        operation_id: str | None = None, operation_payload_hash: str | None = None,
+        request_id: str | None = None, cfaz_models: Iterable[dict[str, str]] | None = None,
     ) -> IndexedExam:
         publication = manifest.get("publication")
         if not isinstance(publication, dict):
@@ -421,6 +434,26 @@ class ExamIndexService:
                              _json_value(series.get("estimated_fov")), series.get("rows"), series.get("columns")),
                         )
                 self._record_consistency_issues(db, exam_id, manifest, studies)
+                if operation_id is not None and cfaz_models is not None:
+                    projection = tuple(cfaz_models)
+                    if len(projection) != 2:
+                        raise ExamIndexError("A projeção CFAZ exige exatamente dois modelos.")
+                    db.execute(
+                        "DELETE FROM cfaz_supplement_index_projection WHERE operation_id=?",
+                        (operation_id,),
+                    )
+                    for model in projection:
+                        destination = str(model["destination"]).replace("\\", "/").strip("/")
+                        db.execute(
+                            """INSERT INTO cfaz_supplement_index_projection(
+                            operation_id,operation_payload_hash,request_id,semantic_role,
+                            stl_file_id,asset_sha256,destination_logical,technical_asset_id)
+                            VALUES(?,?,?,?,?,?,?,?)""",
+                            (operation_id, operation_payload_hash or "", request_id or "",
+                             str(model["semantic_role"]), str(model["stl_file_id"]),
+                             str(model["sha256"]), destination,
+                             hashlib.sha256((str(model["stl_file_id"]) + ":" + str(model["sha256"])).encode("utf-8")).hexdigest()),
+                        )
                 db.execute(
                     "INSERT INTO import_history(exam_id,state,source,index_version,indexed_at,operation_id) VALUES(?,?,?,?,?,?)",
                     (exam_id, "INDEXED", source, self.index_version, now, operation_id),
@@ -544,6 +577,95 @@ class ExamIndexService:
     def get_by_exam_id(self, exam_id: str) -> IndexedExam | None:
         values = self._query("e.exam_id=?", (exam_id,))
         return values[0] if values else None
+
+    def has_operation(self, operation_id: str, *, connection: sqlite3.Connection | None = None) -> bool:
+        """Return whether this operation has a durable index-history entry."""
+        if connection is not None:
+            return connection.execute(
+                "SELECT 1 FROM import_history WHERE operation_id=? LIMIT 1", (operation_id,)
+            ).fetchone() is not None
+        with self._connect() as db:
+            return db.execute(
+                "SELECT 1 FROM import_history WHERE operation_id=? LIMIT 1", (operation_id,)
+            ).fetchone() is not None
+
+    def verify_operation_manifest(
+        self, operation_id: str, manifest: dict[str, Any], *, request_id: str | None = None,
+        payload_hash: str | None = None, models: Iterable[Any] | None = None,
+    ) -> bool:
+        """Verify the complete durable index projection for one supplement operation."""
+        publication = manifest.get("publication")
+        if not isinstance(publication, dict):
+            return False
+        exam_id = _text(publication.get("exam_id") or publication.get("source_archive_sha256"))
+        if not exam_id:
+            return False
+        acquisition = manifest.get("acquisition") if isinstance(manifest.get("acquisition"), dict) else {}
+        package = manifest.get("clinical_package") or acquisition.get("clinical_package")
+        assets = package.get("assets") if isinstance(package, dict) else manifest.get("assets", [])
+        assets = [item for item in assets if isinstance(item, dict)] if isinstance(assets, list) else []
+        try:
+            with self._connect() as db:
+                rows = db.execute(
+                    "SELECT exam_id,state,source,operation_id FROM import_history WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchall()
+                if len(rows) != 1 or rows[0]["exam_id"] != exam_id or rows[0]["operation_id"] != operation_id:
+                    return False
+                if rows[0]["state"] != "INDEXED" or rows[0]["source"] != "cfaz-supplement":
+                    return False
+                if request_id is not None:
+                    # The operation request is represented by the CFAZ history row;
+                    # the index must not contain a second operation projection.
+                    if db.execute(
+                        "SELECT COUNT(*) FROM import_history WHERE operation_id=?", (operation_id,)
+                    ).fetchone()[0] != 1:
+                        return False
+                if models is None or payload_hash is None:
+                    return False
+                expected_projection = {
+                    (
+                        operation_id, payload_hash, request_id or "", str(model.semantic_role),
+                        str(model.stl_file_id), str(model.sha256),
+                        str(model.destination).replace("\\", "/").strip("/"),
+                        hashlib.sha256((str(model.stl_file_id) + ":" + str(model.sha256)).encode("utf-8")).hexdigest(),
+                    ) for model in models
+                }
+                persisted_projection = {
+                    tuple(row)
+                    for row in db.execute(
+                        """SELECT operation_id,operation_payload_hash,request_id,semantic_role,
+                        stl_file_id,asset_sha256,destination_logical,technical_asset_id
+                        FROM cfaz_supplement_index_projection WHERE operation_id=?""",
+                        (operation_id,),
+                    ).fetchall()
+                }
+                if len(expected_projection) != 2 or persisted_projection != expected_projection:
+                    return False
+                exam = db.execute("SELECT * FROM exams WHERE exam_id=?", (exam_id,)).fetchone()
+                if exam is None:
+                    return False
+                indexed_assets = db.execute(
+                    "SELECT * FROM clinical_assets WHERE exam_id=?",
+                    (exam_id,),
+                ).fetchall()
+                if len(indexed_assets) != len(assets):
+                    return False
+                for expected in assets:
+                    file_id = _text(expected.get("stl_file_id") or expected.get("provider_asset_id"))
+                    if not file_id:
+                        continue
+                    matches = [row for row in indexed_assets if row["stl_file_id"] == file_id]
+                    if len(matches) != 1:
+                        return False
+                    row = matches[0]
+                    if _text(expected.get("sha256")) != _text(row["sha256"]):
+                        return False
+                    if _text(expected.get("destination")) and _text(expected.get("destination")) != _text(row["relative_path"]):
+                        return False
+                return True
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return False
 
     def find_by_patient(self, patient_name: str) -> list[IndexedExam]:
         return self._query("p.normalized_name LIKE ?", (f"%{PatientNormalizer.compare_ready(patient_name)}%",))

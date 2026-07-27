@@ -362,6 +362,29 @@ class IntakeHistoryRepository:
         except (OSError, sqlite3.Error) as exc:
             raise IntakeHistoryError("Não foi possível registrar o suplemento no intake.") from exc
 
+    def get_by_operation(self, operation_id: str) -> IntakeRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM radiology_imports WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        return _row_to_intake_record(row) if row is not None else None
+
+    def verify_supplement(
+        self, *, operation_id: str, payload_hash: str, correlation_id: str,
+        file_count: int, total_size: int,
+    ) -> bool:
+        """Verify the complete local intake projection for a supplement."""
+        record = self.get_by_operation(operation_id)
+        return bool(
+            record is not None
+            and record.status == "COMPLETED"
+            and record.operation_payload_hash == payload_hash
+            and record.correlation_id == correlation_id
+            and record.file_count == file_count
+            and record.total_size == total_size
+            and record.archive_filename_masked == "supplement-metadata"
+        )
+
     def set_review_required(
         self, record_id: int, *, reason_code: str, stage: str,
         run_id: str | None = None,

@@ -257,6 +257,24 @@ class CfazHistoryRepository:
             ).fetchall()
         return CfazHistoryRecord(**dict(rows[0])) if len(rows) == 1 else None
 
+    def verify_supplement(self, *, request_id: str, operation_id: str,
+                          payload_hash: str, connection: sqlite3.Connection | None = None) -> bool:
+        if connection is not None:
+            row = connection.execute(
+                "SELECT provider,request_id,status,supplement_operation_id,supplement_payload_hash FROM cfaz_import_history "
+                "WHERE provider='cfaz' AND request_id=?", (request_id,)
+            ).fetchone()
+        else:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT provider,request_id,status,supplement_operation_id,supplement_payload_hash FROM cfaz_import_history "
+                    "WHERE provider='cfaz' AND request_id=?", (request_id,)
+                ).fetchone()
+        return bool(row and row["provider"] == "cfaz" and row["request_id"] == request_id
+                    and row["status"] == "COMPLETE"
+                    and row["supplement_operation_id"] == operation_id
+                    and row["supplement_payload_hash"] == payload_hash)
+
     def _update_terminal(
         self, request_id: str, patient_name: str | None, status: str,
         duration: float, destination: str | None, error: str | None,
