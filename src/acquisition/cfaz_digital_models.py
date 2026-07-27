@@ -31,6 +31,7 @@ from acquisition.clinical_normalizer import (
 from acquisition.models.clinical_package import (
     ClinicalAsset as ContractClinicalAsset,
 )
+from integrations.onedrive_graph import GraphRollbackJournal
 
 
 class CfazDigitalModelError(RuntimeError):
@@ -238,7 +239,7 @@ class CfazDigitalModelSupplement:
         remote_data_uploaded = False
         remote_folder = None
         model_folder = None
-        created_remote: list[str] = []
+        rollback_journal = GraphRollbackJournal()
         try:
             used_paths = self._manifest_relative_paths(working)
             for item in inventory.files:
@@ -350,11 +351,11 @@ class CfazDigitalModelSupplement:
                         remote_filename="manifest.json",
                     )
                     target = manifest_path.parent / plan.relative_path
-                    self.graph.upload_small_file(
+                    created_reference = self.graph.upload_small_file_transactional(
                         model_folder, target, remote_filename=plan.stored_name
                     )
                     remote_data_uploaded = True
-                    created_remote.append(plan.stored_name)
+                    rollback_journal.record(created_reference)
                     remote_items[plan.stored_name.casefold()] = {
                         "name": plan.stored_name,
                         "size": plan.size,
@@ -392,12 +393,9 @@ class CfazDigitalModelSupplement:
             self._write_json(manifest_path, final)
         except Exception as exc:
             rollback_ok = True
-            if created_remote and model_folder is not None:
-                for filename in reversed(created_remote):
-                    try:
-                        self.graph.delete_child_file(model_folder, filename)
-                    except Exception:
-                        rollback_ok = False
+            _, rollback_failures = rollback_journal.rollback_all(self.graph)
+            if rollback_failures:
+                rollback_ok = False
             if remote_manifest_started and remote_folder is not None:
                 rollback_path = work_root / "manifest.rollback.json"
                 try:
@@ -414,13 +412,17 @@ class CfazDigitalModelSupplement:
                 for path in reversed(created_local):
                     path.unlink(missing_ok=True)
                 self._remove_empty_model_folder(manifest_path.parent)
-            if isinstance(exc, CfazDigitalModelError):
+            if isinstance(exc, CfazDigitalModelError) and rollback_ok:
                 self._cleanup_work_root(work_root)
                 raise
             self._cleanup_work_root(work_root)
             raise CfazDigitalModelError(
                 "A incorporação dos modelos digitais foi interrompida; "
-                "o estado seguro foi preservado para retomada."
+                + (
+                    "o estado seguro foi preservado para retomada."
+                    if rollback_ok
+                    else "o rollback remoto ficou incompleto e exige revisão."
+                )
             ) from exc
 
         indexed = False
@@ -433,11 +435,9 @@ class CfazDigitalModelSupplement:
                 indexed = True
             except Exception as exc:
                 rollback_ok = True
-                for filename in reversed(created_remote):
-                    try:
-                        self.graph.delete_child_file(model_folder, filename)
-                    except Exception:
-                        rollback_ok = False
+                _, rollback_failures = rollback_journal.rollback_all(self.graph)
+                if rollback_failures:
+                    rollback_ok = False
                 try:
                     rollback_path = work_root / "manifest.rollback.json"
                     rollback_path.write_bytes(original_bytes)
@@ -626,8 +626,17 @@ class CfazDigitalModelSupplement:
             )
         for url in urls:
             CfazProvider._validate_download_url(url)
-        if self.graph is not None and not callable(
-            getattr(self.graph, "delete_child_file", None)
+        capability = getattr(
+            self.graph, "VERIFIED_COMPENSATION_CAPABILITY", None
+        )
+        if self.graph is not None and (
+            capability != "graph-item-id-etag-delete-v1"
+            or not callable(
+                getattr(self.graph, "upload_small_file_transactional", None)
+            )
+            or not callable(
+                getattr(self.graph, "delete_created_item_verified", None)
+            )
         ):
             raise CfazDigitalModelError(
                 "O cliente remoto não oferece rollback verificável; "

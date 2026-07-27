@@ -26,6 +26,10 @@ from acquisition.cfaz_provider import (
     CfazDigitalModelInventory,
     CfazProvider,
 )
+from integrations.onedrive_graph import (
+    GraphCreatedItemReference,
+    GraphRollbackVerification,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -155,6 +159,8 @@ class UnsafeArchiveSession(ArchiveSession):
 
 
 class Graph:
+    VERIFIED_COMPENSATION_CAPABILITY = "graph-item-id-etag-delete-v1"
+
     def __init__(self, manifest):
         self.remote_manifest = deepcopy(manifest)
         self.uploads = []
@@ -205,6 +211,20 @@ class Graph:
 
     def delete_child_file(self, _folder, filename):
         self.remote_models.pop(filename, None)
+
+    def upload_small_file_transactional(
+        self, folder, path, remote_filename=None
+    ):
+        uploaded = self.upload_small_file(folder, path, remote_filename)
+        return GraphCreatedItemReference(
+            drive_id="synthetic-drive",
+            item_id=uploaded.name,
+            etag="synthetic-etag",
+        )
+
+    def delete_created_item_verified(self, reference):
+        self.remote_models.pop(reference.item_id, None)
+        return GraphRollbackVerification(True, 204, 1)
 
 
 class FailingGraph(Graph):
@@ -562,6 +582,28 @@ def test_duplicate_urls_fail_before_first_get(tmp_path):
         ).run("999991", apply=True)
 
     assert provider.download_calls == []
+
+
+def test_apply_preflight_accepts_only_verified_compensation_capability(tmp_path):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    inventory = provider.discover_digital_models("999991")
+    service = supplement(tmp_path, history, provider, Graph(manifest), Index())
+
+    service._validate_apply_preflight(inventory)
+
+
+def test_apply_preflight_rejects_client_with_delete_method_only(tmp_path):
+    history, _staging, _path, _manifest, provider = fixture(tmp_path)
+    inventory = provider.discover_digital_models("999991")
+
+    class DeleteOnly:
+        def delete_created_item_verified(self, _reference):
+            raise AssertionError("must not be called")
+
+    service = supplement(tmp_path, history, provider, DeleteOnly(), Index())
+
+    with pytest.raises(CfazDigitalModelError, match="rollback verificável"):
+        service._validate_apply_preflight(inventory)
 
 
 def test_identical_contents_for_distinct_ids_require_review(tmp_path):

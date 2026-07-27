@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -81,6 +82,62 @@ class GraphUploadedItem:
     has_id: bool
 
 
+@dataclass(frozen=True)
+class GraphCreatedItemReference:
+    drive_id: str
+    item_id: str
+    etag: str
+    created_by_transaction: bool = True
+
+
+@dataclass(frozen=True)
+class GraphRollbackVerification:
+    verified_absent: bool
+    delete_status: int | None
+    verification_attempts: int
+    delete_transport_uncertain: bool = False
+
+
+class GraphRollbackJournal:
+    """Journal efêmero restrito aos itens criados pela transação atual."""
+
+    def __init__(self) -> None:
+        self._references: list[GraphCreatedItemReference] = []
+
+    def record(self, reference: GraphCreatedItemReference) -> None:
+        if (
+            not isinstance(reference, GraphCreatedItemReference)
+            or not reference.created_by_transaction
+        ):
+            raise OneDriveGraphError(
+                "Somente itens criados pela transação podem entrar no journal."
+            )
+        self._references.append(reference)
+
+    def rollback_reference(
+        self,
+        client: OneDriveGraphClient,
+        reference: GraphCreatedItemReference,
+    ) -> GraphRollbackVerification:
+        if reference not in self._references:
+            raise OneDriveGraphError(
+                "Item ausente do journal transacional; exclusão recusada."
+            )
+        return client.delete_created_item_verified(reference)
+
+    def rollback_all(
+        self, client: OneDriveGraphClient
+    ) -> tuple[list[GraphRollbackVerification], int]:
+        results: list[GraphRollbackVerification] = []
+        failures = 0
+        for reference in reversed(self._references):
+            try:
+                results.append(client.delete_created_item_verified(reference))
+            except OneDriveGraphError:
+                failures += 1
+        return results, failures
+
+
 class OneDriveGraphClient:
     """Executa consultas e uploads pequenos no drive do usuário autenticado."""
 
@@ -88,6 +145,7 @@ class OneDriveGraphClient:
     MAX_SMALL_UPLOAD_BYTES = 250 * 1024 * 1024
     DEFAULT_LARGE_UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024
     UPLOAD_CHUNK_ALIGNMENT = 320 * 1024
+    VERIFIED_COMPENSATION_CAPABILITY = "graph-item-id-etag-delete-v1"
 
     def __init__(
         self,
@@ -539,6 +597,218 @@ class OneDriveGraphClient:
         if progress_callback is not None:
             progress_callback(file_size, file_size)
         return uploaded
+
+    def upload_small_file_transactional(
+        self,
+        parent_folder: GraphFolder,
+        local_file_path: str | Path,
+        remote_filename: str | None = None,
+    ) -> GraphCreatedItemReference:
+        """Cria um arquivo pequeno sem overwrite e devolve identidade de rollback."""
+        local_path = Path(local_file_path)
+        if not local_path.is_file():
+            raise OneDriveGraphError("Arquivo local para upload não encontrado.")
+        filename = self._validated_remote_filename(local_path, remote_filename)
+        size = local_path.stat().st_size
+        if size > self.MAX_SMALL_UPLOAD_BYTES:
+            raise OneDriveGraphError(
+                "Upload transacional aceita somente arquivo pequeno."
+            )
+        drive_id, parent_id = self._folder_location(parent_folder)
+        path = (
+            f"/drives/{quote(drive_id, safe='')}/items/"
+            f"{quote(parent_id, safe='')}:/{quote(filename, safe='')}:/content"
+            "?@microsoft.graph.conflictBehavior=fail"
+        )
+        endpoint = f"{self.BASE_URL}{path}"
+        try:
+            response = self._session.put(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": self._content_type_for_upload(local_path),
+                },
+                data=local_path.read_bytes(),
+                timeout=self._timeout,
+            )
+        except requests.Timeout:
+            raise OneDriveGraphError(
+                "Resultado do upload transacional é indeterminado."
+            ) from None
+        except (OSError, requests.RequestException):
+            raise OneDriveGraphError(
+                "Falha no upload transacional do OneDrive."
+            ) from None
+        if response.status_code != 201:
+            raise OneDriveGraphError(
+                "Upload transacional recusado pelo Microsoft Graph.",
+                http_status=response.status_code,
+            )
+        payload = self._response_mapping(
+            response, "Resposta inválida após upload transacional."
+        )
+        item_id = self._required_text(payload, "id", "Item ID")
+        etag = self._optional_text(payload.get("eTag"))
+        if etag is None:
+            metadata = self._get_item_metadata(drive_id, item_id)
+            etag = self._required_text(metadata, "eTag", "eTag")
+        parent = payload.get("parentReference")
+        returned_drive = (
+            self._optional_text(parent.get("driveId"))
+            if isinstance(parent, dict) else None
+        )
+        if returned_drive is not None and returned_drive != drive_id:
+            raise OneDriveGraphError(
+                "O upload transacional retornou identidade de drive divergente."
+            )
+        return GraphCreatedItemReference(
+            drive_id=drive_id,
+            item_id=item_id,
+            etag=etag,
+        )
+
+    def delete_created_item_verified(
+        self,
+        reference: GraphCreatedItemReference,
+        *,
+        max_verifications: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> GraphRollbackVerification:
+        """Exclui somente item criado na transação e confirma ausência por ID."""
+        if (
+            not isinstance(reference, GraphCreatedItemReference)
+            or not reference.created_by_transaction
+            or not reference.drive_id.strip()
+            or not reference.item_id.strip()
+            or not reference.etag.strip()
+        ):
+            raise OneDriveGraphError(
+                "Referência transacional incompleta ou inelegível para rollback."
+            )
+        checks = min(max(int(max_verifications), 1), 3)
+        endpoint = self._item_endpoint(reference.drive_id, reference.item_id)
+        delete_status: int | None = None
+        uncertain = False
+        try:
+            response = self._session.delete(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "If-Match": reference.etag,
+                },
+                timeout=self._timeout,
+            )
+            delete_status = response.status_code
+        except requests.Timeout:
+            uncertain = True
+        except requests.RequestException:
+            uncertain = True
+        if not uncertain and delete_status not in {204, 404}:
+            raise OneDriveGraphError(
+                "Exclusão compensatória recusada; revisão obrigatória.",
+                http_status=delete_status,
+            )
+        for attempt in range(1, checks + 1):
+            status, code, retry_after = self._probe_item_absence(
+                reference.drive_id, reference.item_id
+            )
+            if status == 404 and code in {
+                "itemnotfound", "resourcenotfound", "notfound",
+            }:
+                return GraphRollbackVerification(
+                    verified_absent=True,
+                    delete_status=delete_status,
+                    verification_attempts=attempt,
+                    delete_transport_uncertain=uncertain,
+                )
+            if status == 429 and attempt < checks:
+                sleep(min(max(retry_after, 0.0), 2.0))
+                continue
+            if status in {0, 200} and attempt < checks:
+                sleep(0.05)
+                continue
+            raise OneDriveGraphError(
+                "Rollback remoto não pôde ser verificado; revisão obrigatória.",
+                http_status=status,
+                graph_code=code,
+            )
+        raise OneDriveGraphError(
+            "Rollback remoto não pôde ser verificado; revisão obrigatória."
+        )
+
+    def _probe_item_absence(
+        self, drive_id: str, item_id: str
+    ) -> tuple[int, str | None, float]:
+        endpoint = self._item_endpoint(drive_id, item_id)
+        try:
+            response = self._session.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {self._access_token}"},
+                params={"$select": "id,eTag"},
+                timeout=self._timeout,
+            )
+        except requests.RequestException:
+            return 0, None, 0.0
+        code = self._graph_error_code(response)
+        try:
+            retry_after = float(response.headers.get("Retry-After") or 0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        return response.status_code, code, retry_after
+
+    def _get_item_metadata(
+        self, drive_id: str, item_id: str
+    ) -> dict[str, Any]:
+        endpoint = self._item_endpoint(drive_id, item_id)
+        try:
+            response = self._session.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {self._access_token}"},
+                params={"$select": "id,eTag,parentReference"},
+                timeout=self._timeout,
+            )
+        except requests.RequestException:
+            raise OneDriveGraphError(
+                "Falha ao confirmar metadados do item criado."
+            ) from None
+        if response.status_code != 200:
+            raise OneDriveGraphError(
+                "Metadados do item criado não puderam ser confirmados.",
+                http_status=response.status_code,
+            )
+        return self._response_mapping(
+            response, "Metadados inválidos do item criado."
+        )
+
+    @classmethod
+    def _graph_error_code(cls, response: requests.Response) -> str | None:
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            return None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        value = cls._optional_text(code)
+        return value.casefold() if value else None
+
+    @staticmethod
+    def _response_mapping(
+        response: requests.Response, message: str
+    ) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise OneDriveGraphError(message) from None
+        if not isinstance(payload, dict):
+            raise OneDriveGraphError(message)
+        return payload
+
+    @classmethod
+    def _item_endpoint(cls, drive_id: str, item_id: str) -> str:
+        return (
+            f"{cls.BASE_URL}/drives/{quote(drive_id, safe='')}/items/"
+            f"{quote(item_id, safe='')}"
+        )
 
     def upload_large_file(
         self,

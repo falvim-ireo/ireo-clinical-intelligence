@@ -2,7 +2,9 @@ import pytest
 import requests
 
 from integrations.onedrive_graph import (
+    GraphCreatedItemReference,
     GraphFolder,
+    GraphRollbackJournal,
     GraphUploadedItem,
     OneDriveGraphClient,
     OneDriveGraphError,
@@ -29,27 +31,31 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        if self.error is not None:
-            raise self.error
-        return self.responses.pop(0)
+        return self._next()
 
     def put(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        if self.error is not None:
-            raise self.error
-        return self.responses.pop(0)
+        return self._next()
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        if self.error is not None:
-            raise self.error
-        return self.responses.pop(0)
+        return self._next()
 
     def patch(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        return self._next()
+
+    def delete(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self._next()
+
+    def _next(self):
         if self.error is not None:
             raise self.error
-        return self.responses.pop(0)
+        value = self.responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
 
 def test_finds_local_root_folder_and_lists_first_items() -> None:
@@ -487,6 +493,243 @@ def test_upload_rejects_folder_without_drive_id_or_item_id(tmp_path, folder) -> 
 
     with pytest.raises(OneDriveGraphError, match="driveId e itemId"):
         client.upload_small_file(folder, local_file)
+
+
+def created_reference(suffix="alpha"):
+    return GraphCreatedItemReference(
+        drive_id=f"synthetic-drive-{suffix}",
+        item_id=f"synthetic-item-{suffix}",
+        etag=f"synthetic-etag-{suffix}",
+    )
+
+
+def absent_response():
+    return FakeResponse(
+        404, {"error": {"code": "itemNotFound", "message": "synthetic"}}
+    )
+
+
+def test_transactional_small_upload_returns_immutable_reference(tmp_path):
+    source = tmp_path / "synthetic-probe.bin"
+    source.write_bytes(b"synthetic")
+    session = FakeSession([FakeResponse(201, {
+        "id": "synthetic-item",
+        "eTag": "synthetic-etag",
+        "name": source.name,
+        "size": source.stat().st_size,
+        "parentReference": {"driveId": "synthetic-drive"},
+    })])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    reference = client.upload_small_file_transactional(
+        GraphFolder(
+            "synthetic-folder", "Synthetic", drive_id="synthetic-drive"
+        ),
+        source,
+    )
+
+    assert reference == GraphCreatedItemReference(
+        "synthetic-drive", "synthetic-item", "synthetic-etag"
+    )
+    assert "conflictBehavior=fail" in session.calls[0][0]
+
+
+def test_transactional_upload_fetches_missing_etag_by_returned_item_id(tmp_path):
+    source = tmp_path / "synthetic-probe.bin"
+    source.write_bytes(b"synthetic")
+    session = FakeSession([
+        FakeResponse(201, {
+            "id": "synthetic-item", "name": source.name, "size": 9,
+        }),
+        FakeResponse(200, {
+            "id": "synthetic-item", "eTag": "synthetic-etag",
+        }),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    reference = client.upload_small_file_transactional(
+        GraphFolder(
+            "synthetic-folder", "Synthetic", drive_id="synthetic-drive"
+        ),
+        source,
+    )
+
+    assert reference.etag == "synthetic-etag"
+    assert "/drives/synthetic-drive/items/synthetic-item" in session.calls[1][0]
+
+
+@pytest.mark.parametrize("delete_status", [204, 404])
+def test_verified_delete_requires_post_delete_absence(delete_status):
+    session = FakeSession([FakeResponse(delete_status), absent_response()])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    result = client.delete_created_item_verified(
+        created_reference(), sleep=lambda _seconds: None
+    )
+
+    assert result.verified_absent is True
+    assert result.verification_attempts == 1
+    assert session.calls[0][1]["headers"]["If-Match"] == "synthetic-etag-alpha"
+    assert len(session.calls) == 2
+
+
+def test_delete_204_with_persistent_200_is_incomplete():
+    session = FakeSession([
+        FakeResponse(204),
+        FakeResponse(200), FakeResponse(200), FakeResponse(200),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    with pytest.raises(OneDriveGraphError, match="não pôde ser verificado"):
+        client.delete_created_item_verified(
+            created_reference(), sleep=lambda _seconds: None
+        )
+
+    assert len(session.calls) == 4
+
+
+def test_delete_verification_can_transition_from_200_to_404():
+    session = FakeSession([
+        FakeResponse(204), FakeResponse(200), absent_response(),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    result = client.delete_created_item_verified(
+        created_reference(), sleep=lambda _seconds: None
+    )
+
+    assert result.verification_attempts == 2
+
+
+def test_delete_verification_honors_bounded_retry_after_for_429():
+    waits = []
+    session = FakeSession([
+        FakeResponse(204),
+        FakeResponse(429, headers={"Retry-After": "1"}),
+        absent_response(),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    result = client.delete_created_item_verified(
+        created_reference(), sleep=waits.append
+    )
+
+    assert result.verification_attempts == 2
+    assert waits == [1.0]
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 412, 423, 429, 500])
+def test_delete_refuses_non_success_statuses_without_retry(status):
+    session = FakeSession([FakeResponse(status)])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    with pytest.raises(OneDriveGraphError, match="revisão obrigatória"):
+        client.delete_created_item_verified(created_reference())
+
+    assert len(session.calls) == 1
+
+
+def test_delete_timeout_is_resolved_only_by_same_item_get_404():
+    session = FakeSession([requests.Timeout("synthetic"), absent_response()])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    result = client.delete_created_item_verified(
+        created_reference(), sleep=lambda _seconds: None
+    )
+
+    assert result.delete_transport_uncertain is True
+    assert result.verified_absent is True
+    assert len(session.calls) == 2
+
+
+def test_delete_timeout_with_persistent_item_requires_review():
+    session = FakeSession([
+        requests.Timeout("synthetic"),
+        FakeResponse(200), FakeResponse(200), FakeResponse(200),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+
+    with pytest.raises(OneDriveGraphError, match="revisão obrigatória"):
+        client.delete_created_item_verified(
+            created_reference(), sleep=lambda _seconds: None
+        )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        GraphCreatedItemReference("", "item", "etag"),
+        GraphCreatedItemReference("drive", "", "etag"),
+        GraphCreatedItemReference("drive", "item", ""),
+        GraphCreatedItemReference("drive", "item", "etag", False),
+    ],
+)
+def test_delete_rejects_incomplete_or_preexisting_reference(reference):
+    client = OneDriveGraphClient("fixture-token", session=FakeSession())
+
+    with pytest.raises(OneDriveGraphError, match="inelegível"):
+        client.delete_created_item_verified(reference)
+
+
+def test_journal_rejects_item_not_recorded():
+    client = OneDriveGraphClient("fixture-token", session=FakeSession())
+    journal = GraphRollbackJournal()
+
+    with pytest.raises(OneDriveGraphError, match="ausente do journal"):
+        journal.rollback_reference(client, created_reference())
+
+
+def test_journal_rolls_back_two_items_in_reverse_creation_order():
+    session = FakeSession([
+        FakeResponse(204), absent_response(),
+        FakeResponse(204), absent_response(),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+    journal = GraphRollbackJournal()
+    journal.record(created_reference("alpha"))
+    journal.record(created_reference("beta"))
+
+    results, failures = journal.rollback_all(client)
+
+    assert len(results) == 2
+    assert failures == 0
+    assert "synthetic-item-beta" in session.calls[0][0]
+    assert "synthetic-item-alpha" in session.calls[2][0]
+    assert all(
+        call[1]["headers"].get("If-Match") is not None
+        for call in (session.calls[0], session.calls[2])
+    )
+    assert all("name" not in call[0] and "search" not in call[0]
+               for call in session.calls)
+
+
+def test_journal_continues_after_one_compensation_failure():
+    session = FakeSession([
+        FakeResponse(412),
+        FakeResponse(204), absent_response(),
+    ])
+    client = OneDriveGraphClient("fixture-token", session=session)
+    journal = GraphRollbackJournal()
+    journal.record(created_reference("alpha"))
+    journal.record(created_reference("beta"))
+
+    results, failures = journal.rollback_all(client)
+
+    assert len(results) == 1
+    assert failures == 1
+    assert "synthetic-item-alpha" in session.calls[1][0]
+
+
+def test_rollback_errors_do_not_expose_reference_values():
+    marker = "must-not-leak"
+    session = FakeSession([FakeResponse(412)])
+    client = OneDriveGraphClient("fixture-token", session=session)
+    reference = GraphCreatedItemReference(marker, marker, marker)
+
+    with pytest.raises(OneDriveGraphError) as captured:
+        client.delete_created_item_verified(reference)
+
+    assert marker not in str(captured.value)
 
 
 def test_finds_existing_child_folder() -> None:
