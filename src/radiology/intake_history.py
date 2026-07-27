@@ -63,6 +63,8 @@ class IntakeRecord:
     created_at_utc: str
     updated_at_utc: str | None
     completed_at_utc: str | None
+    operation_id: str | None = None
+    operation_payload_hash: str | None = None
 
     @property
     def safe_reference(self) -> str:
@@ -100,6 +102,8 @@ def _row_to_intake_record(row: sqlite3.Row) -> IntakeRecord:
         "exception_type": None,
         "updated_at_utc": None,
         "completed_at_utc": None,
+        "operation_id": None,
+        "operation_payload_hash": None,
     }
     record_values = {
         field: values.get(field, default)
@@ -175,6 +179,8 @@ class IntakeHistoryRepository:
                 created_at_utc TEXT NOT NULL,
                 updated_at_utc TEXT,
                 completed_at_utc TEXT
+                ,operation_id TEXT
+                ,operation_payload_hash TEXT
                 )"""
             )
             columns = {
@@ -199,6 +205,8 @@ class IntakeHistoryRepository:
                 "exception_type": "TEXT",
                 "updated_at_utc": "TEXT",
                 "completed_at_utc": "TEXT",
+                "operation_id": "TEXT",
+                "operation_payload_hash": "TEXT",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -230,6 +238,10 @@ class IntakeHistoryRepository:
                 "INSERT INTO schema_info(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (SCHEMA_VERSION,),
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_operation "
+                "ON radiology_imports(operation_id) WHERE operation_id IS NOT NULL"
             )
 
     @staticmethod
@@ -279,6 +291,7 @@ class IntakeHistoryRepository:
             "file_checksums_fingerprint",
             "reimport_confirmed", "previous_record_reference",
             "reason_code", "stage", "exception_type", "run_id",
+            "operation_id", "operation_payload_hash",
         }
         supplied = {key: value for key, value in fields.items() if key in allowed}
         supplied["status"] = status
@@ -302,6 +315,52 @@ class IntakeHistoryRepository:
             raise IntakeHistoryError(
                 "Não foi possível atualizar o histórico.", operation="UPDATE_STATUS"
             ) from exc
+
+    def upsert_supplement(
+        self, *, operation_id: str, payload_hash: str, correlation_id: str,
+        archive_sha256: str | None, file_count: int, total_size: int,
+        destination_fingerprint: str | None = None,
+    ) -> IntakeRecord:
+        """Creates or updates exactly one intake record for a supplement operation."""
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM radiology_imports WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if row is not None:
+                    if row["operation_payload_hash"] != payload_hash:
+                        raise IntakeHistoryError("Operação de suplemento conflitante no intake.")
+                    record_id = int(row["id"])
+                    connection.execute(
+                        "UPDATE radiology_imports SET updated_at_utc=?, status='COMPLETED', "
+                        "file_count=?, total_size=?, archive_sha256=?, destination_fingerprint=? WHERE id=?",
+                        (self._utc_now(), file_count, total_size, archive_sha256,
+                         destination_fingerprint, record_id),
+                    )
+                else:
+                    try:
+                        cursor = connection.execute(
+                            """INSERT INTO radiology_imports(
+                            correlation_id, archive_filename_masked, archive_size,
+                            archive_sha256, file_count, total_size, destination_fingerprint,
+                            status, created_at_utc, updated_at_utc, completed_at_utc,
+                            operation_id, operation_payload_hash)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (correlation_id, "supplement-metadata", total_size,
+                             archive_sha256, file_count, total_size,
+                             destination_fingerprint, "COMPLETED", self._utc_now(),
+                             self._utc_now(), self._utc_now(), operation_id, payload_hash),
+                        )
+                        record_id = int(cursor.lastrowid)
+                    except sqlite3.IntegrityError as exc:
+                        raise IntakeHistoryError("Operação de suplemento duplicada no intake.") from exc
+            return self.get(record_id)
+        except IntakeHistoryError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise IntakeHistoryError("Não foi possível registrar o suplemento no intake.") from exc
 
     def set_review_required(
         self, record_id: int, *, reason_code: str, stage: str,

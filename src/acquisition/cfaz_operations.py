@@ -57,6 +57,8 @@ class CfazHistoryRecord:
     clinic_number: str | None = None
     repaired_at: str | None = None
     repair_version: int | None = None
+    supplement_operation_id: str | None = None
+    supplement_payload_hash: str | None = None
 
 
 class CfazHistoryRepository:
@@ -76,6 +78,8 @@ class CfazHistoryRepository:
                     status TEXT NOT NULL, started_at TEXT, completed_at TEXT,
                     duration_seconds REAL, onedrive_destination TEXT,
                     error_code TEXT, updated_at TEXT NOT NULL,
+                    supplement_operation_id TEXT,
+                    supplement_payload_hash TEXT,
                     PRIMARY KEY(provider, request_id))"""
                 )
                 columns = {
@@ -85,6 +89,8 @@ class CfazHistoryRepository:
                     "provider_request_id": "TEXT", "sequential_id": "TEXT",
                     "clinic_number": "TEXT", "repaired_at": "TEXT",
                     "repair_version": "INTEGER",
+                    "supplement_operation_id": "TEXT",
+                    "supplement_payload_hash": "TEXT",
                 }
                 for column, sql_type in migrations.items():
                     if column not in columns:
@@ -102,6 +108,11 @@ class CfazHistoryRepository:
                 db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cfaz_history_sequential "
                     "ON cfaz_import_history(provider,sequential_id,status)"
+                )
+                db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_cfaz_supplement_operation "
+                    "ON cfaz_import_history(supplement_operation_id) "
+                    "WHERE supplement_operation_id IS NOT NULL"
                 )
         except (OSError, sqlite3.Error) as exc:
             raise CfazHistoryError("Não foi possível abrir o histórico Cfaz.") from exc
@@ -201,13 +212,45 @@ class CfazHistoryRepository:
                     "O histórico COMPLETE do pedido Cfaz não foi localizado de forma única."
                 )
 
+    def record_supplement(
+        self, *, request_id: str, operation_id: str, payload_hash: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Associates one idempotent supplement with the existing CFAZ row."""
+        def execute(db: sqlite3.Connection) -> None:
+            row = db.execute(
+                "SELECT supplement_operation_id,supplement_payload_hash FROM cfaz_import_history "
+                "WHERE provider='cfaz' AND request_id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise CfazHistoryError("Histórico CFAZ não encontrado para o suplemento.")
+            if row["supplement_operation_id"] is not None:
+                if row["supplement_operation_id"] != operation_id or row["supplement_payload_hash"] != payload_hash:
+                    raise CfazHistoryError("Operação de suplemento conflitante no histórico CFAZ.")
+                return
+            try:
+                db.execute(
+                    "UPDATE cfaz_import_history SET supplement_operation_id=?, supplement_payload_hash=?, updated_at=? "
+                    "WHERE provider='cfaz' AND request_id=? AND supplement_operation_id IS NULL",
+                    (operation_id, payload_hash, self._now(), request_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise CfazHistoryError("Operação de suplemento duplicada no histórico CFAZ.") from exc
+        if connection is not None:
+            execute(connection)
+            return
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            execute(db)
+
     def get_record(self, identifier: str) -> CfazHistoryRecord | None:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT request_id,provider,patient_name,status,started_at,
                 completed_at,duration_seconds,onedrive_destination,provider_exam_id,
                 acquisition_sha,import_timestamp,provider_request_id,sequential_id,
-                clinic_number,repaired_at,repair_version FROM cfaz_import_history
+                clinic_number,repaired_at,repair_version,supplement_operation_id,
+                supplement_payload_hash FROM cfaz_import_history
                 WHERE provider='cfaz' AND
                 (request_id=? OR provider_request_id=? OR sequential_id=?)""",
                 (identifier, identifier, identifier),
@@ -303,7 +346,7 @@ class CfazHistoryRepository:
                 completed_at,duration_seconds,onedrive_destination,
                 provider_exam_id,acquisition_sha,import_timestamp
                 ,provider_request_id,sequential_id,clinic_number
-                ,repaired_at,repair_version
+                ,repaired_at,repair_version,supplement_operation_id,supplement_payload_hash
                 FROM cfaz_import_history ORDER BY updated_at DESC LIMIT ?""",
                 (min(max(int(limit), 1), 500),),
             )
@@ -317,7 +360,7 @@ class CfazHistoryRepository:
                 completed_at,duration_seconds,onedrive_destination,
                 provider_exam_id,acquisition_sha,import_timestamp,
                 provider_request_id,sequential_id,clinic_number,
-                repaired_at,repair_version
+                repaired_at,repair_version,supplement_operation_id,supplement_payload_hash
                 FROM cfaz_import_history
                 WHERE provider='cfaz' AND status='COMPLETE'
                 ORDER BY updated_at,request_id"""

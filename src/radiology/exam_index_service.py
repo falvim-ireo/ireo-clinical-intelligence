@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 from time import monotonic, sleep
 from typing import Any, Callable, Iterable
+from contextlib import nullcontext
 
 from integrations.onedrive_graph import GraphFolder, OneDriveGraphClient, OneDriveGraphError
 from services.patient_normalizer import PatientNormalizer
@@ -146,7 +147,7 @@ class ExamIndexService:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     exam_id TEXT, state TEXT NOT NULL, source TEXT NOT NULL,
                     index_version INTEGER NOT NULL, indexed_at TEXT NOT NULL,
-                    detail_code TEXT
+                    detail_code TEXT, operation_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS exam_assets (
                     exam_id TEXT NOT NULL REFERENCES exams(exam_id) ON DELETE CASCADE,
@@ -209,6 +210,13 @@ class ExamIndexService:
             for column in ("digital_model_id", "stl_file_id"):
                 if column not in columns:
                     db.execute(f"ALTER TABLE clinical_assets ADD COLUMN {column} TEXT")
+            history_columns = {row[1] for row in db.execute("PRAGMA table_info(import_history)")}
+            if "operation_id" not in history_columns:
+                db.execute("ALTER TABLE import_history ADD COLUMN operation_id TEXT")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_history_operation "
+                "ON import_history(operation_id) WHERE operation_id IS NOT NULL"
+            )
             db.execute(
                 "INSERT INTO index_metadata(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -233,7 +241,8 @@ class ExamIndexService:
 
     def index_manifest(
         self, manifest: dict[str, Any], *, patient_name: str | None = None,
-        source: str = "pipeline",
+        source: str = "pipeline", connection: sqlite3.Connection | None = None,
+        operation_id: str | None = None,
     ) -> IndexedExam:
         publication = manifest.get("publication")
         if not isinstance(publication, dict):
@@ -260,9 +269,24 @@ class ExamIndexService:
         voxels = [item.get("estimated_voxel_size") for item in series_values if item.get("estimated_voxel_size")]
         fovs = [item.get("estimated_fov") for item in series_values if item.get("estimated_fov")]
         now = _utc_now()
+        context = self._connect() if connection is None else nullcontext(connection)
+        in_transaction_result = None
         try:
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
+            with context as db:
+                if connection is None:
+                    db.execute("BEGIN IMMEDIATE")
+                if operation_id is not None:
+                    prior = db.execute(
+                        "SELECT exam_id FROM import_history WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        result = self._row(db.execute(
+                            "SELECT e.*,p.display_name FROM exams e JOIN patients p USING(patient_key) WHERE e.exam_id=?",
+                            (str(prior["exam_id"]),),
+                        ).fetchone()) if connection is not None else self.get_by_exam_id(str(prior["exam_id"]))
+                        if result is not None:
+                            return result
                 db.execute(
                     """INSERT INTO patients(patient_key,normalized_name,display_name,masked_patient_id,
                     first_exam_date,last_exam_date,updated_at) VALUES(?,?,?,?,?,?,?)
@@ -398,8 +422,8 @@ class ExamIndexService:
                         )
                 self._record_consistency_issues(db, exam_id, manifest, studies)
                 db.execute(
-                    "INSERT INTO import_history(exam_id,state,source,index_version,indexed_at) VALUES(?,?,?,?,?)",
-                    (exam_id, "INDEXED", source, self.index_version, now),
+                    "INSERT INTO import_history(exam_id,state,source,index_version,indexed_at,operation_id) VALUES(?,?,?,?,?,?)",
+                    (exam_id, "INDEXED", source, self.index_version, now, operation_id),
                 )
                 db.execute(
                     """UPDATE patients SET
@@ -407,9 +431,16 @@ class ExamIndexService:
                     last_exam_date=(SELECT MAX(exam_date) FROM exams WHERE patient_key=?),updated_at=?
                     WHERE patient_key=?""", (patient_key, patient_key, now, patient_key),
                 )
+                if connection is not None:
+                    in_transaction_result = self._row(db.execute(
+                        "SELECT e.*,p.display_name FROM exams e JOIN patients p USING(patient_key) WHERE e.exam_id=?",
+                        (exam_id,),
+                    ).fetchone())
         except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            if connection is not None:
+                raise
             raise ExamIndexError("Não foi possível indexar o manifesto radiológico.") from exc
-        result = self.get_by_exam_id(exam_id)
+        result = in_transaction_result or self.get_by_exam_id(exam_id)
         if result is None:
             raise ExamIndexError("O exame não foi encontrado após a indexação.")
         return result
