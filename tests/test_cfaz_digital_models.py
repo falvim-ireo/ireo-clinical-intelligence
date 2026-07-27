@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +28,24 @@ from acquisition.cfaz_provider import (
 )
 
 
+@pytest.fixture(autouse=True)
+def allow_reserved_download_domain(monkeypatch):
+    monkeypatch.setattr(
+        CfazProvider,
+        "_validate_download_url",
+        classmethod(lambda _cls, _url: None),
+    )
+    monkeypatch.setattr(
+        CfazProvider,
+        "_is_digital_model_download_url",
+        classmethod(
+            lambda _cls, value: str(value).startswith(
+                "https://models.example.invalid/"
+            )
+        ),
+    )
+
+
 def binary_stl(marker: bytes) -> bytes:
     header = marker[:80].ljust(80, b"\x00")
     return header + (1).to_bytes(4, "little") + b"\x00" * 50
@@ -41,14 +61,15 @@ class Provider:
         self.archives = archives
         self.discover_calls = []
         self.download_calls = []
+        self._session = ArchiveSession(self)
 
     def discover_digital_models(self, request_id):
         self.discover_calls.append(request_id)
         files = tuple(
             CfazDigitalModelFile(
-                digital_model_id="658742",
+                digital_model_id="synthetic-model",
                 stl_file_id=file_id,
-                download_url=f"https://storage.googleapis.com/bucket/{file_id}.zip?Signature=secret",
+                download_url=f"https://models.example.invalid/bucket/{file_id}.zip?signature=synthetic",
                 filename=f"{source_name}.zip",
                 model_name="Escaneamento",
                 source_field=f"digital_models[1].stl_files[{position}]",
@@ -72,6 +93,10 @@ class Provider:
 
 
 class UnsafeProvider(Provider):
+    def __init__(self, request, archives):
+        super().__init__(request, archives)
+        self._session = UnsafeArchiveSession(self)
+
     def download_digital_model_archive(self, item, destination):
         self.download_calls.append(item.stl_file_id)
         destination = Path(destination)
@@ -79,6 +104,54 @@ class UnsafeProvider(Provider):
         with zipfile.ZipFile(destination, "w") as archive:
             archive.writestr("../escape.stl", binary_stl(b"unsafe"))
         return sha256(destination.read_bytes()), destination.stat().st_size, "application/zip"
+
+
+class ArchiveResponse:
+    status_code = 200
+
+    def __init__(self, body):
+        self.body = body
+        self.headers = {
+            "Content-Type": "application/zip",
+            "Content-Length": str(len(body)),
+        }
+
+    def iter_content(self, chunk_size):
+        for position in range(0, len(self.body), chunk_size):
+            yield self.body[position:position + chunk_size]
+
+    def close(self):
+        pass
+
+
+class ArchiveSession:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def get(self, url, **_kwargs):
+        file_id = next(
+            identity for identity in self.provider.archives
+            if f"/{identity}.zip" in url
+        )
+        self.provider.download_calls.append(file_id)
+        source_name, content = self.provider.archives[file_id]
+        stream = BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr(f"{source_name}.stl", content)
+        return ArchiveResponse(stream.getvalue())
+
+
+class UnsafeArchiveSession(ArchiveSession):
+    def get(self, url, **_kwargs):
+        file_id = next(
+            identity for identity in self.provider.archives
+            if f"/{identity}.zip" in url
+        )
+        self.provider.download_calls.append(file_id)
+        stream = BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("../escape.stl", binary_stl(b"unsafe"))
+        return ArchiveResponse(stream.getvalue())
 
 
 class Graph:
@@ -92,9 +165,9 @@ class Graph:
 
     def list_children(self, folder):
         path_children = {
-            "Pacientes": ["Paciente"],
-            "Paciente": ["Radiologia"],
-            "Radiologia": ["Exame"],
+            "Patients": ["Synthetic Patient"],
+            "Synthetic Patient": ["Radiology"],
+            "Radiology": ["Exam"],
         }
         if folder.name == "04 - Modelos Digitais":
             return [
@@ -129,6 +202,9 @@ class Graph:
         else:
             self.remote_models[filename] = Path(path).stat().st_size
         return SimpleNamespace(name=filename, size=Path(path).stat().st_size)
+
+    def delete_child_file(self, _folder, filename):
+        self.remote_models.pop(filename, None)
 
 
 class FailingGraph(Graph):
@@ -165,6 +241,32 @@ class InterruptedGraph(Graph):
         return result
 
 
+class FailingArchiveSession(ArchiveSession):
+    def __init__(self, provider, fail_on):
+        super().__init__(provider)
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            return ArchiveResponse(b"<html>synthetic failure</html>")
+        return super().get(url, **kwargs)
+
+
+class FailingPromotionSupplement(CfazDigitalModelSupplement):
+    def __init__(self, *args, fail_on, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_on = fail_on
+        self.promotions = 0
+
+    def _promote_local(self, source_path, target):
+        self.promotions += 1
+        if self.promotions == self.fail_on:
+            raise OSError("synthetic promotion failure")
+        return super()._promote_local(source_path, target)
+
+
 class Index:
     def __init__(self):
         self.values = []
@@ -173,20 +275,27 @@ class Index:
         self.values.append((deepcopy(manifest), source))
 
 
+class FailingIndex(Index):
+    def index_manifest(self, manifest, source):
+        if source != "cfaz-digital-models-rollback":
+            raise RuntimeError("synthetic index failure")
+        super().index_manifest(manifest, source)
+
+
 def fixture(tmp_path):
     database = tmp_path / "index.db"
     history = CfazHistoryRepository(database)
     history.mark_complete(
-        request_id="26977444",
-        provider_request_id="26977444",
-        sequential_id="81837",
-        clinic_number="4427",
-        patient_name="Paciente",
+        request_id="99999991",
+        provider_request_id="99999991",
+        sequential_id="999991",
+        clinic_number="99991",
+        patient_name="Synthetic Patient",
         duration_seconds=1,
-        onedrive_destination="Pacientes/Paciente/Radiologia/Exame",
+        onedrive_destination="Patients/Synthetic Patient/Radiology/Exam",
         acquisition_sha="a" * 64,
     )
-    staging = tmp_path / "staging" / "Paciente" / "Exame"
+    staging = tmp_path / "staging" / "Synthetic Patient" / "Exame"
     staging.mkdir(parents=True)
     prior = b"prior"
     (staging / "documentacao_001.jpg").write_bytes(prior)
@@ -194,12 +303,12 @@ def fixture(tmp_path):
         "status": "COMPLETED",
         "file_count": 1,
         "total_size_bytes": len(prior),
-        "onedrive_destination": "Pacientes/Paciente/Radiologia/Exame",
+        "onedrive_destination": "Patients/Synthetic Patient/Radiology/Exam",
         "acquisition": {
             "provider_id": "cfaz",
-            "request_id": "26977444",
-            "provider_request_id": "26977444",
-            "sequential_id": "81837",
+            "request_id": "99999991",
+            "provider_request_id": "99999991",
+            "sequential_id": "999991",
             "classifications": ["Imagem"],
             "asset_count": 1,
             "files": [{
@@ -232,12 +341,12 @@ def fixture(tmp_path):
     manifest_path.write_text(json.dumps(manifest), "utf-8")
     request = AcquisitionRequest(
         provider_id="cfaz",
-        request_id="26977444",
-        provider_request_id="26977444",
-        sequential_id="81837",
-        clinic_number="4427",
-        source_url="https://max.cfaz.net/requests/26977444",
-        patient_name="Paciente",
+        request_id="99999991",
+        provider_request_id="99999991",
+        sequential_id="999991",
+        clinic_number="99991",
+        source_url="https://max.cfaz.net/requests/99999991",
+        patient_name="Synthetic Patient",
         request_date=None,
         exam_date=None,
         radiology_clinic=None,
@@ -245,8 +354,8 @@ def fixture(tmp_path):
         assets=(),
     )
     provider = Provider(request, {
-        "1511267": ("LowerJawScan", binary_stl(b"lower")),
-        "1511268": ("UpperJawScan", binary_stl(b"upper")),
+        "synthetic-stl-alpha": ("LowerJawScan", binary_stl(b"lower")),
+        "synthetic-stl-beta": ("UpperJawScan", binary_stl(b"upper")),
     })
     return history, staging, manifest_path, manifest, provider
 
@@ -268,7 +377,7 @@ def test_dry_run_enumerates_without_download_or_changes(tmp_path):
     history, _staging, manifest_path, _manifest, provider = fixture(tmp_path)
     before = manifest_path.read_bytes()
 
-    result = supplement(tmp_path, history, provider).run("81837")
+    result = supplement(tmp_path, history, provider).run("999991")
 
     assert result.state == "DRY_RUN"
     assert result.model_count == 1
@@ -291,7 +400,7 @@ def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
     index = Index()
     service = supplement(tmp_path, history, provider, graph, index)
 
-    first = service.run("81837", apply=True)
+    first = service.run("999991", apply=True)
 
     assert first.state == "COMPLETE"
     assert first.added_file_count == 2
@@ -302,7 +411,7 @@ def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
     updated = json.loads(manifest_path.read_text("utf-8"))
     marker = updated["cfaz_digital_models"]
     assert marker["state"] == "COMPLETE"
-    assert sorted(marker["provider_files"]) == ["1511267", "1511268"]
+    assert sorted(marker["provider_files"]) == ["synthetic-stl-alpha", "synthetic-stl-beta"]
     assert all(
         item["remote_uploaded"] for item in marker["provider_files"].values()
     )
@@ -311,12 +420,12 @@ def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
     assert updated["file_count"] == 3
     package_assets = updated["acquisition"]["clinical_package"]["assets"]
     assert {item["stl_file_id"] for item in package_assets} == {
-        "1511267", "1511268",
+        "synthetic-stl-alpha", "synthetic-stl-beta",
     }
     serialized = json.dumps(updated)
-    assert "storage.googleapis.com" not in serialized
+    assert "models.example.invalid" not in serialized
     assert "Signature" not in serialized
-    assert history.get_record("81837").status == "COMPLETE"
+    assert history.get_record("999991").status == "COMPLETE"
     assert index.values[-1][1] == "cfaz-digital-models"
     assert set(graph.remote_models) == {
         "modelo_mandibula_001.stl",
@@ -329,7 +438,7 @@ def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
     download_count = len(provider.download_calls)
     upload_count = len(graph.uploads)
 
-    second = service.run("26977444", apply=True)
+    second = service.run("99999991", apply=True)
 
     assert second.state == "ALREADY_COMPLETE"
     assert len(provider.download_calls) == download_count
@@ -341,10 +450,10 @@ def test_unsafe_zip_is_rejected_before_manifest_or_destination_change(tmp_path):
     provider = UnsafeProvider(provider.request, provider.archives)
     before = manifest_path.read_bytes()
 
-    with pytest.raises(CfazDigitalModelError, match="entrada insegura"):
+    with pytest.raises(CfazDigitalModelError, match="validação estrutural"):
         supplement(
             tmp_path, history, provider, Graph(manifest), Index()
-        ).run("81837", apply=True)
+        ).run("999991", apply=True)
 
     assert manifest_path.read_bytes() == before
     assert not (staging / "04 - Modelos Digitais").exists()
@@ -358,38 +467,140 @@ def test_failure_before_first_remote_file_rolls_back_local_changes(tmp_path):
     with pytest.raises(CfazDigitalModelError, match="estado seguro"):
         supplement(
             tmp_path, history, provider, FailingGraph(manifest), Index()
-        ).run("81837", apply=True)
+        ).run("999991", apply=True)
 
     assert manifest_path.read_bytes() == before
     assert not (staging / "04 - Modelos Digitais").exists()
 
 
-def test_interruption_after_first_upload_resumes_without_duplicate(tmp_path):
+def test_interruption_after_first_upload_rolls_back_without_duplicate(tmp_path):
     history, _staging, manifest_path, manifest, provider = fixture(tmp_path)
     graph = InterruptedGraph(manifest)
     service = supplement(tmp_path, history, provider, graph, Index())
 
     with pytest.raises(CfazDigitalModelError, match="estado seguro"):
-        service.run("81837", apply=True)
+        service.run("999991", apply=True)
 
-    interrupted = json.loads(manifest_path.read_text("utf-8"))
-    assert interrupted["cfaz_digital_models"]["state"] == "IN_PROGRESS"
-    assert len(graph.remote_models) == 1
-    first_uploads = [
-        item for item in graph.uploads if item[1].endswith(".stl")
-    ]
-    assert len(first_uploads) == 1
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert graph.remote_models == {}
 
-    result = service.run("81837", apply=True)
 
-    assert result.state == "COMPLETE"
-    assert len(graph.remote_models) == 2
-    model_uploads = [
-        item for item in graph.uploads if item[1].endswith(".stl")
-    ]
-    assert len(model_uploads) == 2
-    completed = json.loads(manifest_path.read_text("utf-8"))
-    assert completed["cfaz_digital_models"]["state"] == "COMPLETE"
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_download_failure_rolls_back_all_local_and_remote_state(
+    tmp_path, fail_on,
+):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    provider._session = FailingArchiveSession(provider, fail_on)
+
+    with pytest.raises(CfazDigitalModelError, match="download"):
+        supplement(
+            tmp_path, history, provider, Graph(manifest), Index()
+        ).run("999991", apply=True)
+
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert not (staging / "04 - Modelos Digitais").exists()
+    assert not (tmp_path / "cfaz-digital-models").exists()
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_local_promotion_failure_rolls_back_both_assets(tmp_path, fail_on):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+    service = FailingPromotionSupplement(
+        provider=provider,
+        history=history,
+        graph=graph,
+        exam_index_service=Index(),
+        staging_root=tmp_path / "staging",
+        max_file_bytes=20 * 1024 * 1024,
+        output=lambda _message: None,
+        fail_on=fail_on,
+    )
+
+    with pytest.raises(CfazDigitalModelError, match="staging local"):
+        service.run("999991", apply=True)
+
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert graph.remote_models == {}
+    assert not (staging / "04 - Modelos Digitais").exists()
+
+
+def test_index_failure_restores_manifest_files_and_remote_models(tmp_path):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+
+    with pytest.raises(CfazDigitalModelError, match="índice"):
+        supplement(
+            tmp_path, history, provider, graph, FailingIndex()
+        ).run("999991", apply=True)
+
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert graph.remote_manifest == manifest
+    assert graph.remote_models == {}
+    assert not (staging / "04 - Modelos Digitais").exists()
+
+
+def test_duplicate_urls_fail_before_first_get(tmp_path):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    original_discover = provider.discover_digital_models
+
+    def discover(request_id):
+        inventory = original_discover(request_id)
+        shared = inventory.files[0].download_url
+        return replace(
+            inventory,
+            files=tuple(
+                replace(item, download_url=shared) for item in inventory.files
+            ),
+        )
+
+    provider.discover_digital_models = discover
+
+    with pytest.raises(CfazDigitalModelError, match="ambíguo"):
+        supplement(
+            tmp_path, history, provider, Graph(manifest), Index()
+        ).run("999991", apply=True)
+
+    assert provider.download_calls == []
+
+
+def test_identical_contents_for_distinct_ids_require_review(tmp_path):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    same = binary_stl(b"same-synthetic-model")
+    provider.archives = {
+        identity: (name, same)
+        for identity, (name, _content) in provider.archives.items()
+    }
+
+    with pytest.raises(CfazDigitalModelError, match="conteúdo idêntico"):
+        supplement(
+            tmp_path, history, provider, Graph(manifest), Index()
+        ).run("999991", apply=True)
+
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert not (staging / "04 - Modelos Digitais").exists()
+
+
+def test_partial_preexisting_identity_requires_review_without_get(tmp_path):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    partial = deepcopy(manifest)
+    partial["acquisition"]["assets"] = [{
+        "provider": "cfaz",
+        "provider_asset_id": "synthetic-stl-alpha",
+        "stl_file_id": "synthetic-stl-alpha",
+        "stored_name": "synthetic-partial.stl",
+        "relative_folder": "04 - Modelos Digitais",
+        "sha256": "a" * 64,
+    }]
+    manifest_path.write_text(json.dumps(partial), "utf-8")
+
+    with pytest.raises(CfazDigitalModelError, match="estado parcial"):
+        supplement(
+            tmp_path, history, provider, Graph(manifest), Index()
+        ).run("999991", apply=True)
+
+    assert provider.download_calls == []
+    assert not (staging / "04 - Modelos Digitais").exists()
 
 
 class HttpResponse:
@@ -414,46 +625,54 @@ class HttpSession:
         authenticated = kwargs.get("params", {}).get("access_token") == "token"
         if not authenticated:
             return HttpResponse(401, {})
-        if url.endswith("/api/v1/requests/26977444"):
+        if url.endswith("/api/v1/requests/99999991"):
             return HttpResponse(200, self.api_payload)
-        if url.endswith("/requests/26977444.json"):
+        if url.endswith("/requests/99999991.json"):
+            return HttpResponse(200, self.page_payload)
+        if "/digital_models/99999992" in url:
             return HttpResponse(200, self.page_payload)
         raise AssertionError(url)
 
 
 def test_provider_resolves_two_signed_urls_from_authenticated_page_json():
     api_payload = {
-        "id": 26977444,
-        "sequential_id": 81837,
-        "clinic_id": 4427,
-        "patient_datum": {"name": "Paciente"},
+        "id": 99999991,
+        "sequential_id": 999991,
+        "clinic_id": 99991,
+        "patient_datum": {"name": "Synthetic Patient"},
         "digital_models": [{
-            "id": 658742,
+            "id": 99999992,
             "model_name": "Escaneamento",
             "stl_files": [
-                {"id": 1511267, "digital_model_id": 658742},
-                {"id": 1511268, "digital_model_id": 658742},
+                {
+                    "id": 99999993,
+                    "digital_model_id": 99999992,
+                },
+                {
+                    "id": 99999994,
+                    "digital_model_id": 99999992,
+                },
             ],
         }],
     }
     page_payload = {
         "digital_models": [{
-            "id": 658742,
+            "id": 99999992,
             "stl_files": [
                 {
-                    "id": 1511267,
+                    "id": 99999993,
                     "name": "LowerJawScan.zip",
                     "download_url": (
-                        "https://storage.googleapis.com/bucket/lower.zip"
-                        "?GoogleAccessId=x&Expires=1&Signature=secret"
+                        "https://models.example.invalid/bucket/lower.zip"
+                        "?GoogleAccessId=x&Expires=1&signature=synthetic"
                     ),
                 },
                 {
-                    "id": 1511268,
+                    "id": 99999994,
                     "name": "UpperJawScan.zip",
                     "download_url": (
-                        "https://storage.googleapis.com/bucket/upper.zip"
-                        "?GoogleAccessId=x&Expires=1&Signature=secret"
+                        "https://models.example.invalid/bucket/upper.zip"
+                        "?GoogleAccessId=x&Expires=1&signature=synthetic"
                     ),
                 },
             ],
@@ -465,11 +684,11 @@ def test_provider_resolves_two_signed_urls_from_authenticated_page_json():
         api_token="token", session=session, output=output.append
     )
 
-    inventory = provider.discover_digital_models("26977444")
+    inventory = provider.discover_digital_models("99999991")
 
     assert inventory.model_count == 1
     assert [item.stl_file_id for item in inventory.files] == [
-        "1511267", "1511268",
+        "99999993", "99999994",
     ]
     assert [item.filename for item in inventory.files] == [
         "LowerJawScan.zip", "UpperJawScan.zip",
@@ -480,19 +699,19 @@ def test_provider_resolves_two_signed_urls_from_authenticated_page_json():
 
 def test_provider_uses_configured_session_login_when_page_rejects_api_token():
     api_payload = {
-        "id": 26977444,
-        "sequential_id": 81837,
+        "id": 99999991,
+        "sequential_id": 999991,
         "digital_models": [{
-            "id": 658742,
-            "stl_files": [{"id": 1511267}],
+            "id": 99999992,
+            "stl_files": [{"id": 99999993}],
         }],
     }
     page_payload = {
         "stl_files": [{
-            "id": 1511267,
+            "id": 99999993,
             "download_url": (
-                "https://storage.googleapis.com/bucket/lower.zip"
-                "?GoogleAccessId=x&Expires=1&Signature=secret"
+                "https://models.example.invalid/bucket/lower.zip"
+                "?GoogleAccessId=x&Expires=1&signature=synthetic"
             ),
         }],
     }
@@ -506,11 +725,15 @@ def test_provider_uses_configured_session_login_when_page_rejects_api_token():
 
         def get(self, url, **kwargs):
             self.calls.append((url, kwargs))
-            if url.endswith("/api/v1/requests/26977444"):
+            if url.endswith("/api/v1/requests/99999991"):
                 if kwargs.get("params", {}).get("access_token") == "token":
                     return HttpResponse(200, api_payload)
                 return HttpResponse(401, {})
-            if url.endswith("/requests/26977444.json"):
+            if url.endswith("/requests/99999991.json"):
+                if "access-token" in kwargs.get("headers", {}):
+                    return HttpResponse(200, page_payload)
+                return HttpResponse(403, {})
+            if "/digital_models/99999992" in url:
                 if "access-token" in kwargs.get("headers", {}):
                     return HttpResponse(200, page_payload)
                 return HttpResponse(403, {})
@@ -535,9 +758,9 @@ def test_provider_uses_configured_session_login_when_page_rejects_api_token():
         output=lambda _message: None,
     )
 
-    inventory = provider.discover_digital_models("26977444")
+    inventory = provider.discover_digital_models("99999991")
 
-    assert [item.stl_file_id for item in inventory.files] == ["1511267"]
+    assert [item.stl_file_id for item in inventory.files] == ["99999993"]
     assert session.login_calls == 1
 
 

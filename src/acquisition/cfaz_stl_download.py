@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path, PurePosixPath
 import shutil
@@ -32,6 +33,8 @@ class CfazStlDiagnostic:
     element_count: int
     redirects: int
     final_status: int
+    sha256: str
+    validated_path: Path
 
 
 def validate_stl(path: Path) -> tuple[str, int]:
@@ -231,6 +234,10 @@ def _download_and_validate(
             "Resposta textual incompatível com um modelo STL."
         )
     stl_format, count = validate_stl(model_path)
+    digest = hashlib.sha256()
+    with model_path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
     return CfazStlDiagnostic(
         received_bytes=received,
         content_category=category,
@@ -238,6 +245,8 @@ def _download_and_validate(
         element_count=count,
         redirects=redirects,
         final_status=status,
+        sha256=digest.hexdigest(),
+        validated_path=model_path,
     )
 
 

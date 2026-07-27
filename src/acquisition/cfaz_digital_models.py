@@ -17,6 +17,11 @@ import zipfile
 from acquisition.cfaz_provider import (
     CfazDigitalModelFile,
     CfazDigitalModelInventory,
+    CfazProvider,
+)
+from acquisition.cfaz_stl_download import (
+    CfazStlDownloadError,
+    download_stl_diagnostic,
 )
 from acquisition.clinical_normalizer import (
     CLINICAL_FOLDERS,
@@ -141,6 +146,12 @@ class CfazDigitalModelSupplement:
         inventory = self.provider.discover_digital_models(lookup_id)
         self._validate_inventory(record, inventory)
         existing_ids = self._manifest_stl_ids(manifest)
+        if existing_ids and not self._completed_marker_is_valid(
+            marker, manifest_path.parent
+        ):
+            raise CfazDigitalModelError(
+                "Há modelos digitais em estado parcial; revisão obrigatória."
+            )
         pending = [
             item for item in inventory.files
             if item.stl_file_id not in existing_ids
@@ -191,6 +202,7 @@ class CfazDigitalModelSupplement:
                 onedrive_destination=destination,
                 indexed=False,
             )
+        self._validate_apply_preflight(inventory)
         return self._apply(
             record=record,
             inventory=inventory,
@@ -226,6 +238,7 @@ class CfazDigitalModelSupplement:
         remote_data_uploaded = False
         remote_folder = None
         model_folder = None
+        created_remote: list[str] = []
         try:
             used_paths = self._manifest_relative_paths(working)
             for item in inventory.files:
@@ -244,6 +257,18 @@ class CfazDigitalModelSupplement:
                         used_paths=used_paths,
                     )
                 )
+            hashes: dict[str, str] = {}
+            for plan in prepared:
+                prior_identity = hashes.get(plan.sha256)
+                if (
+                    prior_identity is not None
+                    and prior_identity != plan.stl_file_id
+                ):
+                    raise CfazDigitalModelError(
+                        "Identidades STL distintas produziram conteúdo idêntico; "
+                        "revisão obrigatória."
+                    )
+                hashes[plan.sha256] = plan.stl_file_id
             for plan in prepared:
                 target = manifest_path.parent / plan.relative_path
                 if plan.already_manifested:
@@ -259,8 +284,7 @@ class CfazDigitalModelSupplement:
                         "O nome local do modelo digital conflita com outro arquivo."
                     )
                 try:
-                    with plan.local_source.open("rb") as source, target.open("xb") as output:
-                        shutil.copyfileobj(source, output, 1024 * 1024)
+                    self._promote_local(plan.local_source, target)
                 except OSError:
                     target.unlink(missing_ok=True)
                     raise CfazDigitalModelError(
@@ -330,6 +354,7 @@ class CfazDigitalModelSupplement:
                         model_folder, target, remote_filename=plan.stored_name
                     )
                     remote_data_uploaded = True
+                    created_remote.append(plan.stored_name)
                     remote_items[plan.stored_name.casefold()] = {
                         "name": plan.stored_name,
                         "size": plan.size,
@@ -366,26 +391,33 @@ class CfazDigitalModelSupplement:
             )
             self._write_json(manifest_path, final)
         except Exception as exc:
-            if not remote_data_uploaded:
-                rollback_ok = True
-                if remote_manifest_started and remote_folder is not None:
-                    rollback_path = work_root / "manifest.rollback.json"
+            rollback_ok = True
+            if created_remote and model_folder is not None:
+                for filename in reversed(created_remote):
                     try:
-                        rollback_path.write_bytes(original_bytes)
-                        self.graph.upload_small_file(
-                            remote_folder,
-                            rollback_path,
-                            remote_filename="manifest.json",
-                        )
+                        self.graph.delete_child_file(model_folder, filename)
                     except Exception:
                         rollback_ok = False
-                if rollback_ok:
-                    manifest_path.write_bytes(original_bytes)
-                    for path in reversed(created_local):
-                        path.unlink(missing_ok=True)
-                    self._remove_empty_model_folder(manifest_path.parent)
+            if remote_manifest_started and remote_folder is not None:
+                rollback_path = work_root / "manifest.rollback.json"
+                try:
+                    rollback_path.write_bytes(original_bytes)
+                    self.graph.upload_small_file(
+                        remote_folder,
+                        rollback_path,
+                        remote_filename="manifest.json",
+                    )
+                except Exception:
+                    rollback_ok = False
+            if rollback_ok:
+                manifest_path.write_bytes(original_bytes)
+                for path in reversed(created_local):
+                    path.unlink(missing_ok=True)
+                self._remove_empty_model_folder(manifest_path.parent)
             if isinstance(exc, CfazDigitalModelError):
+                self._cleanup_work_root(work_root)
                 raise
+            self._cleanup_work_root(work_root)
             raise CfazDigitalModelError(
                 "A incorporação dos modelos digitais foi interrompida; "
                 "o estado seguro foi preservado para retomada."
@@ -399,11 +431,45 @@ class CfazDigitalModelSupplement:
                     source="cfaz-digital-models",
                 )
                 indexed = True
-            except Exception:
-                self.output(
-                    "Indexação dos modelos pendente; o manifesto permite rebuild."
-                )
+            except Exception as exc:
+                rollback_ok = True
+                for filename in reversed(created_remote):
+                    try:
+                        self.graph.delete_child_file(model_folder, filename)
+                    except Exception:
+                        rollback_ok = False
+                try:
+                    rollback_path = work_root / "manifest.rollback.json"
+                    rollback_path.write_bytes(original_bytes)
+                    self.graph.upload_small_file(
+                        remote_folder,
+                        rollback_path,
+                        remote_filename="manifest.json",
+                    )
+                except Exception:
+                    rollback_ok = False
+                if rollback_ok:
+                    manifest_path.write_bytes(original_bytes)
+                    for path in reversed(created_local):
+                        path.unlink(missing_ok=True)
+                    self._remove_empty_model_folder(manifest_path.parent)
+                    try:
+                        self.exam_index_service.index_manifest(
+                            self._read_json(manifest_path),
+                            source="cfaz-digital-models-rollback",
+                        )
+                    except Exception:
+                        rollback_ok = False
+                raise CfazDigitalModelError(
+                    "A atualização atômica do índice falhou; "
+                    + (
+                        "os arquivos e metadados foram revertidos."
+                        if rollback_ok
+                        else "revisão obrigatória do estado preservado."
+                    )
+                ) from exc
         added = sum(not item.already_manifested for item in prepared)
+        self._cleanup_work_root(work_root)
         return CfazDigitalModelsResult(
             request_id=inventory.request.request_id,
             model_count=inventory.model_count,
@@ -417,6 +483,19 @@ class CfazDigitalModelSupplement:
             indexed=indexed,
         )
 
+    @staticmethod
+    def _promote_local(source_path: Path, target: Path) -> None:
+        with source_path.open("rb") as source, target.open("xb") as output:
+            shutil.copyfileobj(source, output, 1024 * 1024)
+
+    @staticmethod
+    def _cleanup_work_root(work_root: Path) -> None:
+        shutil.rmtree(work_root, ignore_errors=True)
+        try:
+            work_root.parent.rmdir()
+        except OSError:
+            pass
+
     def _download_and_prepare(
         self,
         item: CfazDigitalModelFile,
@@ -425,18 +504,32 @@ class CfazDigitalModelSupplement:
         work_root: Path,
         used_paths: set[str],
     ) -> _PreparedModel:
-        archive = (
-            work_root
-            / f"modelo-{item.digital_model_id}-stl-{item.stl_file_id}.zip"
+        prepared_root = work_root / f"prepared-{hashlib.sha256(item.stl_file_id.encode()).hexdigest()[:16]}"
+        prepared_root.mkdir(parents=True, exist_ok=False)
+        source = prepared_root / "model.stl"
+        try:
+            with download_stl_diagnostic(
+                item.download_url,
+                session=getattr(self.provider, "_session", None),
+                max_file_bytes=self.max_file_bytes,
+            ) as diagnostic:
+                with diagnostic.validated_path.open("rb") as input_stream, source.open("xb") as output:
+                    shutil.copyfileobj(input_stream, output, 1024 * 1024)
+                digest = diagnostic.sha256
+        except (CfazStlDownloadError, OSError) as exc:
+            shutil.rmtree(prepared_root, ignore_errors=True)
+            raise CfazDigitalModelError(
+                "O download ou a validação estrutural do STL falhou."
+            ) from exc
+        if self._sha256(source) != digest:
+            shutil.rmtree(prepared_root, ignore_errors=True)
+            raise CfazDigitalModelError(
+                "O fingerprint do STL preparado é inconsistente."
+            )
+        declared_stem = Path(str(item.filename or "")).stem
+        source_name = (
+            f"{declared_stem}.stl" if declared_stem else "modelo.stl"
         )
-        if not archive.is_file() or not zipfile.is_zipfile(archive):
-            archive.unlink(missing_ok=True)
-            self.provider.download_digital_model_archive(item, archive)
-        source, source_name = self._extract_single_stl(
-            archive,
-            work_root / f"extract-{item.digital_model_id}-{item.stl_file_id}",
-        )
-        digest = self._sha256(source)
         stored_name = self._next_stored_name(
             source_name=source_name,
             model_name=item.model_name,
@@ -512,6 +605,34 @@ class CfazDigitalModelSupplement:
             metadata=metadata,
             already_manifested=False,
         )
+
+    def _validate_apply_preflight(
+        self, inventory: CfazDigitalModelInventory
+    ) -> None:
+        if len(inventory.files) != 2:
+            raise CfazDigitalModelError(
+                "A aplicação exige exatamente dois descritores STL."
+            )
+        identities = [str(item.stl_file_id or "") for item in inventory.files]
+        urls = [str(item.download_url or "").strip() for item in inventory.files]
+        if (
+            any(not value for value in identities)
+            or len(set(identities)) != len(identities)
+            or any(not value for value in urls)
+            or len(set(urls)) != len(urls)
+        ):
+            raise CfazDigitalModelError(
+                "Mapa STL incompleto, duplicado ou ambíguo; revisão obrigatória."
+            )
+        for url in urls:
+            CfazProvider._validate_download_url(url)
+        if self.graph is not None and not callable(
+            getattr(self.graph, "delete_child_file", None)
+        ):
+            raise CfazDigitalModelError(
+                "O cliente remoto não oferece rollback verificável; "
+                "aplicação bloqueada."
+            )
 
     def _prepared_from_manifest(
         self,
