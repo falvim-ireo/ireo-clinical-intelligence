@@ -2,11 +2,10 @@
 
 > **Fonte única de verdade do projeto.**
 >
-> Última atualização: 2026-07-26
+> Última atualização: 2026-07-27
 >
 > Estado documental: v1, criado por auditoria do repositório, do histórico Git e dos testes.
-> Referência de código: `main` em `c2aa428`, acrescida das alterações locais
-> ainda não versionadas da Sprint 18.1.
+> Referência de código: `main` em `b4d014a62aa2cd4838f23842e83ddfeb9ab7d161`.
 
 ## Protocolo obrigatório para novas sessões
 
@@ -151,6 +150,118 @@ Clinicorp não é a origem dos arquivos e, portanto, não precede tecnicamente t
 - **Compatibilidade aditiva:** evolução do manifesto e do banco preserva campos e dados existentes.
 - **Observabilidade sanitizada:** logs e históricos evitam PHI, segredos, URLs e caminhos completos.
 - **Uma tarefa por vez:** a seção final deste documento contém uma única prioridade.
+
+### 1.5 Princípio obrigatório de MVP de alto valor clínico
+
+Enquanto o IREO Clinical Intelligence permanecer uma solução de uso exclusivo
+do IREO, cada função deverá ser construída como um **MVP de alto valor
+clínico**: o menor esforço e a menor complexidade capazes de produzir benefício
+real, transformador, perceptível e verificável para a clínica, preservando as
+garantias mínimas exigidas por segurança, integridade dos dados, LGPD e
+prevenção de associação incorreta de pacientes.
+
+Essa decisão reduz escopo e complexidade antecipada; ela não reduz segurança
+essencial. Permanece válida até que uma decisão formal transforme o sistema em
+produto para uso externo.
+
+#### Significado de MVP
+
+- MVP não significa protótipo descartável.
+- MVP não autoriza sistema inseguro, associação ambígua de pacientes ou
+  exposição de dados.
+- MVP é a menor entrega vertical utilizável que gere benefício clínico ou
+  operacional mensurável no IREO.
+- A arquitetura deve ser proporcional ao risco e ao uso real presente, não a
+  cenários hipotéticos de comercialização ou escala.
+
+#### Garantias mínimas inegociáveis
+
+- LGPD e minimização de dados;
+- proteção de credenciais e segredos;
+- associação inequívoca entre paciente, solicitação e exame;
+- prevenção de sobrescrita ou perda silenciosa;
+- idempotência suficiente para o fluxo efetivamente utilizado;
+- rastreabilidade clínica e operacional necessária;
+- falha segura nos pontos que possam gerar associação errada, perda ou
+  duplicidade relevante;
+- revisão humana antes de decisões ou ações com consequência clínica;
+- testes sintéticos dos caminhos reais e dos riscos essenciais.
+
+#### Justificativa obrigatória para complexidade adicional
+
+Qualquer aumento de complexidade deve responder a pelo menos um fator atual e
+demonstrável:
+
+- risco concreto de dano clínico ou associação incorreta;
+- obrigação legal, de privacidade ou segurança;
+- prevenção de perda ou sobrescrita de informação relevante;
+- redução relevante e mensurável de trabalho manual;
+- necessidade operacional observada no IREO;
+- falha real ou provável do fluxo utilizado;
+- benefício clínico, assistencial ou financeiro mensurável.
+
+Sem essa justificativa, ficam adiados mecanismos voltados apenas a escala
+hipotética, workers inexistentes, distribuição comercial futura, generalização
+prematura, integrações não utilizadas, abstrações para provedores alternativos,
+alta disponibilidade não requerida, automação integral onde revisão humana
+simples é suficiente ou cobertura extensa de cenários fora do fluxo real.
+
+#### Priorização de testes
+
+Os testes devem priorizar, nesta ordem:
+
+1. caminho clínico e operacional realmente utilizado;
+2. associação correta do paciente;
+3. integridade dos dados essenciais;
+4. ausência de sobrescrita, duplicidade ou perda;
+5. falhas prováveis e recuperáveis;
+6. evidência de entrega do benefício pretendido.
+
+Testes adicionais de infraestrutura devem ser proporcionais ao risco concreto
+e não substituem validação de valor.
+
+#### Regra para novas tarefas
+
+Toda nova tarefa, Sprint ou instrução de implementação deve declarar:
+
+- problema real do IREO que será resolvido;
+- usuário interno beneficiado;
+- benefício clínico ou operacional esperado;
+- fluxo mínimo utilizável;
+- riscos essenciais que precisam ser controlados agora;
+- critério objetivo de sucesso;
+- forma de medir o valor entregue;
+- itens explicitamente adiados;
+- condição que justificaria retomá-los.
+
+#### Gate pragmático
+
+Toda proposta deve responder objetivamente:
+
+1. Qual problema real e atual do IREO esta mudança resolve?
+2. Quem perceberá diretamente o benefício?
+3. Qual é a menor implementação utilizável?
+4. Qual risco concreto exige robustez adicional agora?
+5. Como o valor clínico ou operacional será medido?
+6. O que será explicitamente adiado?
+
+Se as respostas não forem verificáveis e ligadas ao uso atual do IREO, a
+mudança não entra no escopo vigente.
+
+#### Sequência vigente de entregas
+
+1. concluir a aquisição automatizada de exames de imagem;
+2. validar seu benefício operacional e clínico no IREO;
+3. iniciar o **Patient Recall Engine**;
+4. ampliar robustez ou complexidade somente quando sustentada por risco
+   concreto, benefício demonstrado ou necessidade operacional atual.
+
+A aquisição automatizada é a entrega vertical atual. O trabalho já construído
+deve ser preservado e concluído de forma pragmática, segura e utilizável.
+Novos requisitos de robustez só entram quando necessários às garantias mínimas
+ou ao fluxo real. Depois da conclusão técnica, a clínica deve validar benefício
+perceptível. O Patient Recall Engine é a próxima entrega vertical e não começa
+antes dessa conclusão e da avaliação operacional inicial.
 
 ## 2. Arquitetura Atual
 
@@ -1202,31 +1313,23 @@ Uma mudança no pipeline só é aceita quando:
 
 ## 13. Roadmap
 
-### Sprint 18 — Consolidação e homologação
+### Sequência obrigatória
 
-- lógica local da Sprint 18.1 coberta por cenário integrado determinístico:
-  aquisição, normalização, `ClinicalPackage`, resolução inequívoca do paciente,
-  publicação stateful, manifesto, históricos, índice, reset e reimportação;
-- homologar modelos digitais Cfaz ponta a ponta em execução real supervisionada;
-- executar suíte completa e registrar resultado;
-- validar correção da segunda camada de idempotência;
-- fechar BUG-002 e BUG-006 ou documentar bloqueios verificáveis.
+1. **Concluir aquisição automatizada de exames de imagem.** Preservar o que já
+   foi construído e fechar somente os riscos essenciais do fluxo utilizado.
+2. **Validar benefício operacional e clínico no IREO.** Registrar evidência de
+   uso, redução de trabalho manual, falhas observadas e benefício percebido.
+3. **Iniciar Patient Recall Engine.** Entregar o menor fluxo acionável e
+   mensurável para a equipe interna.
+4. **Expandir robustez somente por risco ou valor demonstrado.** Retomar itens
+   adiados apenas quando a condição registrada no gate pragmático ocorrer.
 
-### Sprint 19 — Robustez operacional
+Backups, retenção, modularização, múltiplos exames, upload alternativo,
+concorrência, novos painéis e outras ampliações permanecem no backlog. Cada
+item precisa ser reavaliado pelo gate da seção 1.5 antes de entrar no escopo.
 
-- formalizar migrações/backup/restore SQLite;
-- política de retenção e limpeza supervisionada;
-- modularizar CLI;
-- teste real controlado com múltiplos exames.
-
-### Sprint 20 — Operação e observabilidade
-
-- painel operacional somente leitura;
-- retomada supervisionada de pendências por correlação;
-- métricas sanitizadas e runbook de incidentes;
-- avaliar upload grande/concorrência no Graph.
-
-Future AI não recebe número de Sprint antes de aprovação de governança clínica, privacidade, segurança e finalidade.
+Future AI não recebe número de Sprint antes das três primeiras etapas e de
+aprovação própria de governança clínica, privacidade, segurança e finalidade.
 
 ### Glossário
 
@@ -1249,15 +1352,18 @@ Future AI não recebe número de Sprint antes de aprovação de governança clí
 
 ## 14. Próxima Tarefa Única
 
-**SPRINT-18-TASK-002 — Homologar em execução real supervisionada o ciclo Cfaz/OneDrive.**
+**Entrega vertical atual — concluir a aquisição automatizada de exames de
+imagem e validar seu benefício no IREO.**
 
-Resultado esperado: realizar diagnóstico e homologação controlada de dois STL
-reais, comprovar aquisição, classificação, reconciliação OneDrive, indexação,
-reset e reimportação sem duplicação; então reavaliar BUG-002 e BUG-006 com
-evidência operacional. A cobertura sintética da lógica local não encerra esses
-bugs.
+O menor escopo utilizável deve fechar os riscos essenciais do fluxo real, sem
+acrescentar robustez para escala hipotética ou produto externo. A conclusão
+técnica não basta: devem ser registrados benefício percebido, trabalho manual
+reduzido e falhas relevantes observadas na operação inicial.
 
-Não iniciar outra tarefa de roadmap antes de concluir ou formalmente bloquear esta.
+Somente depois dessa conclusão e avaliação começa o **Patient Recall Engine**,
+como próxima entrega vertical. Não iniciar outra expansão radiológica, nova
+integração, IA ou complexidade arquitetural sem passar pelo gate pragmático da
+seção 1.5.
 
 ## 15. Convenções
 
@@ -1336,6 +1442,19 @@ documentos normativos devem ser lidos.
 Histórico append-only deste documento. Entradas futuras são acrescentadas no
 topo desta seção; entradas antigas nunca são removidas ou reescritas, salvo
 correção factual acompanhada de nova entrada explicativa.
+
+### 2026-07-27 — Correção consciente de direcionamento
+
+- Adotado formalmente o princípio de MVP de alto valor clínico para o uso
+  interno do IREO.
+- Preservadas as garantias mínimas de segurança, integridade, LGPD,
+  idempotência necessária, associação inequívoca e revisão humana.
+- Estabelecido o gate pragmático obrigatório para novas tarefas.
+- Fixada a ordem: concluir aquisição automatizada, validar valor no IREO,
+  iniciar Patient Recall Engine e só então ampliar robustez por risco ou valor
+  demonstrado.
+- Esta entrada registra uma mudança de direção em 27 de julho de 2026 sem
+  reescrever retroativamente o histórico anterior.
 
 ### 2026-07-26 — Sprint 18.1 local, ainda não versionada
 

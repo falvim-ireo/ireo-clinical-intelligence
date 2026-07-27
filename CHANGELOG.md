@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- adotado formalmente o princípio de MVP de alto valor clínico para o uso
+  interno do IREO, com esforço e complexidade proporcionais a risco e benefício
+- preservadas como inegociáveis as garantias mínimas de segurança, integridade,
+  LGPD, associação correta, idempotência necessária e revisão humana
+- confirmada a ordem de entregas: aquisição automatizada de exames, validação
+  de benefício no IREO e Patient Recall Engine
+
 ### Added
 
 - histórico técnico reconstruído das Sprints 16.1–17.8 em `docs/history/`,

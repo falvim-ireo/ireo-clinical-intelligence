@@ -5,6 +5,23 @@
 > `docs/history/`, do histórico Git e do livro histórico exportado do Pages.
 > Em caso de divergência, o documento mestre é normativo.
 
+## Proporcionalidade arquitetural para o uso interno
+
+Enquanto o sistema for de uso exclusivo do IREO, decisões arquiteturais devem
+ser proporcionais ao risco concreto e à necessidade operacional atual. O
+princípio de MVP de alto valor clínico reduz escopo e complexidade antecipada;
+não reduz LGPD, segurança essencial, integridade dos dados, associação
+inequívoca de pacientes, prevenção de perda/sobrescrita, idempotência
+necessária, rastreabilidade ou revisão humana.
+
+Mecanismos motivados apenas por escala hipotética, distribuição comercial,
+alta disponibilidade ou generalização futura exigem uma decisão formal de
+transformação em produto externo ou uma justificativa atual de risco ou valor.
+A sequência arquitetural vigente é: concluir a aquisição automatizada de
+exames, validar seu benefício no IREO, iniciar o Patient Recall Engine e só
+então ampliar robustez com evidência. O gate normativo está na
+[seção 1.5 do documento mestre](../ENGINEERING_MASTER.md#15-princípio-obrigatório-de-mvp-de-alto-valor-clínico).
+
 ## Sprints 16.2–17.8 — repositório de ativos clínicos
 
 ```text

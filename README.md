@@ -4,6 +4,19 @@ Plataforma operacional para ingestão segura e supervisionada de exames radioló
 
 **Status:** MVP v1.0.0 validado em piloto real supervisionado. O sistema exige supervisão humana em todas as importações.
 
+## Diretriz vigente
+
+O sistema permanece uma solução de uso exclusivo do IREO. Cada função deve ser
+entregue como um MVP de alto valor clínico: a menor entrega utilizável que gere
+benefício real e mensurável, sem reduzir segurança, integridade, LGPD ou
+proteção contra associação incorreta de pacientes.
+
+A entrega vertical atual é concluir a aquisição automatizada de exames de
+imagem e validar seu benefício no IREO. O **Patient Recall Engine** é a próxima
+entrega, somente após essa validação. A formulação normativa e o gate para
+novas propostas estão em
+[Princípio obrigatório de MVP de alto valor clínico](docs/ENGINEERING_MASTER.md#15-princípio-obrigatório-de-mvp-de-alto-valor-clínico).
+
 ## Documento mestre de engenharia
 
 O contexto técnico oficial, a arquitetura vigente, o histórico de Sprints,

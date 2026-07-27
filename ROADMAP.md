@@ -23,18 +23,27 @@
 
 ## Próximos
 
-- homologação real supervisionada de dois STL Cfaz e do destino OneDrive;
-- reconciliação idempotente com destino remoto existente;
-- validação em múltiplos exames;
-- upload direto Microsoft Graph;
-- limpeza supervisionada da quarentena;
-- fila de revisão;
-- retomada supervisionada de pendências automáticas por correlation id;
-- leitura DICOM;
-- painel operacional.
+Sequência obrigatória:
+
+1. Concluir aquisição automatizada de exames de imagem.
+2. Validar benefício operacional e clínico no IREO.
+3. Iniciar Patient Recall Engine.
+4. Expandir robustez somente quando sustentada por risco ou valor demonstrado.
+
+Os itens listados como concluídos acima são entregas históricas preservadas;
+eles não constituem, isoladamente, prova de que a entrega vertical atual já
+esteja concluída ou tenha benefício operacional validado.
+
+Itens ainda sem prova permanecem abertos dentro da primeira entrega apenas
+quando forem necessários ao fluxo real ou às garantias mínimas. Homologações,
+reconciliação, validação em múltiplos exames e outras ampliações não devem ser
+marcadas como concluídas sem evidência. Uploads alternativos, novas
+integrações, alta disponibilidade e generalizações ficam adiados até que o
+gate pragmático do documento mestre demonstre necessidade atual.
 
 IA, busca semântica e comparação inteligente permanecem posteriores à
-homologação do repositório clínico e exigem governança própria.
+aquisição, à validação de benefício e ao Patient Recall Engine, além de
+exigirem governança própria.
 
 ## Segurança adiada para antes de distribuição
 
