@@ -174,6 +174,7 @@ class Graph:
             "Patients": ["Synthetic Patient"],
             "Synthetic Patient": ["Radiology"],
             "Radiology": ["Exam"],
+            "Exam": ["04 - Modelos Digitais"],
         }
         if folder.name == "04 - Modelos Digitais":
             return [
@@ -302,6 +303,55 @@ class FailingIndex(Index):
         super().index_manifest(manifest, source)
 
 
+class MetadataCoordinator:
+    CAPABILITY = "cfaz-supplement-local-tx-v1"
+    TEST_DOUBLE = True
+
+    def __init__(self, index=None, events=None, fail_at=None):
+        self.index = index
+        self.events = events if events is not None else []
+        self.fail_at = fail_at
+        self.history_updates = []
+        self.intake_updates = []
+        self._snapshot = None
+        self._manifest_path = None
+
+    def preflight(self, **_kwargs):
+        self.events.append("metadata_preflight")
+        if self.fail_at == "preflight":
+            raise RuntimeError("synthetic metadata preflight failure")
+
+    def commit(
+        self, *, operation_id, record, original_manifest, updated_manifest,
+        manifest_path, created_files,
+    ):
+        self.events.append("metadata_commit")
+        self._snapshot = manifest_path.read_bytes()
+        self._manifest_path = manifest_path
+        manifest_path.write_text(json.dumps(updated_manifest), "utf-8")
+        if self.fail_at == "manifest":
+            raise RuntimeError("synthetic manifest failure")
+        if self.index is not None:
+            self.index.index_manifest(
+                updated_manifest, source="cfaz-digital-models"
+            )
+        if self.fail_at == "index":
+            raise RuntimeError("synthetic index failure")
+        self.history_updates.append(operation_id)
+        if self.fail_at == "history":
+            raise RuntimeError("synthetic history failure")
+        self.intake_updates.append(operation_id)
+        if self.fail_at == "intake":
+            raise RuntimeError("synthetic intake failure")
+
+    def rollback(self):
+        self.events.append("metadata_rollback")
+        if self._manifest_path is not None and self._snapshot is not None:
+            self._manifest_path.write_bytes(self._snapshot)
+        self.history_updates.clear()
+        self.intake_updates.clear()
+
+
 def fixture(tmp_path):
     database = tmp_path / "index.db"
     history = CfazHistoryRepository(database)
@@ -380,12 +430,19 @@ def fixture(tmp_path):
     return history, staging, manifest_path, manifest, provider
 
 
-def supplement(tmp_path, history, provider, graph=None, index=None):
+def supplement(
+    tmp_path, history, provider, graph=None, index=None,
+    metadata=None, events=None,
+):
+    coordinator = metadata or MetadataCoordinator(index=index, events=events)
     return CfazDigitalModelSupplement(
         provider=provider,
         history=history,
         graph=graph,
         exam_index_service=index,
+        metadata_coordinator=coordinator,
+        event_recorder=(events.append if events is not None else None),
+        allow_test_metadata_coordinator=True,
         staging_root=tmp_path / "staging",
         max_file_bytes=20 * 1024 * 1024,
         output=lambda _message: None,
@@ -412,6 +469,128 @@ def test_cli_exposes_explicit_and_mutually_exclusive_apply(capsys):
     output = capsys.readouterr().out
     assert "--dry-run" in output
     assert "--apply" in output
+
+
+@pytest.mark.parametrize(
+    "coordinator",
+    [
+        None,
+        object(),
+        SimpleNamespace(
+            CAPABILITY="cfaz-supplement-local-tx-v1",
+            TEST_DOUBLE=True,
+            preflight=lambda **_kwargs: None,
+            commit=lambda **_kwargs: None,
+            rollback=lambda: None,
+        ),
+    ],
+)
+def test_cli_apply_gate_blocks_before_graph_auth_browser_or_run(
+    monkeypatch, capsys, coordinator,
+):
+    effects = []
+    monkeypatch.setattr(
+        main,
+        "_resolve_cfaz_productive_metadata_coordinator",
+        lambda: coordinator,
+    )
+    monkeypatch.setattr(
+        main,
+        "build_onedrive_graph_client",
+        lambda: effects.append("graph") or object(),
+    )
+
+    result = main.main([
+        "cfaz-digital-models",
+        "--request-id", "999991",
+        "--browser-session",
+        "--apply",
+    ])
+
+    assert result == 1
+    assert effects == []
+    assert "aplicação bloqueada" in capsys.readouterr().out
+
+
+def test_cli_injected_capable_coordinator_orders_gate_before_graph_and_run(
+    monkeypatch,
+):
+    events = []
+
+    class ProductiveCoordinator:
+        CAPABILITY = "cfaz-supplement-local-tx-v1"
+        PRODUCTIVE_IMPLEMENTATION = True
+
+        def preflight(self, **_kwargs):
+            pass
+
+        def commit(self, **_kwargs):
+            pass
+
+        def rollback(self):
+            pass
+
+    coordinator = ProductiveCoordinator()
+
+    class FakeHistory:
+        def __init__(self, _path):
+            events.append("history")
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            events.append("provider")
+
+    class FakeIndex:
+        def __init__(self, _path):
+            events.append("index")
+
+    class FakeSupplement:
+        def __init__(self, **kwargs):
+            assert kwargs["metadata_coordinator"] is coordinator
+            events.append("supplement")
+
+        def run(self, _request_id, *, apply):
+            assert apply is True
+            events.append("run")
+            return SimpleNamespace(
+                state="COMPLETE",
+                added_file_count=2,
+                reused_file_count=0,
+            )
+
+    import acquisition.cfaz_digital_models as digital_models_module
+    import acquisition.cfaz_operations as operations_module
+    import acquisition.cfaz_provider as provider_module
+    import radiology.exam_index_service as index_module
+
+    monkeypatch.setattr(
+        main,
+        "_resolve_cfaz_productive_metadata_coordinator",
+        lambda: events.append("gate") or coordinator,
+    )
+    monkeypatch.setattr(
+        main,
+        "build_onedrive_graph_client",
+        lambda: events.append("graph") or object(),
+    )
+    monkeypatch.setattr(
+        operations_module, "CfazHistoryRepository", FakeHistory
+    )
+    monkeypatch.setattr(provider_module, "CfazProvider", FakeProvider)
+    monkeypatch.setattr(index_module, "ExamIndexService", FakeIndex)
+    monkeypatch.setattr(
+        digital_models_module, "CfazDigitalModelSupplement", FakeSupplement
+    )
+    monkeypatch.setattr(
+        digital_models_module,
+        "PRODUCTIVE_METADATA_COORDINATOR_TYPE",
+        ProductiveCoordinator,
+    )
+
+    assert main.main([
+        "cfaz-digital-models", "--request-id", "999991", "--apply",
+    ]) == 0
+    assert events.index("gate") < events.index("graph") < events.index("run")
 
 
 def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
@@ -531,6 +710,8 @@ def test_local_promotion_failure_rolls_back_both_assets(tmp_path, fail_on):
         history=history,
         graph=graph,
         exam_index_service=Index(),
+        metadata_coordinator=MetadataCoordinator(index=Index()),
+        allow_test_metadata_coordinator=True,
         staging_root=tmp_path / "staging",
         max_file_bytes=20 * 1024 * 1024,
         output=lambda _message: None,
@@ -549,7 +730,7 @@ def test_index_failure_restores_manifest_files_and_remote_models(tmp_path):
     history, staging, manifest_path, manifest, provider = fixture(tmp_path)
     graph = Graph(manifest)
 
-    with pytest.raises(CfazDigitalModelError, match="índice"):
+    with pytest.raises(CfazDigitalModelError, match="estado seguro"):
         supplement(
             tmp_path, history, provider, graph, FailingIndex()
         ).run("999991", apply=True)
@@ -643,6 +824,134 @@ def test_partial_preexisting_identity_requires_review_without_get(tmp_path):
 
     assert provider.download_calls == []
     assert not (staging / "04 - Modelos Digitais").exists()
+
+
+def test_transaction_phases_are_effectively_ordered_and_metadata_is_coordinated(
+    tmp_path,
+):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    events = []
+    metadata = MetadataCoordinator(index=Index(), events=events)
+
+    result = supplement(
+        tmp_path, history, provider, Graph(manifest), Index(),
+        metadata=metadata, events=events,
+    ).run("999991", apply=True)
+
+    assert result.state == "COMPLETE"
+    assert events == [
+        "resolve_models",
+        "local_preflight",
+        "metadata_preflight",
+        "remote_preflight",
+        "remote_preflight_complete",
+        "staging_acquired",
+        "downloads_validated",
+        "remote_persisted",
+        "local_promotion",
+        "metadata_commit",
+        "metadata_committed",
+    ]
+    assert len(metadata.history_updates) == 1
+    assert metadata.history_updates == metadata.intake_updates
+
+
+def test_remote_collision_blocks_download_and_staging_creation(tmp_path):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+    graph.remote_models["modelo_mandibula_001.stl"] = 123
+    staging_root = tmp_path / "staging"
+
+    with pytest.raises(CfazDigitalModelError, match="remoto"):
+        supplement(
+            tmp_path, history, provider, graph, Index()
+        ).run("999991", apply=True)
+
+    assert provider.download_calls == []
+    assert not list(staging_root.glob(".cfaz-models-transaction-*"))
+
+
+@pytest.mark.parametrize("mode", ["missing", "transport"])
+def test_unprovable_remote_destination_blocks_before_download_or_staging(
+    tmp_path, mode,
+):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+
+    class UnprovableGraph(Graph):
+        def list_children(self, folder):
+            if mode == "missing" and folder.name == "Exam":
+                return []
+            return super().list_children(folder)
+
+        def download_json_file(self, folder, filename):
+            if mode == "transport":
+                raise TimeoutError("synthetic transport failure")
+            return super().download_json_file(folder, filename)
+
+    with pytest.raises(CfazDigitalModelError, match="remot"):
+        supplement(
+            tmp_path, history, provider, UnprovableGraph(manifest), Index()
+        ).run("999991", apply=True)
+
+    assert provider.download_calls == []
+    assert not list((tmp_path / "staging").glob(".cfaz-models-transaction-*"))
+
+
+def test_transaction_staging_is_exclusive_and_preserves_preexisting_content(
+    tmp_path,
+):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    staging_root = tmp_path / "staging"
+    sentinel = staging_root / "preexisting-synthetic-state.txt"
+    sentinel.write_text("preserve", "utf-8")
+
+    supplement(
+        tmp_path, history, provider, Graph(manifest), Index()
+    ).run("999991", apply=True)
+
+    assert sentinel.read_text("utf-8") == "preserve"
+    assert not list(staging_root.glob(".cfaz-models-transaction-*"))
+
+
+@pytest.mark.parametrize("fail_at", ["manifest", "index", "history", "intake"])
+def test_metadata_failure_restores_manifest_history_intake_and_files(
+    tmp_path, fail_at,
+):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+    metadata = MetadataCoordinator(index=Index(), fail_at=fail_at)
+
+    with pytest.raises(CfazDigitalModelError, match="estado seguro"):
+        supplement(
+            tmp_path, history, provider, graph, Index(), metadata=metadata
+        ).run("999991", apply=True)
+
+    assert json.loads(manifest_path.read_text("utf-8")) == manifest
+    assert metadata.history_updates == []
+    assert metadata.intake_updates == []
+    assert graph.remote_models == {}
+    assert not (staging / "04 - Modelos Digitais").exists()
+    assert not list((tmp_path / "staging").glob(".cfaz-models-transaction-*"))
+
+
+def test_apply_is_blocked_without_executable_local_transaction_capability(
+    tmp_path,
+):
+    history, _staging, _path, manifest, provider = fixture(tmp_path)
+    service = CfazDigitalModelSupplement(
+        provider=provider,
+        history=history,
+        graph=Graph(manifest),
+        metadata_coordinator=object(),
+        staging_root=tmp_path / "staging",
+        output=lambda _message: None,
+    )
+
+    with pytest.raises(CfazDigitalModelError, match="Coordenador transacional"):
+        service.run("999991", apply=True)
+
+    assert provider.discover_calls == []
+    assert provider.download_calls == []
 
 
 class HttpResponse:

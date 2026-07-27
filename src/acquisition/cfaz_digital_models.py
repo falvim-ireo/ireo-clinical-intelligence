@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import tempfile
 from typing import Any, Callable
 import unicodedata
 import zipfile
@@ -36,6 +37,34 @@ from integrations.onedrive_graph import GraphRollbackJournal
 
 class CfazDigitalModelError(RuntimeError):
     """Erro sanitizado do fluxo suplementar de modelos digitais."""
+
+
+PRODUCTIVE_METADATA_COORDINATOR_TYPE: type | None = None
+
+
+def validate_metadata_coordinator(
+    coordinator: Any, *, allow_test_double: bool = False
+) -> Any:
+    """Valida localmente o gate transacional, sem inicializar dependências."""
+    required = ("preflight", "commit", "rollback")
+    structurally_complete = (
+        getattr(coordinator, "CAPABILITY", None)
+        == "cfaz-supplement-local-tx-v1"
+        and all(callable(getattr(coordinator, name, None)) for name in required)
+    )
+    productive = (
+        PRODUCTIVE_METADATA_COORDINATOR_TYPE is not None
+        and type(coordinator) is PRODUCTIVE_METADATA_COORDINATOR_TYPE
+        and
+        getattr(coordinator, "PRODUCTIVE_IMPLEMENTATION", False) is True
+        and not getattr(coordinator, "TEST_DOUBLE", False)
+    )
+    if not structurally_complete or (not productive and not allow_test_double):
+        raise CfazDigitalModelError(
+            "Coordenador transacional produtivo de manifesto, índice, "
+            "histórico e intake não está disponível; aplicação bloqueada."
+        )
+    return coordinator
 
 
 @dataclass(frozen=True)
@@ -70,6 +99,17 @@ class _PreparedModel:
         return f"{self.relative_folder}/{self.stored_name}"
 
 
+@dataclass(frozen=True)
+class _PlannedModel:
+    item: CfazDigitalModelFile
+    stored_name: str
+    relative_folder: str
+
+    @property
+    def relative_path(self) -> str:
+        return f"{self.relative_folder}/{self.stored_name}"
+
+
 class CfazDigitalModelSupplement:
     """Acrescenta STL a um pedido COMPLETE sem reimportar os demais assets."""
 
@@ -84,6 +124,9 @@ class CfazDigitalModelSupplement:
         staging_root: str | Path,
         graph=None,
         exam_index_service=None,
+        metadata_coordinator=None,
+        event_recorder: Callable[[str], None] | None = None,
+        allow_test_metadata_coordinator: bool = False,
         max_file_bytes: int = 2 * 1024 * 1024 * 1024,
         output: Callable[[str], None] = print,
         now_provider: Callable[[], datetime] | None = None,
@@ -93,6 +136,9 @@ class CfazDigitalModelSupplement:
         self.staging_root = Path(staging_root).expanduser().resolve()
         self.graph = graph
         self.exam_index_service = exam_index_service
+        self.metadata_coordinator = metadata_coordinator
+        self.event_recorder = event_recorder or (lambda _event: None)
+        self.allow_test_metadata_coordinator = allow_test_metadata_coordinator
         self.max_file_bytes = max(1, int(max_file_bytes))
         self.output = output
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
@@ -142,8 +188,11 @@ class CfazDigitalModelSupplement:
                 onedrive_destination=destination,
                 indexed=True,
             )
+        if apply:
+            self._validate_local_transaction_capability()
 
         lookup_id = str(record.provider_request_id or value)
+        self.event_recorder("resolve_models")
         inventory = self.provider.discover_digital_models(lookup_id)
         self._validate_inventory(record, inventory)
         existing_ids = self._manifest_stl_ids(manifest)
@@ -204,12 +253,29 @@ class CfazDigitalModelSupplement:
                 indexed=False,
             )
         self._validate_apply_preflight(inventory)
+        plans = self._plan_destinations(
+            inventory, manifest=manifest, destination=manifest_path.parent
+        )
+        self.event_recorder("local_preflight")
+        self.metadata_coordinator.preflight(
+            record=record,
+            manifest=manifest,
+            planned_assets=plans,
+        )
+        self.event_recorder("remote_preflight")
+        remote_state = self._preflight_remote(
+            destination=destination,
+            manifest=manifest,
+            plans=plans,
+        )
         return self._apply(
             record=record,
             inventory=inventory,
             manifest_path=manifest_path,
             manifest=manifest,
             destination=destination,
+            plans=plans,
+            remote_state=remote_state,
         )
 
     def _apply(
@@ -220,28 +286,45 @@ class CfazDigitalModelSupplement:
         manifest_path: Path,
         manifest: dict[str, Any],
         destination: str,
+        plans: tuple[_PlannedModel, ...],
+        remote_state: tuple[Any, Any, dict[str, Any]],
     ) -> CfazDigitalModelsResult:
         original_bytes = manifest_path.read_bytes()
         working = json.loads(json.dumps(manifest))
-        work_root = (
-            self.staging_root.parent
-            / "cfaz-digital-models"
-            / f"cfaz-{inventory.request.request_id}"
-        ).resolve()
-        if not work_root.is_relative_to(self.staging_root.parent):
+        if (
+            not self.staging_root.is_dir()
+            or self.staging_root.is_symlink()
+        ):
             raise CfazDigitalModelError(
-                "Destino de quarentena dos modelos é inválido."
+                "Staging root inexistente ou inseguro."
             )
-        work_root.mkdir(parents=True, exist_ok=True)
+        try:
+            work_root = Path(tempfile.mkdtemp(
+                prefix=".cfaz-models-transaction-",
+                dir=self.staging_root,
+            )).resolve()
+        except OSError:
+            raise CfazDigitalModelError(
+                "Não foi possível adquirir staging transacional exclusivo."
+            ) from None
+        owned_work_root = (
+            work_root.parent == self.staging_root
+            and not work_root.is_symlink()
+            and not any(work_root.iterdir())
+        )
+        if not owned_work_root:
+            raise CfazDigitalModelError(
+                "O staging transacional não nasceu vazio e exclusivo."
+            )
+        self.event_recorder("staging_acquired")
         prepared: list[_PreparedModel] = []
         created_local: list[Path] = []
         remote_manifest_started = False
-        remote_data_uploaded = False
-        remote_folder = None
-        model_folder = None
+        remote_folder, model_folder, remote_manifest = remote_state
         rollback_journal = GraphRollbackJournal()
         try:
             used_paths = self._manifest_relative_paths(working)
+            plan_by_id = {plan.item.stl_file_id: plan for plan in plans}
             for item in inventory.files:
                 existing = self._prepared_from_manifest(
                     item, working, manifest_path.parent
@@ -256,8 +339,10 @@ class CfazDigitalModelSupplement:
                         inventory=inventory,
                         work_root=work_root,
                         used_paths=used_paths,
+                        planned=plan_by_id[item.stl_file_id],
                     )
                 )
+            self.event_recorder("downloads_validated")
             hashes: dict[str, str] = {}
             for plan in prepared:
                 prior_identity = hashes.get(plan.sha256)
@@ -270,19 +355,73 @@ class CfazDigitalModelSupplement:
                         "revisão obrigatória."
                     )
                 hashes[plan.sha256] = plan.stl_file_id
+            now = self._utc_now()
+            working = self._merge_manifest(
+                working, prepared, inventory=inventory, timestamp=now
+            )
+            transaction_manifest = work_root / "manifest.pending.json"
+            self._write_json(transaction_manifest, working)
+            self.graph.upload_small_file(
+                remote_folder, transaction_manifest, remote_filename="manifest.json"
+            )
+            remote_manifest_started = True
             for plan in prepared:
-                target = manifest_path.parent / plan.relative_path
+                publication = working["publication"]
+                marker = working["cfaz_digital_models"]
+                marker_file = marker["provider_files"][plan.stl_file_id]
+                uploaded = publication["uploaded_files"]
+                if not plan.already_manifested:
+                    marker_file["remote_upload_intended"] = True
+                    self._write_json(transaction_manifest, working)
+                    self.graph.upload_small_file(
+                        remote_folder,
+                        transaction_manifest,
+                        remote_filename="manifest.json",
+                    )
+                    created_reference = self.graph.upload_small_file_transactional(
+                        model_folder,
+                        plan.local_source,
+                        remote_filename=plan.stored_name,
+                    )
+                    rollback_journal.record(created_reference)
+                uploaded[plan.relative_path] = {
+                    "sha256": plan.sha256,
+                    "size": plan.size,
+                }
+                marker_file["remote_uploaded"] = True
+                marker_file["remote_upload_intended"] = False
+                marker_file["uploaded_at"] = now
+                publication["uploaded_files_count"] = len(uploaded)
+                publication["uploaded_bytes"] = sum(
+                    int(item.get("size") or 0)
+                    for item in uploaded.values()
+                    if isinstance(item, dict)
+                )
+                self._write_json(transaction_manifest, working)
+                self.graph.upload_small_file(
+                    remote_folder, transaction_manifest, remote_filename="manifest.json"
+                )
+
+            final = json.loads(json.dumps(working))
+            final_marker = final["cfaz_digital_models"]
+            final_marker["state"] = "COMPLETE"
+            final_marker["completed_at"] = now
+            final["status"] = "COMPLETED"
+            final["publication"]["state"] = "COMPLETE"
+            final_path = work_root / "manifest.final.json"
+            self._write_json(final_path, final)
+            self.graph.upload_small_file(
+                remote_folder, final_path, remote_filename="manifest.json"
+            )
+            self.event_recorder("remote_persisted")
+            for plan in prepared:
                 if plan.already_manifested:
                     continue
+                target = manifest_path.parent / plan.relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    if (
-                        target.is_file()
-                        and self._sha256(target) == plan.sha256
-                    ):
-                        continue
                     raise CfazDigitalModelError(
-                        "O nome local do modelo digital conflita com outro arquivo."
+                        "Destino local passou a estar ocupado após o preflight."
                     )
                 try:
                     self._promote_local(plan.local_source, target)
@@ -297,100 +436,23 @@ class CfazDigitalModelSupplement:
                         "A validação local do STL incorporado falhou."
                     )
                 created_local.append(target)
-
-            now = self._utc_now()
-            working = self._merge_manifest(
-                working, prepared, inventory=inventory, timestamp=now
+            self.event_recorder("local_promotion")
+            operation_id = hashlib.sha256(
+                (
+                    str(inventory.request.request_id)
+                    + "|"
+                    + "|".join(sorted(item.stl_file_id for item in inventory.files))
+                ).encode("utf-8")
+            ).hexdigest()
+            self.metadata_coordinator.commit(
+                operation_id=operation_id,
+                record=record,
+                original_manifest=manifest,
+                updated_manifest=final,
+                manifest_path=manifest_path,
+                created_files=tuple(created_local),
             )
-            remote_folder = self._resolve_remote_folder(destination)
-            remote_manifest = self.graph.download_json_file(
-                remote_folder, "manifest.json"
-            )
-            self._validate_remote_manifest(working, remote_manifest)
-            model_folder = self.graph.ensure_folder(
-                remote_folder, CLINICAL_FOLDERS[ClinicalCategory.DIGITAL_MODEL]
-            )
-            remote_items = {
-                str(item.get("name") or "").casefold(): item
-                for item in self.graph.list_children(model_folder)
-                if isinstance(item, dict) and isinstance(item.get("file"), dict)
-            }
-            self._write_json(manifest_path, working)
-            self.graph.upload_small_file(
-                remote_folder, manifest_path, remote_filename="manifest.json"
-            )
-            remote_manifest_started = True
-            for plan in prepared:
-                publication = working["publication"]
-                marker = working["cfaz_digital_models"]
-                marker_file = marker["provider_files"][plan.stl_file_id]
-                uploaded = publication["uploaded_files"]
-                remote_item = remote_items.get(plan.stored_name.casefold())
-                trustworthy = (
-                    isinstance(remote_item, dict)
-                    and int(remote_item.get("size") or -1) == plan.size
-                    and (
-                        (
-                            isinstance(uploaded.get(plan.relative_path), dict)
-                            and uploaded[plan.relative_path].get("sha256")
-                            == plan.sha256
-                        )
-                        or bool(marker_file.get("remote_upload_intended"))
-                    )
-                )
-                if remote_item is not None and not trustworthy:
-                    raise CfazDigitalModelError(
-                        "Já existe um arquivo remoto conflitante para o modelo digital."
-                    )
-                if not trustworthy:
-                    marker_file["remote_upload_intended"] = True
-                    self._write_json(manifest_path, working)
-                    self.graph.upload_small_file(
-                        remote_folder,
-                        manifest_path,
-                        remote_filename="manifest.json",
-                    )
-                    target = manifest_path.parent / plan.relative_path
-                    created_reference = self.graph.upload_small_file_transactional(
-                        model_folder, target, remote_filename=plan.stored_name
-                    )
-                    remote_data_uploaded = True
-                    rollback_journal.record(created_reference)
-                    remote_items[plan.stored_name.casefold()] = {
-                        "name": plan.stored_name,
-                        "size": plan.size,
-                        "file": {},
-                    }
-                uploaded[plan.relative_path] = {
-                    "sha256": plan.sha256,
-                    "size": plan.size,
-                }
-                marker_file["remote_uploaded"] = True
-                marker_file["remote_upload_intended"] = False
-                marker_file["uploaded_at"] = now
-                publication["uploaded_files_count"] = len(uploaded)
-                publication["uploaded_bytes"] = sum(
-                    int(item.get("size") or 0)
-                    for item in uploaded.values()
-                    if isinstance(item, dict)
-                )
-                self._write_json(manifest_path, working)
-                self.graph.upload_small_file(
-                    remote_folder, manifest_path, remote_filename="manifest.json"
-                )
-
-            final = json.loads(json.dumps(working))
-            final_marker = final["cfaz_digital_models"]
-            final_marker["state"] = "COMPLETE"
-            final_marker["completed_at"] = now
-            final["status"] = "COMPLETED"
-            final["publication"]["state"] = "COMPLETE"
-            final_path = work_root / "manifest.final.json"
-            self._write_json(final_path, final)
-            self.graph.upload_small_file(
-                remote_folder, final_path, remote_filename="manifest.json"
-            )
-            self._write_json(manifest_path, final)
+            self.event_recorder("metadata_committed")
         except Exception as exc:
             rollback_ok = True
             _, rollback_failures = rollback_journal.rollback_all(self.graph)
@@ -407,15 +469,17 @@ class CfazDigitalModelSupplement:
                     )
                 except Exception:
                     rollback_ok = False
-            if rollback_ok:
-                manifest_path.write_bytes(original_bytes)
-                for path in reversed(created_local):
-                    path.unlink(missing_ok=True)
-                self._remove_empty_model_folder(manifest_path.parent)
+            for path in reversed(created_local):
+                path.unlink(missing_ok=True)
+            self._remove_empty_model_folder(manifest_path.parent)
+            try:
+                self.metadata_coordinator.rollback()
+            except Exception:
+                rollback_ok = False
             if isinstance(exc, CfazDigitalModelError) and rollback_ok:
-                self._cleanup_work_root(work_root)
+                self._cleanup_work_root(work_root, owned=owned_work_root)
                 raise
-            self._cleanup_work_root(work_root)
+            self._cleanup_work_root(work_root, owned=owned_work_root)
             raise CfazDigitalModelError(
                 "A incorporação dos modelos digitais foi interrompida; "
                 + (
@@ -425,51 +489,9 @@ class CfazDigitalModelSupplement:
                 )
             ) from exc
 
-        indexed = False
-        if self.exam_index_service is not None:
-            try:
-                self.exam_index_service.index_manifest(
-                    self._read_json(manifest_path),
-                    source="cfaz-digital-models",
-                )
-                indexed = True
-            except Exception as exc:
-                rollback_ok = True
-                _, rollback_failures = rollback_journal.rollback_all(self.graph)
-                if rollback_failures:
-                    rollback_ok = False
-                try:
-                    rollback_path = work_root / "manifest.rollback.json"
-                    rollback_path.write_bytes(original_bytes)
-                    self.graph.upload_small_file(
-                        remote_folder,
-                        rollback_path,
-                        remote_filename="manifest.json",
-                    )
-                except Exception:
-                    rollback_ok = False
-                if rollback_ok:
-                    manifest_path.write_bytes(original_bytes)
-                    for path in reversed(created_local):
-                        path.unlink(missing_ok=True)
-                    self._remove_empty_model_folder(manifest_path.parent)
-                    try:
-                        self.exam_index_service.index_manifest(
-                            self._read_json(manifest_path),
-                            source="cfaz-digital-models-rollback",
-                        )
-                    except Exception:
-                        rollback_ok = False
-                raise CfazDigitalModelError(
-                    "A atualização atômica do índice falhou; "
-                    + (
-                        "os arquivos e metadados foram revertidos."
-                        if rollback_ok
-                        else "revisão obrigatória do estado preservado."
-                    )
-                ) from exc
+        indexed = True
         added = sum(not item.already_manifested for item in prepared)
-        self._cleanup_work_root(work_root)
+        self._cleanup_work_root(work_root, owned=owned_work_root)
         return CfazDigitalModelsResult(
             request_id=inventory.request.request_id,
             model_count=inventory.model_count,
@@ -489,12 +511,106 @@ class CfazDigitalModelSupplement:
             shutil.copyfileobj(source, output, 1024 * 1024)
 
     @staticmethod
-    def _cleanup_work_root(work_root: Path) -> None:
+    def _cleanup_work_root(work_root: Path, *, owned: bool) -> None:
+        if (
+            not owned
+            or work_root.is_symlink()
+            or not work_root.name.startswith(".cfaz-models-transaction-")
+        ):
+            return
         shutil.rmtree(work_root, ignore_errors=True)
+
+    def _validate_local_transaction_capability(self) -> None:
+        validate_metadata_coordinator(
+            self.metadata_coordinator,
+            allow_test_double=self.allow_test_metadata_coordinator,
+        )
+
+    def _plan_destinations(
+        self,
+        inventory: CfazDigitalModelInventory,
+        *,
+        manifest: dict[str, Any],
+        destination: Path,
+    ) -> tuple[_PlannedModel, ...]:
+        used_paths = self._manifest_relative_paths(manifest)
+        plans: list[_PlannedModel] = []
+        folder = CLINICAL_FOLDERS[ClinicalCategory.DIGITAL_MODEL]
+        for item in inventory.files:
+            declared_stem = Path(str(item.filename or "")).stem
+            source_name = (
+                f"{declared_stem}.stl" if declared_stem else "modelo.stl"
+            )
+            stored_name = self._next_stored_name(
+                source_name=source_name,
+                model_name=item.model_name,
+                used_paths=used_paths,
+            )
+            plan = _PlannedModel(item, stored_name, folder)
+            target = destination / plan.relative_path
+            if target.exists():
+                raise CfazDigitalModelError(
+                    "Destino local de modelo já está ocupado; revisão obrigatória."
+                )
+            used_paths.add(plan.relative_path.casefold())
+            plans.append(plan)
+        if (
+            len(plans) != 2
+            or len({plan.relative_path.casefold() for plan in plans}) != 2
+        ):
+            raise CfazDigitalModelError(
+                "Os dois destinos finais não são distintos e inequívocos."
+            )
+        return tuple(plans)
+
+    def _preflight_remote(
+        self,
+        *,
+        destination: str,
+        manifest: dict[str, Any],
+        plans: tuple[_PlannedModel, ...],
+    ) -> tuple[Any, Any, dict[str, Any]]:
         try:
-            work_root.parent.rmdir()
-        except OSError:
-            pass
+            remote_folder = self._resolve_remote_folder(destination)
+            remote_manifest = self.graph.download_json_file(
+                remote_folder, "manifest.json"
+            )
+            self._validate_remote_manifest(manifest, remote_manifest)
+            expected_name = CLINICAL_FOLDERS[
+                ClinicalCategory.DIGITAL_MODEL
+            ]
+            folders = [
+                item for item in self.graph.list_children(remote_folder)
+                if isinstance(item, dict)
+                and isinstance(item.get("folder"), dict)
+                and self._normalize_name(str(item.get("name") or ""))
+                == self._normalize_name(expected_name)
+            ]
+            if len(folders) != 1:
+                raise CfazDigitalModelError(
+                    "Pasta remota de modelos ausente ou ambígua."
+                )
+            model_folder = self.graph.folder_from_child_item(
+                remote_folder, folders[0]
+            )
+            children = self.graph.list_children(model_folder)
+        except CfazDigitalModelError:
+            raise
+        except Exception:
+            raise CfazDigitalModelError(
+                "Preflight remoto falhou antes dos downloads."
+            ) from None
+        occupied = {
+            str(item.get("name") or "").casefold()
+            for item in children
+            if isinstance(item, dict)
+        }
+        if any(plan.stored_name.casefold() in occupied for plan in plans):
+            raise CfazDigitalModelError(
+                "Destino remoto de modelo já está ocupado; revisão obrigatória."
+            )
+        self.event_recorder("remote_preflight_complete")
+        return remote_folder, model_folder, remote_manifest
 
     def _download_and_prepare(
         self,
@@ -503,6 +619,7 @@ class CfazDigitalModelSupplement:
         inventory: CfazDigitalModelInventory,
         work_root: Path,
         used_paths: set[str],
+        planned: _PlannedModel,
     ) -> _PreparedModel:
         prepared_root = work_root / f"prepared-{hashlib.sha256(item.stl_file_id.encode()).hexdigest()[:16]}"
         prepared_root.mkdir(parents=True, exist_ok=False)
@@ -526,16 +643,12 @@ class CfazDigitalModelSupplement:
             raise CfazDigitalModelError(
                 "O fingerprint do STL preparado é inconsistente."
             )
-        declared_stem = Path(str(item.filename or "")).stem
         source_name = (
-            f"{declared_stem}.stl" if declared_stem else "modelo.stl"
+            f"{Path(str(item.filename or '')).stem}.stl"
+            if Path(str(item.filename or "")).stem else "modelo.stl"
         )
-        stored_name = self._next_stored_name(
-            source_name=source_name,
-            model_name=item.model_name,
-            used_paths=used_paths,
-        )
-        folder = CLINICAL_FOLDERS[ClinicalCategory.DIGITAL_MODEL]
+        stored_name = planned.stored_name
+        folder = planned.relative_folder
         relative_path = f"{folder}/{stored_name}"
         used_paths.add(relative_path.casefold())
         timestamp = self._utc_now()

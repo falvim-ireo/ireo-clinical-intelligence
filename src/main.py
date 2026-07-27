@@ -294,6 +294,11 @@ def build_onedrive_graph_client():
     )
 
 
+def _resolve_cfaz_productive_metadata_coordinator():
+    """Ponto local de composição; permanece fechado até existir o writer real."""
+    return None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
@@ -800,6 +805,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         from acquisition.cfaz_digital_models import (
             CfazDigitalModelError,
             CfazDigitalModelSupplement,
+            validate_metadata_coordinator,
         )
         from acquisition.cfaz_operations import (
             CfazHistoryError,
@@ -823,6 +829,11 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
         try:
             options = parser.parse_args(arguments[1:])
             apply = bool(options.apply)
+            metadata_coordinator = None
+            if apply:
+                metadata_coordinator = validate_metadata_coordinator(
+                    _resolve_cfaz_productive_metadata_coordinator()
+                )
             history = CfazHistoryRepository(
                 Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
             )
@@ -857,6 +868,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                     )
                     if apply else None
                 ),
+                metadata_coordinator=metadata_coordinator,
                 max_file_bytes=Config.CFAZ_MAX_FILE_BYTES,
             )
             result = supplement.run(options.request_id, apply=apply)
