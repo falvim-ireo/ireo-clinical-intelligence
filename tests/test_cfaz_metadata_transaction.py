@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -233,6 +234,18 @@ def coordinator_fixture(tmp_path, *, checkpoint=None, representation_change=None
     prepared = {
         **base,
         "cfaz_digital_models": {
+            "schema_version": 1,
+            "state": "COMPLETE",
+            "digital_models": 1,
+            "stl_files": 2,
+            "provider_files": {
+                "synthetic-stl-a": {"sha256": "a" * 64, "stl_file_id": "synthetic-stl-a", "relative_path": "04/model-a.stl", "remote_uploaded": True},
+                "synthetic-stl-b": {"sha256": "b" * 64, "stl_file_id": "synthetic-stl-b", "relative_path": "04/model-b.stl", "remote_uploaded": True},
+            },
+        },
+    }
+    technical_projection = {
+        "cfaz_digital_models": {
             "operation_id": operation_id,
             "provider_files": {
                 "synthetic-stl-a": {"sha256": "a" * 64, "stl_file_id": "synthetic-stl-a", "destination": "04/model-a.stl"},
@@ -247,7 +260,8 @@ def coordinator_fixture(tmp_path, *, checkpoint=None, representation_change=None
     coordinator = LocalMetadataCoordinator(
         operations=operations, index=index, history=history, intake=intake,
         manifest_path=manifest_path, provider="cfaz", request_id="synthetic-request",
-        models=models(), prepared_representation=prepared, checkpoint=checkpoint,
+        models=models(), prepared_representation=prepared,
+        technical_projection=technical_projection, checkpoint=checkpoint,
     )
     return coordinator, manifest_path, operations, index, history, intake, prepared
 
@@ -264,7 +278,12 @@ def test_local_coordinator_completes_and_repeats_without_duplicate_effects(tmp_p
         payload_hash=coordinator.payload_hash,
     )
     assert intake.get_by_operation(coordinator.operation_id).operation_payload_hash == coordinator.payload_hash
-    assert json.loads(path.read_text("utf-8"))["cfaz_digital_models"]["operation_id"] == coordinator.operation_id
+    operational_marker = json.loads(path.read_text("utf-8"))["cfaz_digital_models"]
+    assert "operation_id" not in operational_marker
+    assert (
+        coordinator.technical_projection["cfaz_digital_models"]["operation_id"]
+        == coordinator.operation_id
+    )
 
 
 @pytest.mark.parametrize("crash_event", ["RADIOLOGY_COMMITTED", "INTAKE_COMMITTED", "MANIFEST_PUBLISHED"])
@@ -362,6 +381,34 @@ def test_preparation_anchor_is_durable_and_external_change_requires_review(tmp_p
     assert operations.get(coordinator.operation_id).phase == "REVIEW_REQUIRED"
 
 
+@pytest.mark.parametrize("mutation", ["missing", "fingerprint", "operation"])
+def test_resume_rejects_missing_or_incompatible_technical_projection(
+    tmp_path, mutation,
+):
+    coordinator, _path, operations, _index, _history, _intake, _ = (
+        coordinator_fixture(tmp_path)
+    )
+    coordinator.checkpoint = (
+        lambda event: (_ for _ in ()).throw(RuntimeError())
+        if event == "RADIOLOGY_COMMITTED" else None
+    )
+    with pytest.raises(RuntimeError):
+        coordinator.execute()
+    resumed, *_ = coordinator_fixture(tmp_path)
+    marker = resumed.technical_projection["cfaz_digital_models"]
+    if mutation == "missing":
+        marker["provider_files"].pop("synthetic-stl-a")
+    elif mutation == "fingerprint":
+        marker["provider_files"]["synthetic-stl-a"]["sha256"] = "f" * 64
+    else:
+        marker["operation_id"] = "wrong-operation"
+
+    with pytest.raises(MetadataTransactionError):
+        resumed.resume()
+
+    assert operations.get(coordinator.operation_id).phase == "REVIEW_REQUIRED"
+
+
 def test_destination_claims_are_persistent_and_conflict_safe(tmp_path):
     first, _path, operations, _index, _history, _intake, _ = coordinator_fixture(tmp_path)
     with pytest.raises(RuntimeError):
@@ -373,7 +420,12 @@ def test_destination_claims_are_persistent_and_conflict_safe(tmp_path):
     second.operation_id, second.payload_json = operation_identity(
         provider="cfaz", request_id="other-request", models=second.models
     )
-    second.prepared_representation["cfaz_digital_models"]["operation_id"] = second.operation_id
+    second.payload_hash = hashlib.sha256(
+        second.payload_json.encode("utf-8")
+    ).hexdigest()
+    second.technical_projection["cfaz_digital_models"][
+        "operation_id"
+    ] = second.operation_id
     with pytest.raises(MetadataTransactionError, match="Destino"):
         second.execute()
 

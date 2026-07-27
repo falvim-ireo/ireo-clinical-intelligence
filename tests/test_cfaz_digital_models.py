@@ -21,6 +21,11 @@ from acquisition.cfaz_digital_models import (
     CfazDigitalModelSupplement,
 )
 from acquisition.cfaz_operations import CfazHistoryRepository
+from acquisition.cfaz_metadata_transaction import (
+    LocalMetadataCoordinator,
+    ProductiveMetadataSagaFactory,
+    SupplementOperationRepository,
+)
 from acquisition.cfaz_provider import (
     CfazDigitalModelFile,
     CfazDigitalModelInventory,
@@ -477,11 +482,9 @@ def test_cli_exposes_explicit_and_mutually_exclusive_apply(capsys):
         None,
         object(),
         SimpleNamespace(
-            CAPABILITY="cfaz-supplement-local-tx-v1",
-            TEST_DOUBLE=True,
-            preflight=lambda **_kwargs: None,
-            commit=lambda **_kwargs: None,
-            rollback=lambda: None,
+            CAPABILITY=LocalMetadataCoordinator.CAPABILITY,
+            PRODUCTIVE_IMPLEMENTATION=True,
+            create=lambda **_kwargs: None,
         ),
     ],
 )
@@ -513,24 +516,13 @@ def test_cli_apply_gate_blocks_before_graph_auth_browser_or_run(
 
 
 def test_cli_injected_capable_coordinator_orders_gate_before_graph_and_run(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     events = []
-
-    class ProductiveCoordinator:
-        CAPABILITY = "cfaz-supplement-local-tx-v1"
-        PRODUCTIVE_IMPLEMENTATION = True
-
-        def preflight(self, **_kwargs):
-            pass
-
-        def commit(self, **_kwargs):
-            pass
-
-        def rollback(self):
-            pass
-
-    coordinator = ProductiveCoordinator()
+    coordinator = ProductiveMetadataSagaFactory(
+        radiology_database_path=tmp_path / "radiology.db",
+        intake_database_path=tmp_path / "intake.db",
+    )
 
     class FakeHistory:
         def __init__(self, _path):
@@ -581,16 +573,30 @@ def test_cli_injected_capable_coordinator_orders_gate_before_graph_and_run(
     monkeypatch.setattr(
         digital_models_module, "CfazDigitalModelSupplement", FakeSupplement
     )
-    monkeypatch.setattr(
-        digital_models_module,
-        "PRODUCTIVE_METADATA_COORDINATOR_TYPE",
-        ProductiveCoordinator,
-    )
-
     assert main.main([
         "cfaz-digital-models", "--request-id", "999991", "--apply",
     ]) == 0
     assert events.index("gate") < events.index("graph") < events.index("run")
+
+
+def test_productive_resolver_returns_real_saga_factory_without_io(
+    monkeypatch, tmp_path,
+):
+    from core.config import Config
+
+    radiology = tmp_path / "radiology.db"
+    intake = tmp_path / "intake.db"
+    monkeypatch.setattr(
+        Config, "IREO_RADIOLOGY_INDEX_DATABASE_PATH", str(radiology)
+    )
+    monkeypatch.setattr(Config, "IREO_INTAKE_DATABASE_PATH", str(intake))
+
+    resolved = main._resolve_cfaz_productive_metadata_coordinator()
+
+    assert isinstance(resolved, ProductiveMetadataSagaFactory)
+    assert resolved.CAPABILITY == LocalMetadataCoordinator.CAPABILITY
+    assert not radiology.exists()
+    assert not intake.exists()
 
 
 def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
@@ -642,6 +648,75 @@ def test_apply_adds_two_stl_updates_remote_manifest_and_is_idempotent(tmp_path):
     assert second.state == "ALREADY_COMPLETE"
     assert len(provider.download_calls) == download_count
     assert len(graph.uploads) == upload_count
+
+
+def test_productive_saga_executes_then_resumes_without_new_remote_effects(
+    tmp_path, monkeypatch,
+):
+    history, _staging, manifest_path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+    radiology_database = history.database_path
+    factory = ProductiveMetadataSagaFactory(
+        radiology_database_path=radiology_database,
+        intake_database_path=tmp_path / "intake.db",
+    )
+    calls = []
+    original_execute = LocalMetadataCoordinator.execute
+    original_resume = LocalMetadataCoordinator.resume
+    monkeypatch.setattr(
+        LocalMetadataCoordinator,
+        "execute",
+        lambda self: calls.append(("execute", self.operation_id))
+        or original_execute(self),
+    )
+    monkeypatch.setattr(
+        LocalMetadataCoordinator,
+        "resume",
+        lambda self: calls.append(("resume", self.operation_id))
+        or original_resume(self),
+    )
+    service = CfazDigitalModelSupplement(
+        provider=provider,
+        history=history,
+        graph=graph,
+        metadata_coordinator=factory,
+        staging_root=tmp_path / "staging",
+        max_file_bytes=10_000_000,
+        output=lambda _message: None,
+    )
+
+    first = service.run("999991", apply=True)
+    first_downloads = len(provider.download_calls)
+    first_uploads = len(graph.uploads)
+    provider.discover_digital_models = lambda _value: (_ for _ in ()).throw(
+        AssertionError("provider não deve ser consultado")
+    )
+    second = service.run("99999991", apply=True)
+
+    assert first.state == "COMPLETE"
+    assert second.state == "ALREADY_COMPLETE"
+    assert [name for name, _operation_id in calls] == ["execute", "resume"]
+    assert calls[0][1] == calls[1][1]
+    assert len(provider.download_calls) == first_downloads
+    assert len(graph.uploads) == first_uploads
+    persisted = SupplementOperationRepository(
+        str(radiology_database)
+    ).get(calls[0][1])
+    assert persisted is not None and persisted.phase == "COMPLETED"
+    projection = json.loads(persisted.prepared_delta_json)
+    assert (
+        projection["cfaz_digital_models"]["operation_id"]
+        == calls[0][1]
+    )
+    assert len(projection["cfaz_digital_models"]["provider_files"]) == 2
+    assert "operation_id" not in json.loads(
+        manifest_path.read_text("utf-8")
+    )["cfaz_digital_models"]
+    serialized_projection = persisted.prepared_delta_json.casefold()
+    assert "://" not in serialized_projection
+    assert "token" not in serialized_projection
+    assert "graph" not in serialized_projection
+    assert "solid " not in serialized_projection
 
 
 def test_unsafe_zip_is_rejected_before_manifest_or_destination_change(tmp_path):
@@ -947,7 +1022,7 @@ def test_apply_is_blocked_without_executable_local_transaction_capability(
         output=lambda _message: None,
     )
 
-    with pytest.raises(CfazDigitalModelError, match="Coordenador transacional"):
+    with pytest.raises(CfazDigitalModelError, match="Saga durável produtiva"):
         service.run("999991", apply=True)
 
     assert provider.discover_calls == []

@@ -139,16 +139,16 @@ def prepare_manifest(path: str | Path, representation: dict[str, Any]) -> Prepar
     )
 
 
-def validate_prepared_representation(
-    representation: dict[str, Any], operation_id: str,
+def validate_technical_projection(
+    projection: dict[str, Any], operation_id: str,
     models: Iterable[SupplementModelIdentity],
 ) -> None:
-    """Validate the technical supplement marker before any local mutation."""
-    verify_manifest_operation(representation, operation_id, models)
-    marker = representation["cfaz_digital_models"]
+    """Validate the canonical technical projection before local mutation."""
+    verify_manifest_operation(projection, operation_id, models)
+    marker = projection["cfaz_digital_models"]
     for key in marker:
         if key not in {"operation_id", "provider_files"}:
-            raise MetadataTransactionError("Representação preparada contém metadado não permitido.")
+            raise MetadataTransactionError("Projeção técnica contém metadado não permitido.")
     for file_id, value in marker["provider_files"].items():
         if not isinstance(value, dict) or set(value) - {"sha256", "stl_file_id", "destination"}:
             raise MetadataTransactionError("Representação preparada contém metadado não permitido.")
@@ -162,15 +162,33 @@ def validate_prepared_representation(
             raise MetadataTransactionError("Destino lógico absoluto ou temporário não é permitido.")
 
 
-def _prepared_delta(original: dict[str, Any], prepared: dict[str, Any]) -> dict[str, Any]:
-    """Return the only permitted deterministic change: the technical marker."""
-    base = dict(original)
-    marker = prepared.get("cfaz_digital_models")
-    if not isinstance(marker, dict):
-        raise MetadataTransactionError("Manifesto preparado sem marcador técnico.")
-    if any(key != "cfaz_digital_models" and original.get(key) != prepared.get(key) for key in set(original) | set(prepared)):
-        raise MetadataTransactionError("Preparação altera conteúdo fora da allowlist técnica.")
-    return {"cfaz_digital_models": marker}
+def validate_operational_manifest_projection(
+    representation: dict[str, Any],
+    projection: dict[str, Any],
+) -> None:
+    """Confirm that the rich operational marker matches the technical view."""
+    operational = representation.get("cfaz_digital_models")
+    technical = projection.get("cfaz_digital_models")
+    if not isinstance(operational, dict) or not isinstance(technical, dict):
+        raise MetadataTransactionError("Manifesto e projeção técnica são incompatíveis.")
+    operational_files = operational.get("provider_files")
+    technical_files = technical.get("provider_files")
+    if not isinstance(operational_files, dict) or not isinstance(technical_files, dict):
+        raise MetadataTransactionError("Manifesto e projeção técnica são incompatíveis.")
+    if set(operational_files) != set(technical_files):
+        raise MetadataTransactionError("Manifesto operacional não contém exatamente a projeção técnica.")
+    for file_id, expected in technical_files.items():
+        actual = operational_files.get(file_id)
+        if (
+            not isinstance(actual, dict)
+            or not isinstance(expected, dict)
+            or actual.get("stl_file_id", file_id) != expected.get("stl_file_id")
+            or actual.get("sha256") != expected.get("sha256")
+            or actual.get(
+                "relative_path", actual.get("destination")
+            ) != expected.get("destination")
+        ):
+            raise MetadataTransactionError("Manifesto operacional diverge da projeção técnica.")
 
 
 def verify_manifest_operation(
@@ -477,11 +495,11 @@ class LocalMetadataCoordinatorResult:
 
 
 class LocalMetadataCoordinator:
-    """Reentrant local metadata saga; deliberately not a productive adapter.
+    """Reentrant local metadata saga used by the productive supplement.
 
     The coordinator composes only the already-persistent local stores.  It has
-    no network capability and is intentionally not registered with the CLI
-    productive-coordinator resolver.
+    no network capability.  The technical projection is deliberately distinct
+    from the rich operational marker stored in the clinical manifest.
     """
 
     CAPABILITY = "cfaz-supplement-local-saga-v1"
@@ -492,6 +510,7 @@ class LocalMetadataCoordinator:
         provider: str, request_id: str,
         models: Iterable[SupplementModelIdentity],
         prepared_representation: dict[str, Any],
+        technical_projection: dict[str, Any] | None = None,
         checkpoint: Any | None = None,
         correlation_id: str | None = None,
     ) -> None:
@@ -504,6 +523,15 @@ class LocalMetadataCoordinator:
         self.request_id = str(request_id)
         self.models = tuple(models)
         self.prepared_representation = prepared_representation
+        self.technical_projection = (
+            technical_projection
+            if technical_projection is not None
+            else {
+                "cfaz_digital_models": prepared_representation.get(
+                    "cfaz_digital_models"
+                )
+            }
+        )
         self.checkpoint = checkpoint
         self.correlation_id = correlation_id or f"cfaz-supplement-{self.request_id}"
         self.operation_id, self.payload_json = operation_identity(
@@ -544,30 +572,35 @@ class LocalMetadataCoordinator:
             raise MetadataTransactionError("Operação PREPARED não possui âncora de manifesto recuperável.")
         if operation.payload_hash != self.payload_hash:
             raise MetadataTransactionError("Âncora de manifesto não corresponde ao payload da operação.")
+        validate_technical_projection(
+            self.technical_projection, self.operation_id, self.models
+        )
+        validate_operational_manifest_projection(
+            self.prepared_representation, self.technical_projection
+        )
+        expected_projection = json.dumps(
+            self.technical_projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if operation.prepared_delta_json != expected_projection:
+            raise MetadataTransactionError("Projeção técnica persistida é incompatível.")
         try:
             current = self.manifest_path.read_bytes()
             current_hash = hashlib.sha256(current).hexdigest()
             if current_hash == operation.manifest_prepared_sha256:
                 parsed = json.loads(current.decode("utf-8"))
-                validate_prepared_representation(parsed, self.operation_id, self.models)
-                expected_delta = json.dumps(
-                    {"cfaz_digital_models": parsed["cfaz_digital_models"]},
-                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                validate_operational_manifest_projection(
+                    parsed, self.technical_projection
                 )
-                if expected_delta != operation.prepared_delta_json:
-                    raise MetadataTransactionError("Âncora de manifesto não corresponde ao conteúdo publicado.")
                 return PreparedManifest(self.manifest_path, current, operation.manifest_original_sha256,
                                         current, operation.manifest_prepared_sha256)
             if current_hash != operation.manifest_original_sha256:
                 raise MetadataTransactionError("Manifesto alterado desde a preparação persistida.")
-            original = json.loads(current.decode("utf-8"))
-            delta = json.loads(operation.prepared_delta_json)
-            if set(delta) != {"cfaz_digital_models"} or not isinstance(delta["cfaz_digital_models"], dict):
-                raise MetadataTransactionError("Âncora de manifesto inválida.")
-            representation = dict(original)
-            representation["cfaz_digital_models"] = delta["cfaz_digital_models"]
-            validate_prepared_representation(representation, self.operation_id, self.models)
-            prepared = prepare_manifest(self.manifest_path, representation)
+            prepared = prepare_manifest(
+                self.manifest_path, self.prepared_representation
+            )
             if (prepared.original_sha256 != operation.manifest_original_sha256
                     or prepared.prepared_sha256 != operation.manifest_prepared_sha256):
                 raise MetadataTransactionError("Manifesto não pôde ser reconstruído pela âncora persistida.")
@@ -577,12 +610,13 @@ class LocalMetadataCoordinator:
 
     def _initial_prepared(self) -> tuple[PreparedManifest, dict[str, Any]]:
         prepared = prepare_manifest(self.manifest_path, self.prepared_representation)
-        try:
-            original = json.loads(prepared.original_bytes.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise MetadataTransactionError("Manifesto original não é JSON válido.") from exc
-        validate_prepared_representation(self.prepared_representation, self.operation_id, self.models)
-        return prepared, _prepared_delta(original, self.prepared_representation)
+        validate_technical_projection(
+            self.technical_projection, self.operation_id, self.models
+        )
+        validate_operational_manifest_projection(
+            self.prepared_representation, self.technical_projection
+        )
+        return prepared, self.technical_projection
 
     def _radiology(self, operation: SupplementOperation, prepared: PreparedManifest) -> None:
         index_db = Path(self.index.database_path).resolve()
@@ -664,7 +698,9 @@ class LocalMetadataCoordinator:
             current_hash = hashlib.sha256(current).hexdigest()
             if current_hash == prepared.prepared_sha256:
                 representation = json.loads(current.decode("utf-8"))
-                validate_prepared_representation(representation, self.operation_id, self.models)
+                validate_operational_manifest_projection(
+                    representation, self.technical_projection
+                )
             elif current_hash == prepared.original_sha256:
                 try:
                     prepared.publish()
@@ -674,9 +710,9 @@ class LocalMetadataCoordinator:
                     reconciled = hashlib.sha256(prepared.path.read_bytes()).hexdigest()
                     if reconciled != prepared.prepared_sha256:
                         self._review("Manifesto alterado durante publicação; revisão manual necessária.")
-                    validate_prepared_representation(
+                    validate_operational_manifest_projection(
                         json.loads(prepared.path.read_text(encoding="utf-8")),
-                        self.operation_id, self.models,
+                        self.technical_projection,
                     )
             else:
                 self._review("Manifesto alterado por outra operação; publicação bloqueada.")
@@ -690,7 +726,9 @@ class LocalMetadataCoordinator:
         try:
             prepared.verify_published()
             representation = json.loads(prepared.path.read_text(encoding="utf-8"))
-            validate_prepared_representation(representation, self.operation_id, self.models)
+            validate_operational_manifest_projection(
+                representation, self.technical_projection
+            )
         except (OSError, UnicodeError, json.JSONDecodeError, MetadataTransactionError) as exc:
             self._review("Verificação final do manifesto falhou; revisão manual necessária.")
         if representation is None or not self.index.verify_operation_manifest(
@@ -765,3 +803,58 @@ class LocalMetadataCoordinator:
     def resume(self) -> LocalMetadataCoordinatorResult:
         """Resume with caller-recreated local repositories and manifest reference."""
         return self._run(resumed=True)
+
+
+class ProductiveMetadataSagaFactory:
+    """Create the canonical durable saga without initializing external clients."""
+
+    CAPABILITY = LocalMetadataCoordinator.CAPABILITY
+    PRODUCTIVE_IMPLEMENTATION = True
+
+    def __init__(
+        self, *, radiology_database_path: str | Path,
+        intake_database_path: str | Path,
+    ) -> None:
+        self.radiology_database_path = Path(radiology_database_path)
+        self.intake_database_path = Path(intake_database_path)
+
+    def create(
+        self, *, record: Any, updated_manifest: dict[str, Any],
+        manifest_path: str | Path,
+        models: Iterable[SupplementModelIdentity],
+    ) -> LocalMetadataCoordinator:
+        from acquisition.cfaz_operations import CfazHistoryRepository
+        from radiology.exam_index_service import ExamIndexService
+        from radiology.intake_history import IntakeHistoryRepository
+
+        model_values = tuple(models)
+        request_id = str(record.request_id)
+        operation_id, _ = operation_identity(
+            provider="cfaz", request_id=request_id, models=model_values
+        )
+        technical_projection = {
+            "cfaz_digital_models": {
+                "operation_id": operation_id,
+                "provider_files": {
+                    item.stl_file_id: {
+                        "sha256": item.sha256,
+                        "stl_file_id": item.stl_file_id,
+                        "destination": item.destination,
+                    }
+                    for item in model_values
+                },
+            }
+        }
+        radiology_path = self.radiology_database_path
+        return LocalMetadataCoordinator(
+            operations=SupplementOperationRepository(str(radiology_path)),
+            index=ExamIndexService(radiology_path),
+            history=CfazHistoryRepository(radiology_path),
+            intake=IntakeHistoryRepository(self.intake_database_path),
+            manifest_path=manifest_path,
+            provider="cfaz",
+            request_id=request_id,
+            models=model_values,
+            prepared_representation=updated_manifest,
+            technical_projection=technical_projection,
+        )

@@ -32,6 +32,11 @@ from acquisition.clinical_normalizer import (
 from acquisition.models.clinical_package import (
     ClinicalAsset as ContractClinicalAsset,
 )
+from acquisition.cfaz_metadata_transaction import (
+    LocalMetadataCoordinator,
+    ProductiveMetadataSagaFactory,
+    SupplementModelIdentity,
+)
 from integrations.onedrive_graph import GraphRollbackJournal
 
 
@@ -39,29 +44,37 @@ class CfazDigitalModelError(RuntimeError):
     """Erro sanitizado do fluxo suplementar de modelos digitais."""
 
 
-PRODUCTIVE_METADATA_COORDINATOR_TYPE: type | None = None
+PRODUCTIVE_METADATA_SAGA_TYPE: type = ProductiveMetadataSagaFactory
 
 
 def validate_metadata_coordinator(
     coordinator: Any, *, allow_test_double: bool = False
 ) -> Any:
     """Valida localmente o gate transacional, sem inicializar dependências."""
-    required = ("preflight", "commit", "rollback")
-    structurally_complete = (
+    saga_complete = (
         getattr(coordinator, "CAPABILITY", None)
-        == "cfaz-supplement-local-tx-v1"
-        and all(callable(getattr(coordinator, name, None)) for name in required)
+        == LocalMetadataCoordinator.CAPABILITY
+        and callable(getattr(coordinator, "create", None))
     )
     productive = (
-        PRODUCTIVE_METADATA_COORDINATOR_TYPE is not None
-        and type(coordinator) is PRODUCTIVE_METADATA_COORDINATOR_TYPE
-        and
-        getattr(coordinator, "PRODUCTIVE_IMPLEMENTATION", False) is True
+        type(coordinator) is PRODUCTIVE_METADATA_SAGA_TYPE
+        and saga_complete
+        and getattr(coordinator, "PRODUCTIVE_IMPLEMENTATION", False) is True
         and not getattr(coordinator, "TEST_DOUBLE", False)
     )
-    if not structurally_complete or (not productive and not allow_test_double):
+    legacy_test_double = (
+        allow_test_double
+        and getattr(coordinator, "TEST_DOUBLE", False) is True
+        and getattr(coordinator, "CAPABILITY", None)
+        == "cfaz-supplement-local-tx-v1"
+        and all(
+            callable(getattr(coordinator, name, None))
+            for name in ("preflight", "commit", "rollback")
+        )
+    )
+    if not productive and not legacy_test_double:
         raise CfazDigitalModelError(
-            "Coordenador transacional produtivo de manifesto, índice, "
+            "Saga durável produtiva de manifesto, índice, "
             "histórico e intake não está disponível; aplicação bloqueada."
         )
     return coordinator
@@ -176,6 +189,13 @@ class CfazDigitalModelSupplement:
         marker = manifest.get("cfaz_digital_models")
         if self._completed_marker_is_valid(marker, manifest_path.parent):
             count = len(marker.get("provider_files") or {})
+            if apply and not self.allow_test_metadata_coordinator:
+                self._validate_local_transaction_capability()
+                self._run_metadata_saga(
+                    record=record,
+                    updated_manifest=manifest,
+                    manifest_path=manifest_path,
+                )
             return CfazDigitalModelsResult(
                 request_id=record.provider_request_id or record.request_id,
                 model_count=int(marker.get("digital_models") or 0),
@@ -257,11 +277,12 @@ class CfazDigitalModelSupplement:
             inventory, manifest=manifest, destination=manifest_path.parent
         )
         self.event_recorder("local_preflight")
-        self.metadata_coordinator.preflight(
-            record=record,
-            manifest=manifest,
-            planned_assets=plans,
-        )
+        if self.allow_test_metadata_coordinator:
+            self.metadata_coordinator.preflight(
+                record=record,
+                manifest=manifest,
+                planned_assets=plans,
+            )
         self.event_recorder("remote_preflight")
         remote_state = self._preflight_remote(
             destination=destination,
@@ -437,21 +458,30 @@ class CfazDigitalModelSupplement:
                     )
                 created_local.append(target)
             self.event_recorder("local_promotion")
-            operation_id = hashlib.sha256(
-                (
-                    str(inventory.request.request_id)
-                    + "|"
-                    + "|".join(sorted(item.stl_file_id for item in inventory.files))
-                ).encode("utf-8")
-            ).hexdigest()
-            self.metadata_coordinator.commit(
-                operation_id=operation_id,
-                record=record,
-                original_manifest=manifest,
-                updated_manifest=final,
-                manifest_path=manifest_path,
-                created_files=tuple(created_local),
-            )
+            if self.allow_test_metadata_coordinator:
+                operation_id = hashlib.sha256(
+                    (
+                        str(inventory.request.request_id)
+                        + "|"
+                        + "|".join(sorted(
+                            item.stl_file_id for item in inventory.files
+                        ))
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.metadata_coordinator.commit(
+                    operation_id=operation_id,
+                    record=record,
+                    original_manifest=manifest,
+                    updated_manifest=final,
+                    manifest_path=manifest_path,
+                    created_files=tuple(created_local),
+                )
+            else:
+                self._run_metadata_saga(
+                    record=record,
+                    updated_manifest=final,
+                    manifest_path=manifest_path,
+                )
             self.event_recorder("metadata_committed")
         except Exception as exc:
             rollback_ok = True
@@ -472,10 +502,11 @@ class CfazDigitalModelSupplement:
             for path in reversed(created_local):
                 path.unlink(missing_ok=True)
             self._remove_empty_model_folder(manifest_path.parent)
-            try:
-                self.metadata_coordinator.rollback()
-            except Exception:
-                rollback_ok = False
+            if self.allow_test_metadata_coordinator:
+                try:
+                    self.metadata_coordinator.rollback()
+                except Exception:
+                    rollback_ok = False
             if isinstance(exc, CfazDigitalModelError) and rollback_ok:
                 self._cleanup_work_root(work_root, owned=owned_work_root)
                 raise
@@ -525,6 +556,52 @@ class CfazDigitalModelSupplement:
             self.metadata_coordinator,
             allow_test_double=self.allow_test_metadata_coordinator,
         )
+
+    @staticmethod
+    def _technical_models(
+        updated_manifest: dict[str, Any],
+    ) -> tuple[SupplementModelIdentity, ...]:
+        marker = updated_manifest.get("cfaz_digital_models")
+        files = marker.get("provider_files") if isinstance(marker, dict) else None
+        if not isinstance(files, dict) or len(files) != 2:
+            raise CfazDigitalModelError(
+                "Marcador operacional não contém exatamente dois modelos."
+            )
+        models: list[SupplementModelIdentity] = []
+        for position, file_id in enumerate(sorted(files), start=1):
+            value = files[file_id]
+            if not isinstance(value, dict):
+                raise CfazDigitalModelError(
+                    "Marcador operacional de modelo é inválido."
+                )
+            models.append(SupplementModelIdentity(
+                semantic_role=f"cfaz-model-{position:02d}",
+                stl_file_id=str(value.get("stl_file_id") or file_id),
+                sha256=str(value.get("sha256") or ""),
+                destination=str(value.get("relative_path") or ""),
+            ))
+        return tuple(models)
+
+    def _run_metadata_saga(
+        self, *, record: Any, updated_manifest: dict[str, Any],
+        manifest_path: Path,
+    ) -> Any:
+        models = self._technical_models(updated_manifest)
+        saga = self.metadata_coordinator.create(
+            record=record,
+            updated_manifest=updated_manifest,
+            manifest_path=manifest_path,
+            models=models,
+        )
+        if (
+            not isinstance(saga, LocalMetadataCoordinator)
+            or saga.models != models
+        ):
+            raise CfazDigitalModelError(
+                "Fábrica produtiva não criou a saga durável esperada."
+            )
+        existing = saga.operations.get(saga.operation_id)
+        return saga.resume() if existing is not None else saga.execute()
 
     def _plan_destinations(
         self,

@@ -295,8 +295,14 @@ def build_onedrive_graph_client():
 
 
 def _resolve_cfaz_productive_metadata_coordinator():
-    """Ponto local de composição; permanece fechado até existir o writer real."""
-    return None
+    """Compose the durable local saga without touching external services."""
+    from acquisition.cfaz_metadata_transaction import ProductiveMetadataSagaFactory
+    from core.config import Config
+
+    return ProductiveMetadataSagaFactory(
+        radiology_database_path=Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH,
+        intake_database_path=Config.IREO_INTAKE_DATABASE_PATH,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
