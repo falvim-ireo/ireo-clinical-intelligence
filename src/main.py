@@ -841,7 +841,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                     _resolve_cfaz_productive_metadata_coordinator()
                 )
             history = CfazHistoryRepository(
-                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH
+                Config.IREO_RADIOLOGY_INDEX_DATABASE_PATH,
+                read_only=not apply,
             )
             browser_resolver = None
             if options.browser_session:
@@ -860,10 +861,11 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
                 payload_diagnostics=True,
                 browser_resolver=browser_resolver,
             )
+            graph_client = build_onedrive_graph_client()
             supplement = CfazDigitalModelSupplement(
                 provider=provider,
                 history=history,
-                graph=build_onedrive_graph_client() if apply else None,
+                graph=graph_client if apply else graph_client.read_only(),
                 staging_root=(
                     Path(Config.IREO_RADIOLOGY_QUARANTINE_PATH)
                     / "supervised-staging"

@@ -92,6 +92,7 @@ class CfazDigitalModelsResult:
     manifest_path: Path
     onedrive_destination: str
     indexed: bool
+    planned_model_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -242,24 +243,11 @@ class CfazDigitalModelSupplement:
                 f"Modelo {item.digital_model_id}; STL {item.stl_file_id}; "
                 f"status={status}."
             )
-        if not apply:
-            return CfazDigitalModelsResult(
-                request_id=inventory.request.request_id,
-                model_count=inventory.model_count,
-                provider_file_count=len(inventory.files),
-                pending_file_count=len(pending),
-                added_file_count=0,
-                reused_file_count=len(inventory.files) - len(pending),
-                state="DRY_RUN",
-                manifest_path=manifest_path,
-                onedrive_destination=destination,
-                indexed=False,
-            )
         if self.graph is None:
             raise CfazDigitalModelError(
-                "Cliente OneDrive obrigatório no modo APPLY."
+                "Cliente OneDrive obrigatório para o preflight remoto."
             )
-        if not inventory.files:
+        if apply and not inventory.files:
             return CfazDigitalModelsResult(
                 request_id=inventory.request.request_id,
                 model_count=inventory.model_count,
@@ -272,12 +260,14 @@ class CfazDigitalModelSupplement:
                 onedrive_destination=destination,
                 indexed=False,
             )
-        self._validate_apply_preflight(inventory)
+        self._validate_model_preflight(inventory)
+        if apply:
+            self._validate_apply_graph_capability()
         plans = self._plan_destinations(
             inventory, manifest=manifest, destination=manifest_path.parent
         )
         self.event_recorder("local_preflight")
-        if self.allow_test_metadata_coordinator:
+        if apply and self.allow_test_metadata_coordinator:
             self.metadata_coordinator.preflight(
                 record=record,
                 manifest=manifest,
@@ -289,6 +279,22 @@ class CfazDigitalModelSupplement:
             manifest=manifest,
             plans=plans,
         )
+        if not apply:
+            return CfazDigitalModelsResult(
+                request_id=inventory.request.request_id,
+                model_count=inventory.model_count,
+                provider_file_count=len(inventory.files),
+                pending_file_count=len(pending),
+                added_file_count=0,
+                reused_file_count=len(inventory.files) - len(pending),
+                state="DRY_RUN",
+                manifest_path=manifest_path,
+                onedrive_destination=destination,
+                indexed=False,
+                planned_model_paths=tuple(
+                    plan.relative_path for plan in plans
+                ),
+            )
         return self._apply(
             record=record,
             inventory=inventory,
@@ -796,7 +802,7 @@ class CfazDigitalModelSupplement:
             already_manifested=False,
         )
 
-    def _validate_apply_preflight(
+    def _validate_model_preflight(
         self, inventory: CfazDigitalModelInventory
     ) -> None:
         if len(inventory.files) != 2:
@@ -816,6 +822,8 @@ class CfazDigitalModelSupplement:
             )
         for url in urls:
             CfazProvider._validate_download_url(url)
+
+    def _validate_apply_graph_capability(self) -> None:
         capability = getattr(
             self.graph, "VERIFIED_COMPENSATION_CAPABILITY", None
         )
@@ -832,6 +840,12 @@ class CfazDigitalModelSupplement:
                 "O cliente remoto não oferece rollback verificável; "
                 "aplicação bloqueada."
             )
+
+    def _validate_apply_preflight(
+        self, inventory: CfazDigitalModelInventory
+    ) -> None:
+        self._validate_model_preflight(inventory)
+        self._validate_apply_graph_capability()
 
     def _prepared_from_manifest(
         self,

@@ -9,6 +9,7 @@ import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import zipfile
 
@@ -456,17 +457,96 @@ def supplement(
 
 
 def test_dry_run_enumerates_without_download_or_changes(tmp_path):
-    history, _staging, manifest_path, _manifest, provider = fixture(tmp_path)
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
     before = manifest_path.read_bytes()
+    before_paths = tuple(sorted(path.relative_to(staging) for path in staging.rglob("*")))
+    events = []
 
-    result = supplement(tmp_path, history, provider).run("999991")
+    result = supplement(
+        tmp_path, history, provider, graph=Graph(manifest), events=events
+    ).run("999991")
 
     assert result.state == "DRY_RUN"
     assert result.model_count == 1
     assert result.provider_file_count == 2
     assert result.pending_file_count == 2
+    assert len(result.planned_model_paths) == 2
+    assert len(set(result.planned_model_paths)) == 2
+    assert events == [
+        "resolve_models",
+        "local_preflight",
+        "remote_preflight",
+        "remote_preflight_complete",
+    ]
     assert provider.download_calls == []
     assert manifest_path.read_bytes() == before
+    assert tuple(
+        sorted(path.relative_to(staging) for path in staging.rglob("*"))
+    ) == before_paths
+
+
+def test_history_read_only_lookup_does_not_modify_sqlite(tmp_path):
+    history, _staging, _manifest_path, _manifest, _provider = fixture(tmp_path)
+    database_path = history.database_path
+    before = database_path.read_bytes()
+
+    reopened = CfazHistoryRepository(database_path, read_only=True)
+
+    assert reopened.get_record("999991") is not None
+    assert database_path.read_bytes() == before
+
+
+def test_history_read_only_supports_legacy_projection_without_migration(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy.db"
+    with sqlite3.connect(database_path) as db:
+        db.execute(
+            """CREATE TABLE cfaz_import_history (
+            provider TEXT NOT NULL, request_id TEXT NOT NULL,
+            provider_request_id TEXT, sequential_id TEXT,
+            patient_name TEXT, status TEXT NOT NULL, started_at TEXT,
+            completed_at TEXT, duration_seconds REAL,
+            onedrive_destination TEXT, provider_exam_id TEXT,
+            acquisition_sha TEXT, import_timestamp TEXT,
+            updated_at TEXT NOT NULL)"""
+        )
+        db.execute(
+            """INSERT INTO cfaz_import_history (
+            provider,request_id,provider_request_id,sequential_id,
+            patient_name,status,onedrive_destination,updated_at
+            ) VALUES ('cfaz','internal','provider','sequence',
+            'Synthetic Patient','COMPLETE','Patients/Synthetic','now')"""
+        )
+    before = database_path.read_bytes()
+
+    record = CfazHistoryRepository(
+        database_path, read_only=True
+    ).get_record("sequence")
+
+    assert record is not None
+    assert record.supplement_operation_id is None
+    assert record.supplement_payload_hash is None
+    assert database_path.read_bytes() == before
+
+
+def test_dry_run_remote_collision_fails_before_effects(tmp_path):
+    history, staging, manifest_path, manifest, provider = fixture(tmp_path)
+    graph = Graph(manifest)
+    first = supplement(tmp_path, history, provider, graph=graph).run("999991")
+    graph.remote_models[first.planned_model_paths[0].rsplit("/", 1)[-1]] = 123
+    before = manifest_path.read_bytes()
+    before_paths = tuple(sorted(path.relative_to(staging) for path in staging.rglob("*")))
+
+    with pytest.raises(CfazDigitalModelError, match="remoto"):
+        supplement(tmp_path, history, provider, graph=graph).run("999991")
+
+    assert provider.download_calls == []
+    assert graph.uploads == []
+    assert manifest_path.read_bytes() == before
+    assert tuple(
+        sorted(path.relative_to(staging) for path in staging.rglob("*"))
+    ) == before_paths
 
 
 def test_cli_exposes_explicit_and_mutually_exclusive_apply(capsys):
@@ -515,6 +595,59 @@ def test_cli_apply_gate_blocks_before_graph_auth_browser_or_run(
     assert "aplicação bloqueada" in capsys.readouterr().out
 
 
+def test_cli_dry_run_uses_read_only_history_and_graph(monkeypatch):
+    events = []
+    read_only_graph = object()
+
+    class FakeHistory:
+        def __init__(self, _path, *, read_only=False):
+            events.append(("history", read_only))
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            events.append(("provider", True))
+
+    class FakeGraph:
+        def read_only(self):
+            events.append(("graph_read_only", True))
+            return read_only_graph
+
+    class FakeSupplement:
+        def __init__(self, **kwargs):
+            assert kwargs["graph"] is read_only_graph
+            assert kwargs["metadata_coordinator"] is None
+
+        def run(self, _request_id, *, apply):
+            assert apply is False
+            events.append(("run", True))
+            return SimpleNamespace(
+                state="DRY_RUN",
+                added_file_count=0,
+                reused_file_count=0,
+            )
+
+    import acquisition.cfaz_digital_models as digital_models_module
+    import acquisition.cfaz_operations as operations_module
+    import acquisition.cfaz_provider as provider_module
+
+    monkeypatch.setattr(operations_module, "CfazHistoryRepository", FakeHistory)
+    monkeypatch.setattr(provider_module, "CfazProvider", FakeProvider)
+    monkeypatch.setattr(
+        digital_models_module, "CfazDigitalModelSupplement", FakeSupplement
+    )
+    monkeypatch.setattr(main, "build_onedrive_graph_client", FakeGraph)
+
+    assert main.main([
+        "cfaz-digital-models", "--request-id", "999991", "--dry-run",
+    ]) == 0
+    assert events == [
+        ("history", True),
+        ("provider", True),
+        ("graph_read_only", True),
+        ("run", True),
+    ]
+
+
 def test_cli_injected_capable_coordinator_orders_gate_before_graph_and_run(
     monkeypatch, tmp_path,
 ):
@@ -525,7 +658,7 @@ def test_cli_injected_capable_coordinator_orders_gate_before_graph_and_run(
     )
 
     class FakeHistory:
-        def __init__(self, _path):
+        def __init__(self, _path, **_kwargs):
             events.append("history")
 
     class FakeProvider:

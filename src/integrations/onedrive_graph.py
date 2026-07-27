@@ -174,6 +174,10 @@ class OneDriveGraphClient:
         self.large_upload_max_retries = large_upload_max_retries
         self._remote_folders: dict[str, tuple[str | None, str | None]] = {}
 
+    def read_only(self) -> "OneDriveGraphReadOnly":
+        """Expõe somente as consultas necessárias ao preflight remoto."""
+        return OneDriveGraphReadOnly(self)
+
     def get_authenticated_user(self) -> GraphUser:
         payload = self._get("/me", params={"$select": "displayName,mail,userPrincipalName"})
         return GraphUser(
@@ -1277,3 +1281,28 @@ class OneDriveGraphClient:
         if value is None:
             raise OneDriveGraphError(f"{label} ausente na resposta do Microsoft Graph.")
         return value
+
+
+class OneDriveGraphReadOnly:
+    """Visão de capacidade restrita sobre o cliente Graph autenticado."""
+
+    __slots__ = ("__client",)
+
+    def __init__(self, client: OneDriveGraphClient) -> None:
+        self.__client = client
+
+    def find_root_folder(self, configured_root: str) -> GraphFolder:
+        return self.__client.find_root_folder(configured_root)
+
+    def list_children(self, folder: GraphFolder) -> list[dict[str, Any]]:
+        return self.__client.list_children(folder)
+
+    def folder_from_child_item(
+        self, parent_folder: GraphFolder, item: dict[str, Any]
+    ) -> GraphFolder:
+        return self.__client.folder_from_child_item(parent_folder, item)
+
+    def download_json_file(
+        self, parent_folder: GraphFolder, filename: str
+    ) -> dict[str, Any] | None:
+        return self.__client.download_json_file(parent_folder, filename)

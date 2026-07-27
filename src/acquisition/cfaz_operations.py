@@ -62,8 +62,29 @@ class CfazHistoryRecord:
 
 
 class CfazHistoryRepository:
-    def __init__(self, database_path: str | Path) -> None:
+    _RECORD_COLUMNS = (
+        "request_id", "provider", "patient_name", "status", "started_at",
+        "completed_at", "duration_seconds", "onedrive_destination",
+        "provider_exam_id", "acquisition_sha", "import_timestamp",
+        "provider_request_id", "sequential_id", "clinic_number",
+        "repaired_at", "repair_version", "supplement_operation_id",
+        "supplement_payload_hash",
+    )
+
+    def __init__(
+        self, database_path: str | Path, *, read_only: bool = False
+    ) -> None:
         self.database_path = Path(database_path).expanduser().resolve()
+        self.read_only = read_only
+        if read_only:
+            try:
+                with self._connect() as db:
+                    db.execute("SELECT 1 FROM cfaz_import_history LIMIT 1")
+            except (OSError, sqlite3.Error) as exc:
+                raise CfazHistoryError(
+                    "Não foi possível abrir o histórico Cfaz para leitura."
+                ) from exc
+            return
         try:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as db:
@@ -118,9 +139,38 @@ class CfazHistoryRepository:
             raise CfazHistoryError("Não foi possível abrir o histórico Cfaz.") from exc
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=10)
+        target: str | Path = self.database_path
+        kwargs: dict[str, object] = {"timeout": 10}
+        if self.read_only:
+            target = f"{self.database_path.as_uri()}?mode=ro"
+            kwargs["uri"] = True
+        connection = sqlite3.connect(target, **kwargs)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @classmethod
+    def _record_projection(cls, db: sqlite3.Connection) -> str:
+        available = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(cfaz_import_history)")
+        }
+        return ",".join(
+            column if column in available else f"NULL AS {column}"
+            for column in cls._RECORD_COLUMNS
+        )
+
+    @staticmethod
+    def _identifier_columns(db: sqlite3.Connection) -> tuple[str, ...]:
+        available = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(cfaz_import_history)")
+        }
+        return tuple(
+            column for column in (
+                "request_id", "provider_request_id", "sequential_id"
+            )
+            if column in available
+        )
 
     @staticmethod
     def _now() -> str:
@@ -245,15 +295,15 @@ class CfazHistoryRepository:
 
     def get_record(self, identifier: str) -> CfazHistoryRecord | None:
         with self._connect() as db:
+            identifier_columns = self._identifier_columns(db)
+            predicate = " OR ".join(
+                f"{column}=?" for column in identifier_columns
+            )
             rows = db.execute(
-                """SELECT request_id,provider,patient_name,status,started_at,
-                completed_at,duration_seconds,onedrive_destination,provider_exam_id,
-                acquisition_sha,import_timestamp,provider_request_id,sequential_id,
-                clinic_number,repaired_at,repair_version,supplement_operation_id,
-                supplement_payload_hash FROM cfaz_import_history
-                WHERE provider='cfaz' AND
-                (request_id=? OR provider_request_id=? OR sequential_id=?)""",
-                (identifier, identifier, identifier),
+                f"""SELECT {self._record_projection(db)}
+                FROM cfaz_import_history
+                WHERE provider='cfaz' AND ({predicate})""",
+                (identifier,) * len(identifier_columns),
             ).fetchall()
         return CfazHistoryRecord(**dict(rows[0])) if len(rows) == 1 else None
 
@@ -360,11 +410,7 @@ class CfazHistoryRepository:
     def list_records(self, limit: int = 100) -> list[CfazHistoryRecord]:
         with self._connect() as db:
             rows = db.execute(
-                """SELECT request_id,provider,patient_name,status,started_at,
-                completed_at,duration_seconds,onedrive_destination,
-                provider_exam_id,acquisition_sha,import_timestamp
-                ,provider_request_id,sequential_id,clinic_number
-                ,repaired_at,repair_version,supplement_operation_id,supplement_payload_hash
+                f"""SELECT {self._record_projection(db)}
                 FROM cfaz_import_history ORDER BY updated_at DESC LIMIT ?""",
                 (min(max(int(limit), 1), 500),),
             )
@@ -374,11 +420,7 @@ class CfazHistoryRepository:
         """Lista aquisições Cfaz explícitas concluídas, sem inferir pelo acervo."""
         with self._connect() as db:
             rows = db.execute(
-                """SELECT request_id,provider,patient_name,status,started_at,
-                completed_at,duration_seconds,onedrive_destination,
-                provider_exam_id,acquisition_sha,import_timestamp,
-                provider_request_id,sequential_id,clinic_number,
-                repaired_at,repair_version,supplement_operation_id,supplement_payload_hash
+                f"""SELECT {self._record_projection(db)}
                 FROM cfaz_import_history
                 WHERE provider='cfaz' AND status='COMPLETE'
                 ORDER BY updated_at,request_id"""

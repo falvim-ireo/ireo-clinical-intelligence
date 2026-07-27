@@ -91,6 +91,20 @@ def test_finds_local_root_folder_and_lists_first_items() -> None:
     assert session.calls[0][1]["timeout"] == (10.0, 30.0)
 
 
+def test_read_only_view_exposes_queries_without_mutating_methods() -> None:
+    client = OneDriveGraphClient("fixture-token", session=FakeSession())
+    graph = client.read_only()
+
+    assert callable(graph.find_root_folder)
+    assert callable(graph.list_children)
+    assert callable(graph.folder_from_child_item)
+    assert callable(graph.download_json_file)
+    assert not hasattr(graph, "upload_small_file")
+    assert not hasattr(graph, "upload_small_file_transactional")
+    assert not hasattr(graph, "delete_created_item_verified")
+    assert not hasattr(graph, "ensure_folder")
+
+
 def test_finds_remote_root_folder_and_lists_remote_items() -> None:
     session = FakeSession(
         responses=[
