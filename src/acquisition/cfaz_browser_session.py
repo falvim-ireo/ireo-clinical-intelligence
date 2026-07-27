@@ -5,7 +5,6 @@ serialized as storage_state. Signed download URLs are kept only in memory.
 """
 from __future__ import annotations
 
-import os
 import stat
 import time
 from pathlib import Path
@@ -58,102 +57,58 @@ class CfazBrowserSession:
                 expected_stl_file_ids: set[str] | tuple[str, ...] | list[str],
                 manual_trigger: bool = False) -> dict[str, str]:
         expected_ids = {str(value) for value in expected_stl_file_ids}
-        factory = self.playwright_factory or self._factory()
-        urls: list[str] = []
-        observed = 0
-        initial = 0
-        active = False
-        post_requests = fetch_count = xhr_count = anchor_count = popup_count = download_count = blocked = 0
-        with factory() as playwright:
-            headless = False if manual_trigger else True
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_dir()), headless=headless, accept_downloads=False,
+        if not expected_ids:
+            raise CfazBrowserSessionError(
+                "Nenhum identificador STL foi informado ao resolvedor."
             )
-            if manual_trigger and headless:
-                raise CfazBrowserSessionError("Modo manual exige navegador visível.")
+        factory = self.playwright_factory or self._factory()
+        with factory() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir()), headless=True, accept_downloads=False,
+                service_workers="block",
+            )
             try:
                 page = context.new_page()
-                def route_handler(route: Any) -> None:
-                    nonlocal observed, initial
-                    request = route.request
-                    parsed = urlsplit(request.url)
-                    if parsed.hostname in {"storage.googleapis.com", "storage.cloud.google.com"}:
-                        observed += 1
-                        if not active:
-                            initial += 1
-                            route.continue_()
-                            return
-                        if request.method == "GET":
-                            path = parsed.path.casefold()
-                            if manual_trigger or path.endswith((".zip", ".stl")):
-                                # Keep the signed URL only in memory.  The
-                                # signature is never included in diagnostics.
-                                urls.append(request.url)
-                                route.abort()
-                                return
-                    route.continue_()
-                page.route("**/*", route_handler)
-                # Keep browser-level observers armed before navigation. They
-                # count only; signed URLs never reach output or disk.
-                try:
-                    context.on("request", lambda _request: None)
-                    page.on("request", lambda _request: None)
-                    page.on("download", lambda _download: None)
-                    page.on("popup", lambda _popup: None)
-                    page.add_init_script("""
-                        (() => { const emit = (kind, url) => {
-                          try { window.__ireoBrowserEvents = window.__ireoBrowserEvents || [];
-                            window.__ireoBrowserEvents.push({kind, url: String(url || '')}); } catch (_) {}
-                        };
-                        const f = window.fetch; window.fetch = function(...a) { emit('fetch', a[0]); return f.apply(this,a); };
-                        const xo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m,u,...r) { emit('xhr',u); return xo.call(this,m,u,...r); };
-                        const wo = window.open; window.open = function(u,...a) { emit('popup',u); return wo.call(this,u,...a); };
-                        const ac = HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click = function() { emit('anchor',this.href); return ac.call(this); };
-                        })();
-                    """)
-                except Exception:
-                    pass
                 page.goto(
                     f"https://max.cfaz.net/requests/{request_id}",
                     wait_until="networkidle", timeout=60000,
                 )
-                self._dom_diagnostics(page, model_id)
-                self._identity_diagnostics(page, expected_ids)
-                if manual_trigger:
-                    active = True
-                    self.output("Fase manual armada antes do prompt: sim")
-                    self.output("Abra Modelo Digital e acione somente os downloads STL.")
-                    input("Após acionar os dois downloads, pressione Enter: ")
-                else:
-                # The component is fragment-driven; clicking is best-effort.
+                section = page.locator(f"#digital_model{model_id}")
+                if not (section.count() and section.first.is_visible()):
                     selectors = (
                         f'[href="#digital_model{model_id}"]',
                         f'[data-target="#digital_model{model_id}"]',
                         f'[aria-controls="digital_model{model_id}"]',
                     )
-                    for selector in selectors:
-                        try:
-                            active = True
-                            page.locator(selector).first.click(timeout=3000)
-                            break
-                        except Exception:
-                            pass
-                    if not active:
+                    controls = page.locator(",".join(selectors))
+                    visible = [
+                        controls.nth(position)
+                        for position in range(controls.count())
+                        if controls.nth(position).is_visible()
+                    ]
+                    if len(visible) != 1:
                         raise CfazBrowserSessionError(
-                            "Controle da seção Modelo Digital não foi identificado. "
-                            "Use --manual-model-trigger."
+                            "A seção de modelos digitais não pôde ser identificada "
+                            "inequivocamente."
                         )
-                page.wait_for_timeout(2000)
-                if not urls:
-                    # Some Vue versions have no clickable tab because the
-                    # fragment already selected it. Reload only after the
-                    # initial inventory has been discarded.
-                    active = True
-                    page.goto(
-                        f"https://max.cfaz.net/requests/{request_id}#digital_model{model_id}",
-                        wait_until="networkidle", timeout=60000,
-                    )
+                    visible[0].click(timeout=3000)
+                    page.wait_for_timeout(500)
+                controls = page.evaluate(
+                    """() => Array.from(
+                      document.querySelectorAll('button[data-download-url]')
+                    ).map((node) => ({
+                      element: node.tagName.toLowerCase(),
+                      stl_file_id: node.getAttribute('data-id'),
+                      model_id: node.getAttribute('data-model-id'),
+                      download_url: node.getAttribute('data-download-url'),
+                    }))"""
+                )
+                resolved = self.resolve_declared_url_map(
+                    controls, expected_ids=expected_ids
+                )
             except Exception as exc:
+                if isinstance(exc, CfazBrowserSessionError):
+                    raise
                 raise CfazBrowserSessionError(
                     "Sessão Cfaz inexistente, expirada ou página indisponível."
                 ) from exc
@@ -163,40 +118,56 @@ class CfazBrowserSession:
                 except Exception as cleanup_error:
                     if "Connection closed" not in str(cleanup_error):
                         raise
-        # Avoid accidentally counting unrelated storage requests.
-        unique: list[str] = []
-        seen: set[str] = set()
-        for url in urls:
-            identity = urlsplit(url)._replace(query="", fragment="").geturl()
-            if identity not in seen:
-                seen.add(identity)
-                unique.append(url)
-        urls = unique
-        self.output(f"Requisições Google Storage observadas: {observed}")
-        self.output(f"Candidatas antes da seção: {initial}")
-        self.output(f"Candidatas após da seção: {len(urls)}")
-        self.output(f"Candidatas ZIP/STL: {len(urls)}")
-        self.output(f"Requests pós-baseline: {max(0, observed-initial)}")
-        self.output(f"Chamadas fetch pós-baseline: {fetch_count}")
-        self.output(f"Chamadas XHR pós-baseline: {xhr_count}")
-        self.output(f"Cliques anchor pós-baseline: {anchor_count}")
-        self.output(f"Window.open/popup pós-baseline: {popup_count}")
-        self.output(f"Eventos download pós-baseline: {download_count}")
-        self.output("Chamadas associadas a unzipFileDownloadUrl: não expostas")
-        self.output(f"Transferências bloqueadas: {len(urls)}")
+        self.output(f"Associações STL resolvidas: {len(resolved)}")
+        self.output("Cliques em controles de arquivo: 0")
+        self.output("Requisições de transferência: 0")
         self.output("Arquivos salvos: 0")
-        if len(urls) != len(expected_ids):
+        return resolved
+
+    @classmethod
+    def resolve_declared_url_map(
+        cls, controls: object, *, expected_ids: set[str]
+    ) -> dict[str, str]:
+        """Resolve somente button[data-id][data-download-url] sem heurísticas."""
+        expected = {str(value) for value in expected_ids}
+        if not isinstance(controls, list):
             raise CfazBrowserSessionError(
-                f"Sessão browser resolveu {len(urls)} URL(s); esperado: {len(expected_ids)}."
+                "Controles de modelos retornaram estrutura inválida."
             )
-        self.output(f"URLs resolvidas: {len(urls)}")
-        self.output("Arquivos salvos: 0")
-        # A browser network request alone has no reliable STL identity. Never
-        # infer it from capture order; callers must provide an explicit map.
-        raise CfazBrowserSessionError(
-            "As capturas browser não expõem stl_file_id de forma inequívoca; "
-            "nenhum mapa URL→STL foi produzido."
-        )
+        matches: dict[str, list[str]] = {value: [] for value in expected}
+        for control in controls:
+            if not isinstance(control, dict):
+                raise CfazBrowserSessionError(
+                    "Controle de modelo sem estrutura identificável."
+                )
+            if str(control.get("element") or "").casefold() != "button":
+                continue
+            identity = str(control.get("stl_file_id") or "").strip()
+            model_identity = str(control.get("model_id") or "").strip()
+            url = str(control.get("download_url") or "").strip()
+            if identity not in expected or model_identity:
+                continue
+            if not url:
+                raise CfazBrowserSessionError(
+                    "Botão de arquivo sem URL declarativa."
+                )
+            if not url.startswith("https://"):
+                raise CfazBrowserSessionError(
+                    "Botão de arquivo contém URL estruturalmente inválida."
+                )
+            matches[identity].append(url)
+        if any(len(values) != 1 for values in matches.values()):
+            raise CfazBrowserSessionError(
+                "Associação STL incompleta ou ambígua; revisão obrigatória."
+            )
+        resolved = {
+            identity: values[0] for identity, values in matches.items()
+        }
+        if len(set(resolved.values())) != len(resolved):
+            raise CfazBrowserSessionError(
+                "Uma URL foi associada a mais de um STL."
+            )
+        return cls.validate_url_map(resolved, expected)
 
     def resolve_collection(self, specification, *, manual_model_trigger: bool = True,
                            stabilization_seconds: float = 2.0) -> frozenset[str]:

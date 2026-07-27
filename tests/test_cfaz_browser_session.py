@@ -1,83 +1,134 @@
-from acquisition.cfaz_browser_session import CfazBrowserSession, CfazBrowserSessionError
+import pytest
+
+from acquisition.cfaz_browser_session import (
+    CfazBrowserSession,
+    CfazBrowserSessionError,
+)
 
 
-class Req:
-    def __init__(self, url): self.url, self.method = url, "GET"
+EXPECTED_IDS = {"synthetic-stl-alpha", "synthetic-stl-beta"}
+URL_ALPHA = "https://models.example.invalid/download?signature=synthetic-alpha"
+URL_BETA = "https://models.example.invalid/download?signature=synthetic-beta"
 
 
-class Route:
-    def __init__(self, req): self.request, self.aborted = req, False
-    def abort(self): self.aborted = True
-    def continue_(self): pass
+def file_button(stl_file_id, url, *, model_id=None):
+    return {
+        "element": "button",
+        "stl_file_id": stl_file_id,
+        "model_id": model_id,
+        "download_url": url,
+    }
 
 
-class Page:
-    def __init__(self, urls): self.urls = urls
-    def route(self, _pattern, handler):
-        self.handler = handler
-    def goto(self, *_args, **_kwargs):
-        for url in self.urls:
-            self.handler(Route(Req(url)))
-    def wait_for_timeout(self, *_args): pass
-    def get_by_text(self, *_args, **_kwargs): return self
-    def locator(self, *_args, **_kwargs): return self
-    def count(self): return 1
-    @property
-    def first(self): return self
-    def click(self, **_kwargs): pass
+def resolve(controls):
+    return CfazBrowserSession.resolve_declared_url_map(
+        controls, expected_ids=EXPECTED_IDS
+    )
 
 
-class Context:
-    def __init__(self, urls): self.page = Page(urls)
-    def new_page(self): return self.page
-    def close(self): pass
+def test_declared_url_map_is_one_to_one_with_inverted_dom_order():
+    result = resolve([
+        file_button("synthetic-stl-beta", URL_BETA),
+        file_button("synthetic-stl-alpha", URL_ALPHA),
+    ])
+
+    assert result == {
+        "synthetic-stl-alpha": URL_ALPHA,
+        "synthetic-stl-beta": URL_BETA,
+    }
 
 
-class Chromium:
-    def __init__(self, urls): self.urls = urls
-    def launch_persistent_context(self, *_args, **_kwargs): return Context(self.urls)
+@pytest.mark.parametrize(
+    "controls",
+    [
+        [file_button("synthetic-stl-alpha", URL_ALPHA)],
+        [
+            file_button("synthetic-stl-alpha", URL_ALPHA),
+            file_button("synthetic-stl-alpha", URL_BETA),
+            file_button("synthetic-stl-beta", URL_BETA),
+        ],
+        [
+            file_button("synthetic-stl-alpha", ""),
+            file_button("synthetic-stl-beta", URL_BETA),
+        ],
+        [
+            file_button("synthetic-stl-alpha", URL_ALPHA),
+            file_button("synthetic-stl-beta", URL_ALPHA),
+        ],
+        [
+            file_button("synthetic-stl-alpha", URL_ALPHA),
+            file_button("synthetic-stl-unexpected", URL_BETA),
+        ],
+        [
+            {
+                "element": "button",
+                "stl_file_id": None,
+                "model_id": None,
+                "download_url": URL_ALPHA,
+            },
+            {
+                "element": "button",
+                "stl_file_id": None,
+                "model_id": None,
+                "download_url": URL_BETA,
+            },
+        ],
+    ],
+)
+def test_declared_url_map_fails_closed_for_incomplete_or_ambiguous_controls(
+    controls,
+):
+    with pytest.raises(CfazBrowserSessionError):
+        resolve(controls)
 
 
-class PW:
-    def __init__(self, urls): self.chromium = Chromium(urls)
-    def __enter__(self): return self
-    def __exit__(self, *_args): pass
-
-
-def factory(urls): return lambda: PW(urls)
-
-
-def test_browser_dry_run_captures_two_urls_without_logging_signed_values(tmp_path, monkeypatch):
-    monkeypatch.setattr("acquisition.cfaz_browser_session.profile_dir", lambda: tmp_path)
-    output = []
-    urls = [
-        "https://storage.googleapis.com/a.zip?Signature=secret",
-        "https://storage.googleapis.com/b.zip?Expires=1",
+def test_model_button_and_destructive_link_are_ignored_as_competitors():
+    controls = [
+        file_button("synthetic-stl-alpha", URL_ALPHA),
+        file_button(
+            "synthetic-stl-alpha", URL_ALPHA,
+            model_id="synthetic-model",
+        ),
+        {
+            "element": "a",
+            "stl_file_id": "synthetic-stl-alpha",
+            "model_id": "synthetic-model",
+            "download_url": "https://models.example.invalid/destructive",
+        },
+        file_button("synthetic-stl-beta", URL_BETA),
     ]
-    session = CfazBrowserSession(output=output.append, playwright_factory=factory(urls))
-    try:
-        session.resolve(request_id="26977444", model_id="658742", expected_stl_file_ids={"1511267", "1511268"})
-    except CfazBrowserSessionError:
-        pass
-    assert "secret" not in " ".join(output)
+
+    assert resolve(controls) == {
+        "synthetic-stl-alpha": URL_ALPHA,
+        "synthetic-stl-beta": URL_BETA,
+    }
 
 
-def test_url_map_requires_explicit_identity():
-    result = CfazBrowserSession.validate_url_map(
-        {"1511268": "https://storage.googleapis.com/b.zip?x=1",
-         "1511267": "https://storage.googleapis.com/a.zip?x=2"},
-        {"1511267", "1511268"})
-    assert set(result) == {"1511267", "1511268"}
+def test_errors_and_output_never_include_declared_urls():
+    sensitive_marker = "must-not-leak"
+    controls = [
+        file_button(
+            "synthetic-stl-alpha",
+            f"https://models.example.invalid/download?signature={sensitive_marker}",
+        ),
+        file_button("synthetic-stl-alpha", URL_ALPHA),
+        file_button("synthetic-stl-beta", URL_BETA),
+    ]
+
+    with pytest.raises(CfazBrowserSessionError) as captured:
+        resolve(controls)
+
+    assert sensitive_marker not in str(captured.value)
+    assert "https://" not in str(captured.value)
 
 
-def test_browser_requires_exact_number_of_urls(tmp_path, monkeypatch):
-    monkeypatch.setattr("acquisition.cfaz_browser_session.profile_dir", lambda: tmp_path)
-    session = CfazBrowserSession(playwright_factory=factory([
-        "https://storage.googleapis.com/a.zip?Signature=secret",
-    ]))
-    try:
-        session.resolve(request_id="26977444", model_id="658742", expected_stl_file_ids={"1511267", "1511268"})
-    except CfazBrowserSessionError:
-        pass
-    else:
-        raise AssertionError("expected incomplete resolution")
+def test_api_unauthorized_state_does_not_invalidate_browser_dom_mapping():
+    api_status = 401
+
+    result = resolve([
+        file_button("synthetic-stl-alpha", URL_ALPHA),
+        file_button("synthetic-stl-beta", URL_BETA),
+    ])
+
+    assert api_status == 401
+    assert set(result) == EXPECTED_IDS

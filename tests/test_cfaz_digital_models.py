@@ -539,3 +539,69 @@ def test_provider_uses_configured_session_login_when_page_rejects_api_token():
 
     assert [item.stl_file_id for item in inventory.files] == ["1511267"]
     assert session.login_calls == 1
+
+
+def test_provider_uses_browser_dom_map_without_page_endpoint_fallback(
+    monkeypatch,
+):
+    payload = {
+        "id": 99999991,
+        "sequential_id": 999991,
+        "patient_datum": {"name": "Synthetic Patient"},
+        "digital_models": [{
+            "id": "synthetic-model",
+            "stl_files": [
+                {"id": "synthetic-stl-alpha"},
+                {"id": "synthetic-stl-beta"},
+            ],
+        }],
+    }
+
+    class ApiSession:
+        cookies = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if "/api/v1/requests/" not in url:
+                raise AssertionError("page endpoint must not be consulted")
+            if kwargs.get("params", {}).get("access_token") == "synthetic-token":
+                return HttpResponse(200, payload)
+            return HttpResponse(401, {})
+
+    resolver_calls = []
+
+    def browser_resolver(**kwargs):
+        resolver_calls.append(kwargs)
+        return {
+            "synthetic-stl-alpha": (
+                "https://models.example.invalid/alpha"
+                "?signature=synthetic-alpha"
+            ),
+            "synthetic-stl-beta": (
+                "https://models.example.invalid/beta"
+                "?signature=synthetic-beta"
+            ),
+        }
+
+    session = ApiSession()
+    monkeypatch.setattr(
+        CfazProvider,
+        "_validate_download_url",
+        classmethod(lambda _cls, _url: None),
+    )
+    provider = CfazProvider(
+        api_token="synthetic-token",
+        session=session,
+        browser_resolver=browser_resolver,
+        output=lambda _message: None,
+    )
+
+    inventory = provider.discover_digital_models("99999991")
+
+    assert len(inventory.files) == 2
+    assert len(resolver_calls) == 1
+    assert len(session.calls) == 2
+    assert all("/api/v1/requests/" in call[0] for call in session.calls)

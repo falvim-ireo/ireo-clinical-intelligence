@@ -275,7 +275,52 @@ class CfazProvider(AcquisitionProvider):
             return CfazDigitalModelInventory(
                 request=request, model_count=len(models), files=()
             )
-        if any(not item["download_url"] for item in descriptors):
+        if (
+            any(not item["download_url"] for item in descriptors)
+            and self._browser_resolver
+        ):
+            browser_urls = self._browser_resolver(
+                request_id=request.request_id,
+                model_id=str(descriptors[0]["digital_model_id"]),
+                expected_stl_file_ids={
+                    str(item["stl_file_id"]) for item in descriptors
+                },
+            )
+            expected_ids = {
+                str(item["stl_file_id"]) for item in descriptors
+            }
+            normalized_urls = (
+                {str(key): value for key, value in browser_urls.items()}
+                if isinstance(browser_urls, dict)
+                else {}
+            )
+            if set(normalized_urls) != expected_ids:
+                raise CfazRequestError(
+                    "O mapa DOM de modelos está incompleto ou contém identidades "
+                    "inesperadas."
+                )
+            if (
+                any(
+                    not isinstance(url, str) or not url.startswith("https://")
+                    for url in normalized_urls.values()
+                )
+                or len(set(normalized_urls.values())) != len(normalized_urls)
+            ):
+                raise CfazRequestError(
+                    "O mapa DOM de modelos contém associação inválida ou ambígua."
+                )
+            for descriptor in descriptors:
+                descriptor["download_url"] = normalized_urls[
+                    str(descriptor["stl_file_id"])
+                ]
+                descriptor["source_field"] = (
+                    "browser:button[data-id][data-download-url]"
+                )
+
+        if (
+            any(not item["download_url"] for item in descriptors)
+            and not self._browser_resolver
+        ):
             page_payload = self._page_get(
                 f"/requests/{request.request_id}.json"
             )
@@ -317,27 +362,6 @@ class CfazProvider(AcquisitionProvider):
             str(item["stl_file_id"])
             for item in descriptors if not item["download_url"]
         ]
-        if unresolved:
-            if self._browser_resolver:
-                browser_urls = self._browser_resolver(
-                    request_id=request.request_id,
-                    model_id=str(descriptors[0]["digital_model_id"]),
-                    expected_stl_file_ids={str(item["stl_file_id"]) for item in descriptors},
-                )
-                if not isinstance(browser_urls, dict):
-                    raise CfazRequestError(
-                        "As URLs do navegador não estão associadas inequivocamente "
-                        "aos stl_file_id; associação por ordem foi bloqueada."
-                    )
-                for descriptor in descriptors:
-                    url = browser_urls.get(str(descriptor["stl_file_id"]))
-                    if url:
-                        descriptor["download_url"] = str(url)
-                        descriptor["source_field"] = "browser:unzipFileDownloadUrl"
-                unresolved = [
-                    str(item["stl_file_id"])
-                    for item in descriptors if not item["download_url"]
-                ]
         if unresolved:
             raise CfazRequestError(
                 "A página autenticada do Cfaz não forneceu todos os downloads "
